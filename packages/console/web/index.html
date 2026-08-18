@@ -9,32 +9,40 @@
 <body>
 	<header class="topbar">
 		<span class="logo">Pi 控制台</span>
-	<div class="topbar-controls">
-		<select id="model-select" title="模型" disabled>
-			<option value="">加载模型中…</option>
-		</select>
-		<select id="thinking-select" title="思考等级" disabled>
-			<option value="off">off</option>
-			<option value="minimal">minimal</option>
-			<option value="low">low</option>
-			<option value="medium">medium</option>
-			<option value="high">high</option>
-			<option value="xhigh">xhigh</option>
-			<option value="max">max</option>
-		</select>
-		<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新）">⚙</button>
-	</div>
 		<span id="conn-state" class="conn-state">连接中…</span>
+		<div class="topbar-right">
+			<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新 / MCP）">⚙</button>
+		</div>
 	</header>
 
 	<div class="layout">
-		<aside class="sidebar" id="sidebar">
-			<div class="sidebar-header" id="packs-toggle">能力包 <span class="chevron" id="packs-chevron">▾</span></div>
-			<div id="packs-panel" class="packs-panel">
-				<div id="packs-list" class="packs-list">加载中…</div>
-			</div>
+		<!-- 左栏：助手 / 技能 / 文件 -->
+		<aside class="sidebar">
+			<section class="side-section">
+				<div class="side-header" data-panel="assistants-panel">助手 <span class="chevron">▾</span></div>
+				<div id="assistants-panel" class="side-body">
+					<div id="assistants-list" class="assistants-list">加载中…</div>
+				</div>
+			</section>
+			<section class="side-section">
+				<div class="side-header" data-panel="skills-panel">技能 <span class="chevron">▾</span></div>
+				<div id="skills-panel" class="side-body">
+					<div class="skills-empty">技能将在这里列出，可选用作对话能力（即将支持）。</div>
+				</div>
+			</section>
+			<section class="side-section side-section-grow">
+				<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
+				<div id="files-panel" class="side-body side-body-grow">
+					<div class="files-toolbar">
+						<select id="fs-root-select" title="浏览根目录"></select>
+						<button id="fs-refresh" class="icon-btn small" title="刷新">⟳</button>
+					</div>
+					<div id="fs-tree" class="fs-tree"></div>
+				</div>
+			</section>
 		</aside>
 
+		<!-- 中间：聊天区 -->
 		<main class="content">
 			<div id="error-bar" class="error-bar" hidden></div>
 
@@ -45,7 +53,7 @@
 			<footer class="composer">
 				<div class="attachments" id="attachments" hidden></div>
 				<div class="composer-row">
-					<button id="attach-btn" class="icon-btn" title="添加附件">📎</button>
+					<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
 					<input type="file" id="file-input" multiple hidden>
 					<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
 					<div class="composer-buttons">
@@ -53,12 +61,61 @@
 						<button id="stop-btn" hidden>停止</button>
 					</div>
 				</div>
+				<div class="composer-bottom">
+					<span class="composer-model-label">模型</span>
+					<select id="model-select" title="模型" disabled>
+						<option value="">加载中…</option>
+					</select>
+					<span class="composer-model-label">思考</span>
+					<select id="thinking-select" title="思考等级" disabled>
+						<option value="off">off</option>
+						<option value="minimal">minimal</option>
+						<option value="low">low</option>
+						<option value="medium">medium</option>
+						<option value="high">high</option>
+						<option value="xhigh">xhigh</option>
+						<option value="max">max</option>
+					</select>
+					<span class="composer-spacer"></span>
+					<span id="context-info" class="context-info" title="已启用能力"></span>
+				</div>
 			</footer>
 		</main>
+
+		<!-- 右栏：上下文 / MCP 占位 -->
+		<aside class="context-panel">
+			<section class="side-section">
+				<div class="side-header" data-panel="context-panel-body">上下文 <span class="chevron">▾</span></div>
+				<div id="context-panel-body" class="side-body">
+					<div class="context-block">
+						<div class="context-block-title">MCP 服务</div>
+						<div class="context-empty">暂无 MCP 服务。<br>此面板为能力上下文预留（MCP/工具/知识库），后续版本开放。</div>
+					</div>
+					<div class="context-block">
+						<div class="context-block-title">已启用能力</div>
+						<div id="context-tools" class="context-tools">（未挂载助手）</div>
+					</div>
+				</div>
+			</section>
+		</aside>
 	</div>
 
 	<div id="drop-overlay" class="drop-overlay" hidden>
 		<div class="drop-overlay-inner">📥 释放以添加附件</div>
+	</div>
+
+	<!-- 文件预览弹层 -->
+	<div id="preview-modal" class="modal" hidden>
+		<div class="modal-body preview-body">
+			<div class="modal-header">
+				<span class="modal-title" id="preview-title">预览</span>
+				<button id="preview-close" class="icon-btn" title="关闭">×</button>
+			</div>
+			<div id="preview-content" class="preview-content"></div>
+			<div class="preview-actions">
+				<button id="preview-attach" class="primary-btn">＋ 添加到对话</button>
+			</div>
+		</div>
 	</div>
 
 	<div id="settings-modal" class="modal" hidden>
@@ -70,13 +127,19 @@
 
 			<section class="modal-section">
 				<h3>模型服务</h3>
-				<p class="modal-hint">添加模型厂商的 API Key 后，对应模型即可在顶栏选择使用（与设置一起持久保存）。</p>
+				<p class="modal-hint">添加模型厂商的 API Key 后，对应模型即可在输入框右下角选择使用（与设置一起持久保存）。</p>
 				<div class="key-add-row">
 					<select id="key-provider"></select>
 					<input type="password" id="key-input" placeholder="粘贴 API Key（sk-…）" autocomplete="off">
 					<button id="key-add-btn">添加</button>
 				</div>
 				<div id="key-list" class="key-list"></div>
+			</section>
+
+			<section class="modal-section">
+				<h3>MCP 服务</h3>
+				<p class="modal-hint">MCP（Model Context Protocol）服务将在后续版本开放配置。当前为占位设计，能力上下文面板已预留入口。</p>
+				<div class="context-empty">暂无 MCP 服务可配置</div>
 			</section>
 
 			<section class="modal-section">
