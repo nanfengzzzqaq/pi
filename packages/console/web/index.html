@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Pi 控制台</title>
+	<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+	<header class="topbar">
+		<span class="logo">Pi 控制台</span>
+		<span id="conn-state" class="conn-state">连接中…</span>
+	</header>
+
+	<div id="error-bar" class="error-bar" hidden></div>
+
+	<main id="messages" class="messages"></main>
+
+	<div id="indicator" class="indicator" hidden>思考中…</div>
+
+	<footer class="composer">
+		<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+		<div class="composer-buttons">
+			<button id="send-btn" disabled>发送</button>
+			<button id="stop-btn" hidden>停止</button>
+		</div>
+	</footer>
+
+	<script src="/app.js"></script>
+</body>
+</html>
