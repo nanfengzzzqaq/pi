@@ -90,6 +90,12 @@
 				<div class="download-bar-wrap" id="update-progress" hidden>
 					<div class="download-bar" id="update-progress-bar"></div>
 				</div>
+				<p class="modal-hint" id="github-token-hint">更新源是 GitHub 上的私有仓库时，需要填写有读取权限的 Personal Access Token（公开仓库无需填写）。</p>
+				<div class="key-add-row">
+					<input type="password" id="github-token-input" placeholder="GitHub Token（ghp_…，可选）" autocomplete="off">
+					<button id="github-token-save-btn">保存</button>
+					<button id="github-token-clear-btn" hidden>清除</button>
+				</div>
 			</section>
 		</div>
 	</div>

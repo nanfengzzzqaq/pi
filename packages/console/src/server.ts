@@ -675,6 +675,25 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, { version: updates.APP_VERSION });
 		return;
 	}
+	if (pathname === "/api/app/github-token" && req.method === "GET") {
+		sendJson(res, 200, { configured: updates.githubToken() !== null });
+		return;
+	}
+	if (pathname === "/api/app/github-token" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { token?: unknown };
+		if (typeof body?.token !== "string" || !body.token.trim()) {
+			sendJson(res, 400, { error: '请求体需为 {"token": "..."}' });
+			return;
+		}
+		updates.setGithubToken(body.token.trim());
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	if (pathname === "/api/app/github-token" && req.method === "DELETE") {
+		updates.clearGithubToken();
+		sendJson(res, 200, { ok: true });
+		return;
+	}
 	if (pathname === "/api/app/update-check" && req.method === "GET") {
 		sendJson(res, 200, await updates.checkUpdate());
 		return;

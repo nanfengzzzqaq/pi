@@ -248,8 +248,8 @@ Else
   OpenAppWindow
 End If
 '@
-Set-Content -Path (Join-Path $Staging "Pi控制台.vbs") -Value $Vbs -Encoding ASCII
-Write-Host "已生成启动器（.bat / .vbs）"
+Set-Content -Path (Join-Path $Staging "launcher.vbs") -Value $Vbs -Encoding ASCII
+Write-Host "已生成启动器（Pi控制台.bat / launcher.vbs）"
 
 # ---------------------------------------------------------------------------
 # 6. NSIS 便携版
