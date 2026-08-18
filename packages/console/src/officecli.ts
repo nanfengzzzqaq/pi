@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -19,7 +20,31 @@ const GITHUB_LATEST = "https://api.github.com/repos/iOfficeAI/OfficeCLI/releases
 const VERSION_TIMEOUT_MS = 5000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
-const BIN_DIR = join(import.meta.dirname, "..", "data", "bin");
+const BIN_DIR = join(DATA_DIR, "bin");
+
+/**
+ * 首启引导：安装版把 OfficeCLI 预置在 app/data/bin（随程序分发），
+ * 而运行时数据目录外置在 %APPDATA%。目标缺失时把预置副本拷过去，保证装完即用。
+ */
+export function seedBundledBinary(): boolean {
+	const exeName = process.platform === "win32" ? "officecli.exe" : "officecli";
+	const bundled = join(PACKAGE_ROOT, "data", "bin", exeName);
+	const target = join(BIN_DIR, exeName);
+	try {
+		if (!existsSync(target) && existsSync(bundled)) {
+			mkdirSync(BIN_DIR, { recursive: true });
+			copyFileSync(bundled, target);
+			const bundledRecord = join(PACKAGE_ROOT, "data", "bin", "officecli.json");
+			if (existsSync(bundledRecord) && !existsSync(join(BIN_DIR, "officecli.json"))) {
+				copyFileSync(bundledRecord, join(BIN_DIR, "officecli.json"));
+			}
+			return true;
+		}
+	} catch {
+		// 引导失败不阻断启动，用户仍可页面下载
+	}
+	return false;
+}
 const RECORD_FILE = join(BIN_DIR, "officecli.json");
 
 /** Windows x64: officecli-win-x64.exe；其他平台按官方资产命名 */

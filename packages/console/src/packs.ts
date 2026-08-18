@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DATA_DIR } from "./paths.ts";
 
 /** 注入给能力包的上下文 */
 export interface PackContext {
@@ -39,7 +40,6 @@ interface LoadedPack {
 export const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write"];
 
 const PACKS_DIR = join(import.meta.dirname, "..", "packs");
-const DATA_DIR = join(import.meta.dirname, "..", "data");
 const MOUNTED_PACKS_FILE = join(DATA_DIR, "mounted-packs.json");
 
 /** 已加载的全部能力包（服务启动时填充） */

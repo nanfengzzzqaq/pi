@@ -1,10 +1,10 @@
-# @pi/console — Pi Web 控制台（第 2 步：能力包框架 + Office 助手包 + 前端增强）
+# @pi/console — Pi Web 控制台（能力包框架 + Office 助手包 + Windows 安装包）
 
 在浏览器里使用 Pi：`node:http` 原生后端 + 纯 HTML/JS/CSS 前端，无新增 npm 依赖、无构建步骤。
 默认形态为**纯净原生 Pi**（内置 read/bash/edit/write 工具，官方系统提示词）；能力包通过 `customTools` 注册、
-`setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与第 1 步完全一致。
+`setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与纯净版完全一致。
 
-## 安装与启动
+## 安装与启动（开发模式）
 
 ```bash
 # 仓库根目录
@@ -17,10 +17,33 @@ set PI_CONSOLE_MODEL=deepseek/deepseek-v4-flash
 set DEEPSEEK_API_KEY=...
 
 npx tsx packages/console/src/server.ts
+# 或直接 node packages/console/src/server.ts（Node >= 22.18 原生 type-stripping）
 # 浏览器打开 http://127.0.0.1:3200
 ```
 
 > PowerShell 请用 `$env:PI_CONSOLE_MODEL="..."`，Git Bash 请用 `export PI_CONSOLE_MODEL=...`。
+
+## Windows 安装包（installer/）
+
+给没有 Node/开发环境的普通用户：双击 Setup exe 安装，桌面图标点开即用。
+
+```powershell
+# 在打包机（Windows x64 + Node/npm）上执行：
+cd packages/console/installer
+powershell -ExecutionPolicy Bypass -File build.ps1
+# 产物：installer/out/Pi控制台-Setup-<version>.exe（约 68 MB）
+```
+
+构建脚本自动完成：下载官方 Node 绿色版（写死 v24.19.0，SHA256 校验）→ 组装 staging
+（app 源码 + npm registry 生产依赖 + 预置 OfficeCLI）→ 下载 NSIS 3.11 便携版 → 编译安装包。
+`.tools/`（工具链缓存）、`staging/`、`out/` 均不入库，二次构建直接复用缓存。
+
+安装与使用：
+
+- 装到 `%LOCALAPPDATA%\Programs\pi-console`（无需管理员权限），桌面 + 开始菜单快捷方式
+- 快捷方式指向 `Pi控制台.vbs`：隐藏窗口启动服务、轮询就绪后自动打开浏览器；重复双击只开新标签不起第二个服务（`Pi控制台.bat` 为可见窗口的调试启动器）
+- 数据目录外置在 `%APPDATA%\pi-console\data`（环境变量 `PI_CONSOLE_DATA` 控制，卸载/重装不丢数据；服务启动时会自动把安装包预置的 OfficeCLI 复制过去）
+- 卸载删除程序文件并保留数据目录（卸载向导会提示数据位置）
 
 ## 环境变量
 
@@ -28,6 +51,7 @@ npx tsx packages/console/src/server.ts
 |---|---|
 | `PORT` | 监听端口，默认 `3200`（仅绑定 `127.0.0.1`） |
 | `PI_CONSOLE_MODEL` | 可选。`provider/model-id`。未设置时走 Pi 默认解析（settings / 上次选择） |
+| `PI_CONSOLE_DATA` | 可选。数据目录外置（默认 `<包>/data`；安装版由启动器设为 `%APPDATA%pi-consoledata`） |
 | `PI_CONSOLE_TOKEN` | 可选。设置后所有 `/api/*` 请求必须带 `Authorization: Bearer <token>`（SSE 额外接受 `?token=`），静态页面放行 |
 
 模型/思考等级选择通过控制台专属 agent 目录（`packages/console/data/agent/settings.json`）持久化，新会话自动沿用，不污染全局 `~/.pi/agent/`。
