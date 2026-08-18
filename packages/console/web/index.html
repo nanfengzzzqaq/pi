@@ -9,20 +9,21 @@
 <body>
 	<header class="topbar">
 		<span class="logo">Pi 控制台</span>
-		<div class="topbar-controls">
-			<select id="model-select" title="模型" disabled>
-				<option value="">加载模型中…</option>
-			</select>
-			<select id="thinking-select" title="思考等级" disabled>
-				<option value="off">off</option>
-				<option value="minimal">minimal</option>
-				<option value="low">low</option>
-				<option value="medium">medium</option>
-				<option value="high">high</option>
-				<option value="xhigh">xhigh</option>
-				<option value="max">max</option>
-			</select>
-		</div>
+	<div class="topbar-controls">
+		<select id="model-select" title="模型" disabled>
+			<option value="">加载模型中…</option>
+		</select>
+		<select id="thinking-select" title="思考等级" disabled>
+			<option value="off">off</option>
+			<option value="minimal">minimal</option>
+			<option value="low">low</option>
+			<option value="medium">medium</option>
+			<option value="high">high</option>
+			<option value="xhigh">xhigh</option>
+			<option value="max">max</option>
+		</select>
+		<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新）">⚙</button>
+	</div>
 		<span id="conn-state" class="conn-state">连接中…</span>
 	</header>
 
@@ -54,6 +55,43 @@
 				</div>
 			</footer>
 		</main>
+	</div>
+
+	<div id="drop-overlay" class="drop-overlay" hidden>
+		<div class="drop-overlay-inner">📥 释放以添加附件</div>
+	</div>
+
+	<div id="settings-modal" class="modal" hidden>
+		<div class="modal-body">
+			<div class="modal-header">
+				<span class="modal-title">设置</span>
+				<button id="settings-close" class="icon-btn" title="关闭">×</button>
+			</div>
+
+			<section class="modal-section">
+				<h3>模型服务</h3>
+				<p class="modal-hint">添加模型厂商的 API Key 后，对应模型即可在顶栏选择使用（与设置一起持久保存）。</p>
+				<div class="key-add-row">
+					<select id="key-provider"></select>
+					<input type="password" id="key-input" placeholder="粘贴 API Key（sk-…）" autocomplete="off">
+					<button id="key-add-btn">添加</button>
+				</div>
+				<div id="key-list" class="key-list"></div>
+			</section>
+
+			<section class="modal-section">
+				<h3>关于与更新</h3>
+				<div class="update-row">
+					<span id="app-version">版本 …</span>
+					<button id="update-check-btn">检查更新</button>
+					<button id="update-run-btn" hidden>立即更新</button>
+				</div>
+				<div id="update-status" class="update-status"></div>
+				<div class="download-bar-wrap" id="update-progress" hidden>
+					<div class="download-bar" id="update-progress-bar"></div>
+				</div>
+			</section>
+		</div>
 	</div>
 
 	<script src="/app.js"></script>

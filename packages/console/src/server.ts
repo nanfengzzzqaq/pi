@@ -29,6 +29,7 @@ import {
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
+import * as updates from "./updates.ts";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -85,8 +86,11 @@ interface ConsoleSession {
 
 const sessions = new Map<string, ConsoleSession>();
 
-/** 全服共享一个 ModelRuntime，启动时创建 */
-const modelRuntime = await ModelRuntime.create();
+/** API Key 存储文件（控制台专属，与 agent settings 同目录；格式 Record<provider, {type:"api_key",key}>） */
+const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
+
+/** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
+const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
@@ -355,6 +359,72 @@ function listModels(): Array<{ provider: string; modelId: string; label: string;
 	return items;
 }
 
+// ---------------------------------------------------------------------------
+// 模型服务 Key 管理（auth.json：Record<provider, {type:"api_key",key}>）
+// ---------------------------------------------------------------------------
+
+type AuthFile = Record<string, { type: "api_key"; key: string }>;
+
+function readAuthFile(): AuthFile {
+	try {
+		const data = JSON.parse(readFileSync(AUTH_FILE, "utf8"));
+		if (typeof data === "object" && data !== null) return data as AuthFile;
+	} catch {
+		/* 不存在或损坏时视为空 */
+	}
+	return {};
+}
+
+function writeAuthFile(data: AuthFile): void {
+	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
+	writeFileSync(AUTH_FILE, `${JSON.stringify(data, null, "\t")}\n`, "utf8");
+}
+
+function writeAuthEntry(provider: string, key: string): void {
+	const data = readAuthFile();
+	data[provider] = { type: "api_key", key };
+	writeAuthFile(data);
+}
+
+function deleteAuthEntry(provider: string): boolean {
+	const data = readAuthFile();
+	if (!(provider in data)) return false;
+	delete data[provider];
+	writeAuthFile(data);
+	return true;
+}
+
+/** Key 列表：文件里已存的 + 环境变量配置的（标注来源），脱敏显示 */
+function listKeys(): Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> {
+	const entries: Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> = [];
+	const names = new Map(modelRuntime.getProviders().map((p) => [p.id, p.name ?? p.id]));
+	for (const [provider, entry] of Object.entries(readAuthFile())) {
+		entries.push({
+			provider,
+			displayName: names.get(provider) ?? provider,
+			masked: maskKey(entry.key),
+			source: "file",
+		});
+	}
+	for (const provider of modelRuntime.getProviders()) {
+		if (provider.id in readAuthFile()) continue;
+		if (modelRuntime.hasConfiguredAuth(provider.id)) {
+			entries.push({
+				provider: provider.id,
+				displayName: provider.name ?? provider.id,
+				masked: "（环境变量）",
+				source: "env",
+			});
+		}
+	}
+	return entries;
+}
+
+function maskKey(key: string): string {
+	if (key.length <= 8) return "****";
+	return `${key.slice(0, 4)}****${key.slice(-4)}`;
+}
+
 /** 校验并归一化 prompt 的 images 参数；格式不对返回 undefined */
 function parseImages(images: unknown): Array<{ type: "image"; data: string; mimeType: string }> | undefined {
 	if (!Array.isArray(images)) return [];
@@ -565,6 +635,61 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// 模型枚举
 	if (pathname === "/api/models" && req.method === "GET") {
 		sendJson(res, 200, listModels());
+		return;
+	}
+
+	// 模型服务 Key 管理（auth.json 读写 + runtime 刷新）
+	if (pathname === "/api/keys" && req.method === "GET") {
+		sendJson(res, 200, listKeys());
+		return;
+	}
+	if (pathname === "/api/keys" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { provider?: unknown; key?: unknown };
+		if (typeof body?.provider !== "string" || typeof body?.key !== "string" || !body.key.trim()) {
+			sendJson(res, 400, { error: '请求体需为 {"provider": "...", "key": "..."}' });
+			return;
+		}
+		if (!modelRuntime.getProvider(body.provider)) {
+			sendJson(res, 404, { error: `未知的模型服务商：${body.provider}` });
+			return;
+		}
+		writeAuthEntry(body.provider, body.key.trim());
+		await modelRuntime.refresh();
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	const keyMatch = pathname.match(/^\/api\/keys\/([^/]+)$/);
+	if (keyMatch && req.method === "DELETE") {
+		const provider = decodeURIComponent(keyMatch[1]);
+		if (!deleteAuthEntry(provider)) {
+			sendJson(res, 404, { error: `${provider} 没有已保存的 Key` });
+			return;
+		}
+		await modelRuntime.refresh();
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+
+	// 应用版本与自更新
+	if (pathname === "/api/app/version" && req.method === "GET") {
+		sendJson(res, 200, { version: updates.APP_VERSION });
+		return;
+	}
+	if (pathname === "/api/app/update-check" && req.method === "GET") {
+		sendJson(res, 200, await updates.checkUpdate());
+		return;
+	}
+	if (pathname === "/api/app/update" && req.method === "POST") {
+		if (updates.getUpdateProgress().running) {
+			sendJson(res, 409, { error: "更新已在进行中" });
+			return;
+		}
+		void updates.runUpdate();
+		sendJson(res, 202, { ok: true });
+		return;
+	}
+	if (pathname === "/api/app/update-progress" && req.method === "GET") {
+		sendJson(res, 200, updates.getUpdateProgress());
 		return;
 	}
 
