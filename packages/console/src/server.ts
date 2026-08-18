@@ -28,6 +28,7 @@ import {
 	mountPack,
 	unmountPack,
 } from "./packs.ts";
+import { DATA_DIR } from "./paths.ts";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -42,12 +43,13 @@ const MODEL_SPEC = process.env.PI_CONSOLE_MODEL;
 
 const PACKAGE_ROOT = join(import.meta.dirname, ".."); // packages/console
 const WEB_DIR = join(PACKAGE_ROOT, "web");
-const WORKSPACES_DIR = join(PACKAGE_ROOT, "data", "workspaces");
+/** 会话工作区根目录（DATA_DIR 可通过 PI_CONSOLE_DATA 外置，安装版指向用户目录） */
+const WORKSPACES_DIR = join(DATA_DIR, "workspaces");
 /**
  * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
- * （data/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
+ * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
-const CONSOLE_AGENT_DIR = join(PACKAGE_ROOT, "data", "agent");
+const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
@@ -89,10 +91,15 @@ const modelRuntime = await ModelRuntime.create();
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
 
+// 首启引导：把安装包预置的 OfficeCLI 拷到外置数据目录（开发模式两者同路径，无操作）
+if (officecli.seedBundledBinary()) {
+	console.log("已把预置的 OfficeCLI 复制到数据目录");
+}
+
 // 预热：扩展注册的自定义 provider 只有在某个会话加载扩展之后才会出现在
 // ModelRuntime 里。启动时先加载一次全局扩展，PI_CONSOLE_MODEL 才能引用它们。
 try {
-	const warmupCwd = join(PACKAGE_ROOT, "data", "warmup");
+	const warmupCwd = join(DATA_DIR, "warmup");
 	mkdirSync(warmupCwd, { recursive: true });
 	await createAgentSession({
 		cwd: warmupCwd,
@@ -727,6 +734,7 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 
 server.listen(PORT, HOST, () => {
 	console.log(`Pi 控制台已启动：http://${HOST}:${PORT}`);
+	console.log(`数据目录：${DATA_DIR}`);
 	if (MODEL_SPEC) console.log(`模型（PI_CONSOLE_MODEL）：${MODEL_SPEC}`);
 	else console.log("模型：Pi 默认解析（settings / 上次选择）");
 	if (AUTH_TOKEN) console.log("鉴权：已启用（PI_CONSOLE_TOKEN），/api/* 需要 Bearer token");
