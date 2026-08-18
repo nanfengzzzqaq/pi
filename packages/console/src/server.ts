@@ -18,6 +18,7 @@ import {
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import * as fsExplorer from "./fs.ts";
 import * as officecli from "./officecli.ts";
 import {
 	activeToolNames,
@@ -123,8 +124,8 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				return { type: "text_delta", delta: inner.delta };
 			}
 			if (inner.type === "thinking_delta") {
-				// 只用于前端显示"思考中"指示，不传输思考内容
-				return { type: "thinking_delta" };
+				// 思考内容随事件下发，前端在可折叠的"思考过程"区滚动显示
+				return { type: "thinking_delta", delta: inner.delta };
 			}
 			return undefined;
 		}
@@ -667,6 +668,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		await modelRuntime.refresh();
 		sendJson(res, 200, { ok: true });
+		return;
+	}
+
+	// 本地资源管理器（受限浏览）
+	if (pathname === "/api/fs/roots" && req.method === "GET") {
+		sendJson(res, 200, fsExplorer.listRoots());
+		return;
+	}
+	if (pathname === "/api/fs/list" && req.method === "GET") {
+		const path = url.searchParams.get("path") ?? "";
+		try {
+			sendJson(res, 200, { entries: fsExplorer.listDir(path) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/read" && req.method === "GET") {
+		const path = url.searchParams.get("path") ?? "";
+		try {
+			sendJson(res, 200, fsExplorer.readFileAsBase64(path));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
 		return;
 	}
 
