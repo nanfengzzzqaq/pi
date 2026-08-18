@@ -13,6 +13,15 @@ const stopBtn = document.getElementById("stop-btn");
 const indicatorEl = document.getElementById("indicator");
 const errorBarEl = document.getElementById("error-bar");
 const connStateEl = document.getElementById("conn-state");
+const modelSelectEl = document.getElementById("model-select");
+const thinkingSelectEl = document.getElementById("thinking-select");
+const fileInputEl = document.getElementById("file-input");
+const attachBtnEl = document.getElementById("attach-btn");
+const attachmentsEl = document.getElementById("attachments");
+const packsListEl = document.getElementById("packs-list");
+const packsToggleEl = document.getElementById("packs-toggle");
+const packsPanelEl = document.getElementById("packs-panel");
+const packsChevronEl = document.getElementById("packs-chevron");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1; // 已收到（含）的最大事件序号
@@ -20,7 +29,7 @@ let running = false; // 一轮对话是否进行中
 let es = null; // 当前 EventSource
 let reconnectTimer = null;
 let currentAssistant = null; // 本轮正在流式输出的助手消息容器
-let thinkingActive = false;
+let pendingAttachments = []; // { name, mimeType, dataBase64, size, isImage }
 
 // ---------------------------------------------------------------------------
 // 基础请求
@@ -62,6 +71,8 @@ async function ensureSession() {
 		try {
 			const history = await api(`/api/sessions/${sessionId}/history`);
 			renderHistory(history);
+			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
+			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 			if (history.streaming) setRunning(true, true);
 			return;
 		} catch (error) {
@@ -75,6 +86,10 @@ async function ensureSession() {
 	sessionId = result.sessionId;
 	localStorage.setItem(SESSION_KEY, sessionId);
 	messagesEl.innerHTML = "";
+	// 同步新会话的默认模型 / 思考等级（来自持久化设置）
+	const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 }
 
 function renderHistory(history) {
@@ -192,6 +207,12 @@ function handleEvent(event) {
 		case "compaction_end":
 			setIndicator(false);
 			break;
+		case "model_changed":
+			syncModelSelect(event.provider, event.modelId);
+			break;
+		case "thinking_level_changed":
+			thinkingSelectEl.value = event.level;
+			break;
 		case "error":
 			showError(event.message || "发生错误");
 			setIndicator(false);
@@ -307,7 +328,6 @@ function setRunning(value, restoreOnly = false) {
 }
 
 function setIndicator(visible, text) {
-	thinkingActive = visible;
 	indicatorEl.hidden = !visible;
 	if (text) indicatorEl.textContent = text;
 }
@@ -324,6 +344,67 @@ function scrollToBottom() {
 	messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// ---------------------------------------------------------------------------
+// 附件
+// ---------------------------------------------------------------------------
+
+const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+function formatSize(bytes) {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fileToBase64(file) {
+	return new Promise((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(String(reader.result).split(",")[1] ?? "");
+		reader.onerror = reject;
+		reader.readAsDataURL(file);
+	});
+}
+
+function addAttachment(file) {
+	fileToBase64(file).then((dataBase64) => {
+		const attachment = {
+			name: file.name,
+			mimeType: file.type || "application/octet-stream",
+			dataBase64,
+			size: file.size,
+			isImage: IMAGE_MIME.has(file.type),
+		};
+		pendingAttachments.push(attachment);
+		renderAttachments();
+	});
+}
+
+function renderAttachments() {
+	attachmentsEl.innerHTML = "";
+	attachmentsEl.hidden = pendingAttachments.length === 0;
+	for (const [index, attachment] of pendingAttachments.entries()) {
+		const chip = document.createElement("span");
+		chip.className = "attachment-chip";
+		chip.textContent = `${attachment.isImage ? "🖼" : "📄"} ${attachment.name} (${formatSize(attachment.size)})`;
+		const remove = document.createElement("button");
+		remove.className = "chip-remove";
+		remove.textContent = "×";
+		remove.title = "移除附件";
+		remove.addEventListener("click", () => {
+			pendingAttachments.splice(index, 1);
+			renderAttachments();
+		});
+		chip.appendChild(remove);
+		attachmentsEl.appendChild(chip);
+	}
+}
+
+attachBtnEl.addEventListener("click", () => fileInputEl.click());
+fileInputEl.addEventListener("change", () => {
+	for (const file of fileInputEl.files ?? []) addAttachment(file);
+	fileInputEl.value = "";
+});
+
 async function sendMessage() {
 	const text = inputEl.value.trim();
 	if (!text || running || !sessionId) return;
@@ -332,10 +413,34 @@ async function sendMessage() {
 	appendMessage("user", text);
 	setRunning(true);
 	setIndicator(true, "思考中…");
+
 	try {
+		// 1) 先提取图片（给模型看的），再保存全部附件到 uploads/（含图片，模型可用工具读取）
+		const images = [];
+		for (const attachment of pendingAttachments) {
+			if (attachment.isImage) {
+				images.push({ data: attachment.dataBase64, mimeType: attachment.mimeType });
+			}
+		}
+		let attachmentLine = "";
+		if (pendingAttachments.length > 0) {
+			const saved = await api(`/api/sessions/${sessionId}/files`, {
+				method: "POST",
+				body: JSON.stringify({
+					files: pendingAttachments.map(({ name, mimeType, dataBase64 }) => ({
+						name,
+						mimeType,
+						dataBase64,
+					})),
+				}),
+			});
+			pendingAttachments = [];
+			renderAttachments();
+			attachmentLine = `\n[附件: ${saved.files.join(", ")}]`;
+		}
 		await api(`/api/sessions/${sessionId}/messages`, {
 			method: "POST",
-			body: JSON.stringify({ text }),
+			body: JSON.stringify({ text: text + attachmentLine, images }),
 		});
 	} catch (error) {
 		showError(error.message);
@@ -362,15 +467,277 @@ inputEl.addEventListener("keydown", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// 模型 / 思考等级选择器
+// ---------------------------------------------------------------------------
+
+function syncModelSelect(provider, modelId) {
+	const value = `${provider}/${modelId}`;
+	if ([...modelSelectEl.options].some((o) => o.value === value)) {
+		modelSelectEl.value = value;
+	}
+}
+
+async function loadModels() {
+	try {
+		const models = await api("/api/models");
+		modelSelectEl.innerHTML = "";
+		const authed = models.filter((m) => m.hasAuth);
+		const others = models.filter((m) => !m.hasAuth);
+		// 已配置 Key 的完整列出；无 Key 的折叠为按 provider 的占位项，避免上千项
+		const byProvider = new Map();
+		for (const m of others) {
+			const list = byProvider.get(m.provider) ?? [];
+			list.push(m);
+			byProvider.set(m.provider, list);
+		}
+		if (authed.length > 0) {
+			const group = document.createElement("optgroup");
+			group.label = "已配置 Key";
+			for (const m of authed) {
+				const option = document.createElement("option");
+				option.value = `${m.provider}/${m.modelId}`;
+				option.textContent = m.label;
+				group.appendChild(option);
+			}
+			modelSelectEl.appendChild(group);
+		}
+		if (byProvider.size > 0) {
+			const group = document.createElement("optgroup");
+			group.label = "未配置 Key";
+			for (const [provider, list] of byProvider) {
+				const option = document.createElement("option");
+				option.value = `${provider}/__none__`;
+				option.disabled = true;
+				option.textContent = `${provider}（${list.length} 个模型，未配置 Key）`;
+				group.appendChild(option);
+			}
+			modelSelectEl.appendChild(group);
+		}
+		modelSelectEl.disabled = models.length === 0;
+		// 恢复当前会话模型
+		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+	} catch (error) {
+		showError(`加载模型列表失败：${error.message}`);
+	}
+}
+
+modelSelectEl.addEventListener("change", async () => {
+	const value = modelSelectEl.value;
+	if (!value || !sessionId) return;
+	const [provider, ...rest] = value.split("/");
+	const modelId = rest.join("/");
+	try {
+		await api(`/api/sessions/${sessionId}/model`, {
+			method: "POST",
+			body: JSON.stringify({ provider, modelId }),
+		});
+	} catch (error) {
+		showError(`切换模型失败：${error.message}`);
+		// 恢复原值
+		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+	}
+});
+
+thinkingSelectEl.addEventListener("change", async () => {
+	if (!sessionId) return;
+	try {
+		const result = await api(`/api/sessions/${sessionId}/thinking`, {
+			method: "POST",
+			body: JSON.stringify({ level: thinkingSelectEl.value }),
+		});
+		thinkingSelectEl.value = result.level; // 服务端按模型能力截断后的实际值
+	} catch (error) {
+		showError(`切换思考等级失败：${error.message}`);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// 能力包面板
+// ---------------------------------------------------------------------------
+
+packsToggleEl.addEventListener("click", () => {
+	const collapsed = packsPanelEl.classList.toggle("collapsed");
+	packsChevronEl.textContent = collapsed ? "▸" : "▾";
+});
+
+async function loadPacks() {
+	try {
+		const packs = await api("/api/packs");
+		packsListEl.innerHTML = "";
+		if (packs.length === 0) {
+			packsListEl.textContent = "暂无能力包";
+			return;
+		}
+		for (const pack of packs) {
+			const card = document.createElement("div");
+			card.className = "pack-card";
+			card.dataset.packName = pack.name;
+
+			const header = document.createElement("div");
+			header.className = "pack-header";
+			const title = document.createElement("div");
+			title.className = "pack-title";
+			title.textContent = `${pack.displayName} v${pack.version}`;
+			const toggle = document.createElement("input");
+			toggle.type = "checkbox";
+			toggle.className = "pack-toggle";
+			toggle.checked = pack.mounted;
+			toggle.addEventListener("change", () => togglePack(pack.name, toggle));
+			header.appendChild(title);
+			header.appendChild(toggle);
+			card.appendChild(header);
+
+			const desc = document.createElement("div");
+			desc.className = "pack-desc";
+			desc.textContent = pack.description;
+			card.appendChild(desc);
+
+			const tools = document.createElement("div");
+			tools.className = "pack-tools";
+			tools.textContent = pack.tools.join(", ");
+			card.appendChild(tools);
+
+			if (pack.name === "office-assistant") {
+				const statusRow = document.createElement("div");
+				statusRow.className = "officecli-status";
+				card.appendChild(statusRow);
+				renderOfficeCliStatus(statusRow);
+			}
+
+			packsListEl.appendChild(card);
+		}
+	} catch (error) {
+		packsListEl.textContent = `加载失败：${error.message}`;
+	}
+}
+
+async function togglePack(name, toggle) {
+	const action = toggle.checked ? "mount" : "unmount";
+	try {
+		await api(`/api/packs/${name}/${action}`, { method: "POST", body: "{}" });
+		showInfo(`${action === "mount" ? "已挂载" : "已卸载"} ${name}，下一轮对话生效`);
+	} catch (error) {
+		toggle.checked = !toggle.checked;
+		showError(`切换能力包失败：${error.message}`);
+	}
+}
+
+/** OfficeCLI 状态行 + 下载按钮 + 进度条 */
+async function renderOfficeCliStatus(container, statusOverride) {
+	let status = statusOverride;
+	if (!status) {
+		try {
+			status = await api("/api/officecli/status");
+		} catch {
+			container.textContent = "状态获取失败";
+			return;
+		}
+	}
+	container.innerHTML = "";
+	const line = document.createElement("div");
+	line.className = "officecli-line";
+	const stateEl = document.createElement("span");
+	if (status.installed) {
+		stateEl.textContent = `已安装 v${status.version}`;
+	} else {
+		stateEl.textContent = "未安装";
+	}
+	line.appendChild(stateEl);
+	if (status.latestVersion && status.latestVersion !== status.version) {
+		const updateBadge = document.createElement("span");
+		updateBadge.className = "officecli-update-badge";
+		updateBadge.textContent = `可更新 → v${status.latestVersion}`;
+		line.appendChild(updateBadge);
+	}
+	container.appendChild(line);
+
+	const downloadBtn = document.createElement("button");
+	downloadBtn.className = "officecli-download";
+	downloadBtn.textContent = status.installed ? "更新" : "下载";
+	downloadBtn.addEventListener("click", async () => {
+		downloadBtn.disabled = true;
+		try {
+			await api("/api/officecli/download", { method: "POST", body: "{}" });
+			pollDownloadProgress(container, downloadBtn);
+		} catch (error) {
+			downloadBtn.disabled = false;
+			showError(`下载失败：${error.message}`);
+		}
+	});
+	container.appendChild(downloadBtn);
+}
+
+function pollDownloadProgress(container, downloadBtn) {
+	const barWrap = document.createElement("div");
+	barWrap.className = "download-bar-wrap";
+	const bar = document.createElement("div");
+	bar.className = "download-bar";
+	barWrap.appendChild(bar);
+	const pct = document.createElement("span");
+	pct.className = "download-pct";
+	pct.textContent = "0%";
+	container.appendChild(barWrap);
+	container.appendChild(pct);
+
+	const timer = setInterval(async () => {
+		let progress;
+		try {
+			progress = await api("/api/officecli/progress");
+		} catch {
+			clearInterval(timer);
+			downloadBtn.disabled = false;
+			return;
+		}
+		if (progress.running) {
+			const total = progress.totalBytes ?? 0;
+			const p = total > 0 ? Math.min(100, Math.round((progress.receivedBytes / total) * 100)) : 0;
+			bar.style.width = `${p}%`;
+			pct.textContent = `${p}%`;
+		} else {
+			clearInterval(timer);
+			downloadBtn.disabled = false;
+			barWrap.remove();
+			pct.remove();
+			if (progress.error) {
+				showError(`OfficeCLI 下载失败：${progress.error}`);
+			} else {
+				showInfo(`OfficeCLI 已更新到 v${progress.version}`);
+			}
+			renderOfficeCliStatus(container);
+		}
+	}, 1000);
+}
+
+// ---------------------------------------------------------------------------
 // 启动
 // ---------------------------------------------------------------------------
 
+let infoTimer = null;
+function showInfo(message) {
+	errorBarEl.textContent = message;
+	errorBarEl.classList.remove("error-bar");
+	errorBarEl.classList.add("info-bar");
+	errorBarEl.hidden = false;
+	clearTimeout(infoTimer);
+	infoTimer = setTimeout(() => {
+		errorBarEl.hidden = true;
+		errorBarEl.classList.remove("info-bar");
+		errorBarEl.classList.add("error-bar");
+	}, 6000);
+}
+
 (async function init() {
 	try {
+		await loadModels();
 		await ensureSession();
 		connectSSE();
+		loadPacks();
 		inputEl.disabled = false;
 		sendBtn.disabled = false;
+		modelSelectEl.disabled = false;
+		thinkingSelectEl.disabled = false;
 		inputEl.focus();
 	} catch (error) {
 		showError(`初始化失败：${error.message}`);

@@ -9,22 +9,52 @@
 <body>
 	<header class="topbar">
 		<span class="logo">Pi 控制台</span>
+		<div class="topbar-controls">
+			<select id="model-select" title="模型" disabled>
+				<option value="">加载模型中…</option>
+			</select>
+			<select id="thinking-select" title="思考等级" disabled>
+				<option value="off">off</option>
+				<option value="minimal">minimal</option>
+				<option value="low">low</option>
+				<option value="medium">medium</option>
+				<option value="high">high</option>
+				<option value="xhigh">xhigh</option>
+				<option value="max">max</option>
+			</select>
+		</div>
 		<span id="conn-state" class="conn-state">连接中…</span>
 	</header>
 
-	<div id="error-bar" class="error-bar" hidden></div>
+	<div class="layout">
+		<aside class="sidebar" id="sidebar">
+			<div class="sidebar-header" id="packs-toggle">能力包 <span class="chevron" id="packs-chevron">▾</span></div>
+			<div id="packs-panel" class="packs-panel">
+				<div id="packs-list" class="packs-list">加载中…</div>
+			</div>
+		</aside>
 
-	<main id="messages" class="messages"></main>
+		<main class="content">
+			<div id="error-bar" class="error-bar" hidden></div>
 
-	<div id="indicator" class="indicator" hidden>思考中…</div>
+			<main id="messages" class="messages"></main>
 
-	<footer class="composer">
-		<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
-		<div class="composer-buttons">
-			<button id="send-btn" disabled>发送</button>
-			<button id="stop-btn" hidden>停止</button>
-		</div>
-	</footer>
+			<div id="indicator" class="indicator" hidden>思考中…</div>
+
+			<footer class="composer">
+				<div class="attachments" id="attachments" hidden></div>
+				<div class="composer-row">
+					<button id="attach-btn" class="icon-btn" title="添加附件">📎</button>
+					<input type="file" id="file-input" multiple hidden>
+					<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+					<div class="composer-buttons">
+						<button id="send-btn" disabled>发送</button>
+						<button id="stop-btn" hidden>停止</button>
+					</div>
+				</div>
+			</footer>
+		</main>
+	</div>
 
 	<script src="/app.js"></script>
 </body>

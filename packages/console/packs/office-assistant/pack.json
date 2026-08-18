@@ -1,0 +1,6 @@
+{
+	"name": "office-assistant",
+	"displayName": "Office 助手",
+	"description": "通过 OfficeCLI 创建与编辑 Word/Excel/PowerPoint 文档（docx/xlsx/pptx）",
+	"version": "0.1.0"
+}
