@@ -27,7 +27,7 @@ npx tsx packages/console/src/server.ts
 
 - **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
-- **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup 静默重装并自动重启）
+- **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup 静默重装并自动重启；私有仓库需在设置里填写 GitHub Token；启动器为 ASCII 文件名 launcher.vbs 以规避控制台代码页问题）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
 
 ## Windows 安装包（installer/）

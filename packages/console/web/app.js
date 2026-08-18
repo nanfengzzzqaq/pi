@@ -36,6 +36,9 @@ const updateStatusEl = document.getElementById("update-status");
 const updateProgressEl = document.getElementById("update-progress");
 const updateProgressBarEl = document.getElementById("update-progress-bar");
 const dropOverlayEl = document.getElementById("drop-overlay");
+const githubTokenInputEl = document.getElementById("github-token-input");
+const githubTokenSaveBtnEl = document.getElementById("github-token-save-btn");
+const githubTokenClearBtnEl = document.getElementById("github-token-clear-btn");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1; // 已收到（含）的最大事件序号
@@ -888,7 +891,41 @@ async function loadVersionSection() {
 	} catch {
 		appVersionEl.textContent = "版本未知";
 	}
+	try {
+		const tokenInfo = await api("/api/app/github-token");
+		githubTokenClearBtnEl.hidden = !tokenInfo.configured;
+		if (tokenInfo.configured) githubTokenInputEl.placeholder = "已保存 GitHub Token（输入可替换）";
+	} catch {
+		/* 忽略 */
+	}
 }
+
+githubTokenSaveBtnEl.addEventListener("click", async () => {
+	const token = githubTokenInputEl.value.trim();
+	if (!token) {
+		showError("请先填写 GitHub Token");
+		return;
+	}
+	try {
+		await api("/api/app/github-token", { method: "POST", body: JSON.stringify({ token }) });
+		githubTokenInputEl.value = "";
+		showInfo("GitHub Token 已保存");
+		await loadVersionSection();
+	} catch (error) {
+		showError(`保存失败：${error.message}`);
+	}
+});
+
+githubTokenClearBtnEl.addEventListener("click", async () => {
+	try {
+		await api("/api/app/github-token", { method: "DELETE" });
+		showInfo("已清除 GitHub Token");
+		githubTokenInputEl.placeholder = "GitHub Token（ghp_…，可选）";
+		await loadVersionSection();
+	} catch (error) {
+		showError(`清除失败：${error.message}`);
+	}
+});
 
 updateCheckBtnEl.addEventListener("click", async () => {
 	updateCheckBtnEl.disabled = true;

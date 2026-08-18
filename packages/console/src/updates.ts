@@ -7,7 +7,7 @@
  * → 本进程 exit。
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
@@ -27,6 +27,7 @@ export const APP_VERSION = (() => {
 
 interface ReleaseAsset {
 	name: string;
+	url?: string; // GitHub Assets API 地址（私有仓库下载唯一可靠途径）
 	browser_download_url: string;
 	size?: number;
 	digest?: string;
@@ -37,16 +38,52 @@ export interface UpdateInfo {
 	latest: string | null;
 	updateAvailable: boolean | null;
 	assetUrl: string | null;
+	/** Assets API 地址（带 token 时优先用它下载，私有仓库必需） */
+	assetApiUrl: string | null;
 	assetName: string | null;
 	assetSize: number | null;
 	notes: string | null;
+}
+
+/**
+ * 可选的 GitHub 访问令牌（私有仓库的 Release 检查/下载需要；公开仓库无需配置）。
+ * 明文存 <DATA_DIR>/agent/github-token.txt，仅本机使用。
+ */
+const TOKEN_FILE = join(DATA_DIR, "agent", "github-token.txt");
+
+export function githubToken(): string | null {
+	try {
+		const token = readFileSync(TOKEN_FILE, "utf8").trim();
+		return token || null;
+	} catch {
+		return null;
+	}
+}
+
+export function setGithubToken(token: string): void {
+	mkdirSync(join(DATA_DIR, "agent"), { recursive: true });
+	writeFileSync(TOKEN_FILE, token, "utf8");
+}
+
+export function clearGithubToken(): boolean {
+	if (!existsSync(TOKEN_FILE)) return false;
+	rmSync(TOKEN_FILE, { force: true });
+	return true;
+}
+
+/** GitHub 请求公共头（带可选令牌） */
+function githubHeaders(): Record<string, string> {
+	const headers: Record<string, string> = { "User-Agent": "pi-console" };
+	const token = githubToken();
+	if (token) headers.Authorization = `Bearer ${token}`;
+	return headers;
 }
 
 /** 通过 302 跳转拿最新 tag（GitHub API 匿名限流时的降级路径） */
 async function latestTagViaRedirect(): Promise<string | null> {
 	try {
 		const res = await fetch(`https://github.com/${REPO}/releases/latest`, {
-			headers: { "User-Agent": "pi-console" },
+			headers: githubHeaders(),
 			redirect: "manual",
 			signal: AbortSignal.timeout(15000),
 		});
@@ -74,6 +111,7 @@ export async function checkUpdate(): Promise<UpdateInfo> {
 		latest: null,
 		updateAvailable: null,
 		assetUrl: null,
+		assetApiUrl: null,
 		assetName: null,
 		assetSize: null,
 		notes: null,
@@ -83,7 +121,7 @@ export async function checkUpdate(): Promise<UpdateInfo> {
 	let assets: ReleaseAsset[] = [];
 	try {
 		const res = await fetch(GITHUB_LATEST_API, {
-			headers: { "User-Agent": "pi-console", Accept: "application/vnd.github+json" },
+			headers: { ...githubHeaders(), Accept: "application/vnd.github+json" },
 			signal: AbortSignal.timeout(15000),
 		});
 		if (res.ok) {
@@ -103,6 +141,7 @@ export async function checkUpdate(): Promise<UpdateInfo> {
 	const asset = assets.find((a) => /Setup-.*\.exe$/i.test(a.name));
 	if (asset) {
 		info.assetUrl = asset.browser_download_url;
+		info.assetApiUrl = asset.url ?? null;
 		info.assetName = asset.name;
 		info.assetSize = asset.size ?? null;
 	} else {
@@ -145,8 +184,14 @@ export async function runUpdate(): Promise<void> {
 		mkdirSync(updateDir, { recursive: true });
 		const setupPath = join(updateDir, info.assetName ?? "Pi控制台-Setup.exe");
 
-		const res = await fetch(info.assetUrl, {
-			headers: { "User-Agent": "pi-console" },
+		// 带 token 时优先走 Assets API（私有仓库 browser_download_url 直链会 404）；
+		// 无 token（公开仓库）用 browser_download_url 直链
+		const downloadUrl = githubToken() && info.assetApiUrl ? info.assetApiUrl : info.assetUrl;
+		const downloadHeaders = githubHeaders();
+		if (downloadUrl === info.assetApiUrl) downloadHeaders.Accept = "application/octet-stream";
+
+		const res = await fetch(downloadUrl, {
+			headers: downloadHeaders,
 			signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
 		});
 		if (!res.ok || !res.body) throw new Error(`下载失败：HTTP ${res.status}`);
@@ -196,14 +241,27 @@ export async function runUpdate(): Promise<void> {
 }
 
 /**
- * 派生独立的 cmd：等待 2 秒（本进程退出、node.exe 解锁）→ 静默安装 →
+ * 派生独立进程执行更新收尾：等 2 秒（本进程退出、node.exe 解锁）→ 静默安装 →
  * 重新运行安装目录里的 vbs 启动器（客户端重开）。
+ * 用 .cmd 文件中转，避免 spawn 参数里多层引号被 cmd 吃掉。
  */
 function installAndRestart(setupPath: string): void {
 	// PACKAGE_ROOT = <安装目录>\app，启动器在安装目录根部
-	const launcher = join(PACKAGE_ROOT, "..", "Pi控制台.vbs");
-	const script = `timeout /t 2 /nobreak >nul & "${setupPath}" /S & wscript.exe "${launcher}"`;
-	spawn("cmd.exe", ["/c", script], {
+	// 启动器用 ASCII 文件名（launcher.vbs）：更新收尾由 cmd 调用，
+	// 中文文件名在 GBK 控制台下会被读成乱码导致 wscript 找不到文件
+	const launcher = join(PACKAGE_ROOT, "..", "launcher.vbs");
+	const batPath = join(DATA_DIR, "update", "apply-update.cmd");
+	const content = [
+		"@echo off",
+		"timeout /t 2 /nobreak >nul",
+		// cmd 调用 GUI 程序（NSIS Setup）默认不等待；必须 start /wait 等安装真正完成，
+		// 否则 vbs 会在 app 目录被覆盖途中启动 node，导致服务起不来
+		`start "" /wait "${setupPath}" /S`,
+		`wscript.exe "${launcher}"`,
+		"",
+	].join("\r\n");
+	writeFileSync(batPath, content, "utf8");
+	spawn("cmd.exe", ["/d", "/c", batPath], {
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,

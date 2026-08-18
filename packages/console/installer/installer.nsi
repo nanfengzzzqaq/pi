@@ -47,17 +47,17 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" ""
 Section "Install"
   SetOutPath "$INSTDIR"
 
-  ; staging 内容：node\、app\、两个启动器
+  ; staging 内容：node\、app\、两个启动器（vbs 用 ASCII 文件名，更新链 cmd 调用时不受代码页影响）
   File /r "${STAGING}\node"
   File /r "${STAGING}\app"
   File "${STAGING}\Pi控制台.bat"
-  File "${STAGING}\Pi控制台.vbs"
+  File "${STAGING}\launcher.vbs"
 
-  ; 开始菜单 + 桌面快捷方式（指向 .vbs：隐藏窗口并自动开浏览器）
+  ; 开始菜单 + 桌面快捷方式（指向 launcher.vbs：隐藏窗口并自动开客户端窗口）
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
-  CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\Pi控制台.vbs" "" "$INSTDIR\Pi控制台.vbs"
+  CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\卸载 ${APPNAME}.lnk" "$INSTDIR\Uninstall.exe"
-  CreateShortcut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\Pi控制台.vbs" "" "$INSTDIR\Pi控制台.vbs"
+  CreateShortcut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
 
   ; 注册卸载信息（当前用户）
   WriteRegStr HKCU "Software\${APPID}" "InstallDir" "$INSTDIR"
