@@ -56,9 +56,18 @@ function Get-FileChecked([string]$Url, [string]$Dest) {
 # 1. 清理
 # ---------------------------------------------------------------------------
 
-if (Test-Path $Staging) { Remove-Item $Staging -Recurse -Force }
-if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
-New-Item -ItemType Directory -Path $Staging, $OutDir, (Join-Path $Staging "node") | Out-Null
+# 目录被其他进程占用（如资源管理器/终端停在里面）时只清内容，不让构建硬失败
+foreach ($dir in @($Staging, $OutDir)) {
+    if (Test-Path $dir) {
+        try {
+            Remove-Item $dir -Recurse -Force -ErrorAction Stop
+        } catch {
+            Get-ChildItem $dir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "目录被占用，已尽量清空内容：$dir"
+        }
+    }
+}
+New-Item -ItemType Directory -Path $Staging, $OutDir, (Join-Path $Staging "node") -Force | Out-Null
 
 # ---------------------------------------------------------------------------
 # 2. 运行时 Node（官方绿色版，只取 node.exe，SHA256 校验）
@@ -184,14 +193,31 @@ pause
 '@
 Set-Content -Path (Join-Path $Staging "Pi控制台.bat") -Value $Bat -Encoding ASCII
 
-# 日常启动器：隐藏窗口运行 + 轮询就绪后开浏览器（冷启动需 10-30 秒）。内容保持 ASCII。
+# 日常启动器：隐藏窗口运行 + 轮询就绪后以 Edge App 模式打开独立客户端窗口
+# （无地址栏/标签页的独立窗口；找不到 Edge 时回退默认浏览器）。内容保持 ASCII。
 $Vbs = @'
-Rem Pi Console launcher: hidden window + open browser when ready
-Dim base, sh, exec, line, listening, i, ready, http
+Rem Pi Console launcher: hidden server + standalone app window (Edge --app mode)
+Dim base, sh, exec, line, listening, i, ready, http, edge
 Set sh = CreateObject("WScript.Shell")
 Dim fso
 Set fso = CreateObject("Scripting.FileSystemObject")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
+
+Rem Locate Edge (typical install paths)
+edge = ""
+If fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\Microsoft\Edge\Application\msedge.exe") Then
+  edge = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\Microsoft\Edge\Application\msedge.exe"
+ElseIf fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\Microsoft\Edge\Application\msedge.exe") Then
+  edge = sh.ExpandEnvironmentStrings("%ProgramFiles%") & "\Microsoft\Edge\Application\msedge.exe"
+End If
+
+Sub OpenAppWindow()
+  If edge <> "" Then
+    sh.Run """" & edge & """ --app=http://127.0.0.1:3200/ --window-size=1280,860", 1, False
+  Else
+    sh.Run "http://127.0.0.1:3200", 1, False
+  End If
+End Sub
 
 listening = False
 Set exec = sh.Exec("cmd /c netstat -ano | findstr " & Chr(34) & ":3200" & Chr(34))
@@ -201,7 +227,7 @@ Do While Not exec.StdOut.AtEndOfStream
 Loop
 
 If listening Then
-  sh.Run "http://127.0.0.1:3200", 1, False
+  OpenAppWindow
 Else
   sh.Environment("PROCESS")("PI_CONSOLE_DATA") = sh.ExpandEnvironmentStrings("%APPDATA%") & "\pi-console\data"
   sh.Environment("PROCESS")("PORT") = "3200"
@@ -219,7 +245,7 @@ Else
     On Error Goto 0
     If ready Then Exit For
   Next
-  sh.Run "http://127.0.0.1:3200", 1, False
+  OpenAppWindow
 End If
 '@
 Set-Content -Path (Join-Path $Staging "Pi控制台.vbs") -Value $Vbs -Encoding ASCII

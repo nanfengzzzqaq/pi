@@ -22,6 +22,20 @@ const packsListEl = document.getElementById("packs-list");
 const packsToggleEl = document.getElementById("packs-toggle");
 const packsPanelEl = document.getElementById("packs-panel");
 const packsChevronEl = document.getElementById("packs-chevron");
+const settingsBtnEl = document.getElementById("settings-btn");
+const settingsModalEl = document.getElementById("settings-modal");
+const settingsCloseEl = document.getElementById("settings-close");
+const keyProviderEl = document.getElementById("key-provider");
+const keyInputEl = document.getElementById("key-input");
+const keyAddBtnEl = document.getElementById("key-add-btn");
+const keyListEl = document.getElementById("key-list");
+const appVersionEl = document.getElementById("app-version");
+const updateCheckBtnEl = document.getElementById("update-check-btn");
+const updateRunBtnEl = document.getElementById("update-run-btn");
+const updateStatusEl = document.getElementById("update-status");
+const updateProgressEl = document.getElementById("update-progress");
+const updateProgressBarEl = document.getElementById("update-progress-bar");
+const dropOverlayEl = document.getElementById("drop-overlay");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1; // 已收到（含）的最大事件序号
@@ -727,6 +741,211 @@ function showInfo(message) {
 		errorBarEl.classList.add("error-bar");
 	}, 6000);
 }
+
+// ---------------------------------------------------------------------------
+// 拖拽 / 粘贴添加附件（与 📎 按钮同一条管道）
+// ---------------------------------------------------------------------------
+
+let dragDepth = 0;
+
+window.addEventListener("dragenter", (e) => {
+	if (!e.dataTransfer?.types.includes("Files")) return;
+	e.preventDefault();
+	dragDepth++;
+	dropOverlayEl.hidden = false;
+});
+window.addEventListener("dragover", (e) => {
+	if (!e.dataTransfer?.types.includes("Files")) return;
+	e.preventDefault();
+});
+window.addEventListener("dragleave", (e) => {
+	e.preventDefault();
+	dragDepth = Math.max(0, dragDepth - 1);
+	if (dragDepth === 0) dropOverlayEl.hidden = true;
+});
+window.addEventListener("drop", (e) => {
+	e.preventDefault();
+	dragDepth = 0;
+	dropOverlayEl.hidden = true;
+	for (const file of e.dataTransfer?.files ?? []) addAttachment(file);
+});
+
+// 粘贴：截图/复制的文件进入附件管道（输入框获得焦点时粘贴文本不受影响）
+window.addEventListener("paste", (e) => {
+	const files = e.clipboardData?.files;
+	if (!files || files.length === 0) return;
+	e.preventDefault();
+	for (const file of files) addAttachment(file);
+});
+
+// ---------------------------------------------------------------------------
+// 设置弹窗：模型服务 Key 管理 + 应用更新
+// ---------------------------------------------------------------------------
+
+settingsBtnEl.addEventListener("click", () => {
+	settingsModalEl.hidden = false;
+	loadKeysSection();
+	loadVersionSection();
+});
+settingsCloseEl.addEventListener("click", () => {
+	settingsModalEl.hidden = true;
+});
+settingsModalEl.addEventListener("click", (e) => {
+	if (e.target === settingsModalEl) settingsModalEl.hidden = true;
+});
+
+async function loadKeysSection() {
+	// 服务商下拉（全部 provider；已配置的排前面标注）
+	try {
+		const [keys, models] = await Promise.all([api("/api/keys"), api("/api/models")]);
+		const providers = new Map(models.map((m) => [m.provider, m.label.split(" · ")[0]]));
+		keyProviderEl.innerHTML = "";
+		const existing = new Set(keys.map((k) => k.provider));
+		const sorted = [...providers.keys()].sort((a, b) => {
+			const ea = existing.has(a) ? 0 : 1;
+			const eb = existing.has(b) ? 0 : 1;
+			return ea - eb || a.localeCompare(b);
+		});
+		for (const p of sorted) {
+			const option = document.createElement("option");
+			option.value = p;
+			option.textContent = existing.has(p) ? `${providers.get(p)}（已配置）` : providers.get(p);
+			keyProviderEl.appendChild(option);
+		}
+		renderKeyList(keys);
+	} catch (error) {
+		keyListEl.textContent = `加载失败：${error.message}`;
+	}
+}
+
+function renderKeyList(keys) {
+	keyListEl.innerHTML = "";
+	if (keys.length === 0) {
+		keyListEl.innerHTML = '<div class="key-empty">尚未配置任何模型服务</div>';
+		return;
+	}
+	for (const entry of keys) {
+		const row = document.createElement("div");
+		row.className = "key-row";
+		const name = document.createElement("span");
+		name.className = "key-name";
+		name.textContent = entry.displayName;
+		const masked = document.createElement("span");
+		masked.className = "key-masked";
+		masked.textContent = entry.masked;
+		row.appendChild(name);
+		row.appendChild(masked);
+		if (entry.source === "file") {
+			const del = document.createElement("button");
+			del.className = "key-delete";
+			del.textContent = "删除";
+			del.addEventListener("click", async () => {
+				try {
+					await api(`/api/keys/${encodeURIComponent(entry.provider)}`, { method: "DELETE" });
+					showInfo(`已删除 ${entry.displayName} 的 Key`);
+					await loadKeysSection();
+					await loadModels();
+				} catch (error) {
+					showError(`删除失败：${error.message}`);
+				}
+			});
+			row.appendChild(del);
+		} else {
+			const envTag = document.createElement("span");
+			envTag.className = "key-env-tag";
+			envTag.textContent = "环境变量";
+			row.appendChild(envTag);
+		}
+		keyListEl.appendChild(row);
+	}
+}
+
+keyAddBtnEl.addEventListener("click", async () => {
+	const provider = keyProviderEl.value;
+	const key = keyInputEl.value.trim();
+	if (!provider || !key) {
+		showError("请选择服务商并填写 API Key");
+		return;
+	}
+	keyAddBtnEl.disabled = true;
+	try {
+		await api("/api/keys", { method: "POST", body: JSON.stringify({ provider, key }) });
+		keyInputEl.value = "";
+		showInfo(`已添加 ${provider}，模型列表已刷新`);
+		await loadKeysSection();
+		await loadModels();
+	} catch (error) {
+		showError(`添加失败：${error.message}`);
+	} finally {
+		keyAddBtnEl.disabled = false;
+	}
+});
+
+async function loadVersionSection() {
+	try {
+		const info = await api("/api/app/version");
+		appVersionEl.textContent = `版本 v${info.version}`;
+	} catch {
+		appVersionEl.textContent = "版本未知";
+	}
+}
+
+updateCheckBtnEl.addEventListener("click", async () => {
+	updateCheckBtnEl.disabled = true;
+	updateStatusEl.textContent = "正在检查更新…";
+	updateRunBtnEl.hidden = true;
+	try {
+		const info = await api("/api/app/update-check");
+		if (info.latest === null) {
+			updateStatusEl.textContent = "无法连接 GitHub 检查更新（网络问题或限流），请稍后再试";
+		} else if (info.updateAvailable) {
+			updateStatusEl.textContent = `发现新版本 v${info.latest}（当前 v${info.current}）`;
+			updateRunBtnEl.hidden = false;
+		} else {
+			updateStatusEl.textContent = `已是最新版 v${info.current}`;
+		}
+	} catch (error) {
+		updateStatusEl.textContent = `检查失败：${error.message}`;
+	} finally {
+		updateCheckBtnEl.disabled = false;
+	}
+});
+
+updateRunBtnEl.addEventListener("click", async () => {
+	updateRunBtnEl.disabled = true;
+	updateStatusEl.textContent = "正在下载更新…";
+	updateProgressEl.hidden = false;
+	try {
+		await api("/api/app/update", { method: "POST", body: "{}" });
+	} catch (error) {
+		updateStatusEl.textContent = `更新失败：${error.message}`;
+		updateRunBtnEl.disabled = false;
+		updateProgressEl.hidden = true;
+		return;
+	}
+	const timer = setInterval(async () => {
+		let progress;
+		try {
+			progress = await api("/api/app/update-progress");
+		} catch {
+			return; // 服务已退出（进入安装阶段）属正常
+		}
+		if (progress.running && progress.phase === "downloading") {
+			const total = progress.totalBytes ?? 0;
+			const p = total > 0 ? Math.min(100, Math.round((progress.receivedBytes / total) * 100)) : 0;
+			updateProgressBarEl.style.width = `${p}%`;
+			updateStatusEl.textContent = `正在下载更新… ${p}%`;
+		} else if (progress.running && progress.phase === "installing") {
+			updateStatusEl.textContent = "下载完成，正在安装并重启客户端…";
+		} else if (progress.error) {
+			clearInterval(timer);
+			updateStatusEl.textContent = `更新失败：${progress.error}`;
+			updateRunBtnEl.disabled = false;
+			updateProgressEl.hidden = true;
+		}
+		// 安装阶段服务进程退出后轮询失败，停留在"正在安装"提示，等新实例起来
+	}, 1000);
+});
 
 (async function init() {
 	try {

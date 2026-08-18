@@ -459,3 +459,205 @@ body {
 	background: var(--error);
 	color: #fff;
 }
+
+/* 拖放附件遮罩 */
+.drop-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 90;
+	background: rgba(59, 110, 245, 0.12);
+	border: 3px dashed var(--accent);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+/* display:flex 会压过 hidden 属性的 UA 样式，显式恢复 */
+.drop-overlay[hidden],
+.modal[hidden] {
+	display: none;
+}
+
+.drop-overlay-inner {
+	background: var(--panel);
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	padding: 24px 40px;
+	font-size: 18px;
+	font-weight: 600;
+	color: var(--accent);
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+/* 设置弹窗 */
+.modal {
+	position: fixed;
+	inset: 0;
+	z-index: 100;
+	background: rgba(15, 20, 30, 0.45);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.modal-body {
+	width: min(560px, calc(100vw - 40px));
+	max-height: calc(100vh - 80px);
+	overflow-y: auto;
+	background: var(--panel);
+	border-radius: 12px;
+	padding: 18px 20px;
+	box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.modal-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 8px;
+}
+
+.modal-title {
+	font-size: 16px;
+	font-weight: 600;
+}
+
+.modal-section {
+	border-top: 1px solid var(--border);
+	padding: 14px 0 6px;
+}
+
+.modal-section h3 {
+	margin: 0 0 6px;
+	font-size: 14px;
+}
+
+.modal-hint {
+	margin: 0 0 10px;
+	color: var(--muted);
+	font-size: 12px;
+	line-height: 1.5;
+}
+
+.key-add-row {
+	display: flex;
+	gap: 8px;
+	margin-bottom: 10px;
+}
+
+.key-add-row select {
+	flex: 0 1 150px;
+	padding: 6px 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	font: inherit;
+	font-size: 13px;
+}
+
+.key-add-row input {
+	flex: 1;
+	padding: 6px 10px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	font: inherit;
+	font-size: 13px;
+	outline: none;
+}
+
+.key-add-row input:focus {
+	border-color: var(--accent);
+}
+
+.key-add-row button {
+	padding: 6px 16px;
+	border: none;
+	border-radius: 6px;
+	background: var(--accent);
+	color: var(--accent-text);
+	font: inherit;
+	font-size: 13px;
+	cursor: pointer;
+}
+
+.key-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.key-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	font-size: 13px;
+}
+
+.key-name {
+	font-weight: 600;
+}
+
+.key-masked {
+	flex: 1;
+	font-family: var(--mono);
+	color: var(--muted);
+	font-size: 12px;
+}
+
+.key-delete {
+	padding: 3px 10px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: transparent;
+	color: var(--error);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.key-env-tag {
+	padding: 2px 8px;
+	border-radius: 10px;
+	background: #eef1f5;
+	color: var(--muted);
+	font-size: 11px;
+}
+
+.key-empty {
+	color: var(--muted);
+	font-size: 13px;
+	padding: 4px 0;
+}
+
+.update-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin-bottom: 8px;
+}
+
+.update-row span {
+	flex: 1;
+	color: var(--muted);
+	font-size: 13px;
+}
+
+.update-row button {
+	padding: 6px 14px;
+	border: none;
+	border-radius: 6px;
+	background: var(--accent);
+	color: var(--accent-text);
+	font: inherit;
+	font-size: 13px;
+	cursor: pointer;
+}
+
+.update-status {
+	color: var(--muted);
+	font-size: 13px;
+	min-height: 18px;
+	margin-bottom: 6px;
+}

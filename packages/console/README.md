@@ -23,6 +23,13 @@ npx tsx packages/console/src/server.ts
 
 > PowerShell 请用 `$env:PI_CONSOLE_MODEL="..."`，Git Bash 请用 `export PI_CONSOLE_MODEL=...`。
 
+## 新特性（v0.2）：模型 Key 管理 / 桌面客户端窗口 / 应用内更新 / 拖拽与粘贴附件
+
+- **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量
+- **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
+- **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup 静默重装并自动重启）
+- **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
+
 ## Windows 安装包（installer/）
 
 给没有 Node/开发环境的普通用户：双击 Setup exe 安装，桌面图标点开即用。
