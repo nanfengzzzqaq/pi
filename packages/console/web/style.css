@@ -12,6 +12,7 @@
 	--error: #d93025;
 	--error-bg: #fdeceb;
 	--ok: #1a7f37;
+	--ok-bg: #e6f4ea;
 	--mono: Consolas, "Courier New", monospace;
 }
 
@@ -38,7 +39,7 @@ body {
 .topbar {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
+	gap: 16px;
 	padding: 10px 16px;
 	background: var(--panel);
 	border-bottom: 1px solid var(--border);
@@ -47,6 +48,23 @@ body {
 .logo {
 	font-weight: 600;
 	font-size: 15px;
+}
+
+.topbar-controls {
+	display: flex;
+	gap: 8px;
+	margin-left: auto;
+}
+
+.topbar select {
+	padding: 4px 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	font: inherit;
+	font-size: 13px;
+	background: var(--panel);
+	color: var(--text);
+	max-width: 260px;
 }
 
 .conn-state {
@@ -58,16 +76,178 @@ body {
 	color: var(--error);
 }
 
-/* 错误提示条 */
-.error-bar {
+/* 布局：左栏能力包 + 主聊天区 */
+.layout {
+	flex: 1;
+	display: flex;
+	min-height: 0;
+}
+
+.sidebar {
+	width: 240px;
+	flex-shrink: 0;
+	background: var(--panel);
+	border-right: 1px solid var(--border);
+	overflow-y: auto;
+}
+
+.sidebar-header {
+	padding: 10px 14px;
+	font-weight: 600;
+	cursor: pointer;
+	user-select: none;
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	border-bottom: 1px solid var(--border);
+}
+
+.chevron {
+	color: var(--muted);
+	font-size: 12px;
+}
+
+.packs-panel {
+	padding: 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.packs-panel.collapsed {
+	display: none;
+}
+
+.packs-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	color: var(--muted);
+	font-size: 13px;
+}
+
+.pack-card {
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 10px;
+}
+
+.pack-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 8px;
+}
+
+.pack-title {
+	font-weight: 600;
+	font-size: 13px;
+}
+
+.pack-toggle {
+	width: 16px;
+	height: 16px;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+
+.pack-desc {
+	margin-top: 6px;
+	color: var(--muted);
+	font-size: 12px;
+	line-height: 1.5;
+}
+
+.pack-tools {
+	margin-top: 6px;
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--muted);
+	word-break: break-all;
+}
+
+.officecli-status {
+	margin-top: 8px;
+	padding-top: 8px;
+	border-top: 1px dashed var(--border);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.officecli-line {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+}
+
+.officecli-update-badge {
+	color: var(--accent);
+}
+
+.officecli-download {
+	padding: 4px 10px;
+	border: none;
+	border-radius: 6px;
+	background: var(--accent);
+	color: var(--accent-text);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.officecli-download:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.download-bar-wrap {
+	height: 6px;
+	border-radius: 3px;
+	background: var(--border);
+	overflow: hidden;
+}
+
+.download-bar {
+	height: 100%;
+	width: 0;
+	background: var(--accent);
+	transition: width 0.3s;
+}
+
+.download-pct {
+	font-size: 11px;
+	color: var(--muted);
+}
+
+/* 主区 */
+.content {
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+
+/* 错误/信息提示条 */
+#error-bar {
 	margin: 8px 16px 0;
 	padding: 8px 12px;
-	border: 1px solid #f3c2be;
 	border-radius: 6px;
-	background: var(--error-bg);
-	color: var(--error);
 	font-size: 13px;
 	word-break: break-all;
+}
+
+#error-bar.error-bar {
+	border: 1px solid #f3c2be;
+	background: var(--error-bg);
+	color: var(--error);
+}
+
+#error-bar.info-bar {
+	border: 1px solid #b7e0c4;
+	background: var(--ok-bg);
+	color: var(--ok);
 }
 
 /* 消息区 */
@@ -179,11 +359,61 @@ body {
 /* 输入区 */
 .composer {
 	display: flex;
-	gap: 10px;
-	align-items: flex-end;
+	flex-direction: column;
+	gap: 8px;
 	padding: 12px 16px;
 	background: var(--panel);
 	border-top: 1px solid var(--border);
+}
+
+.attachments {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.attachment-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 10px;
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: #f0f2f5;
+	font-size: 12px;
+}
+
+.chip-remove {
+	border: none;
+	background: transparent;
+	color: var(--muted);
+	cursor: pointer;
+	font-size: 14px;
+	line-height: 1;
+	padding: 0;
+}
+
+.chip-remove:hover {
+	color: var(--error);
+}
+
+.composer-row {
+	display: flex;
+	gap: 10px;
+	align-items: flex-end;
+}
+
+.icon-btn {
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--panel);
+	font-size: 16px;
+	cursor: pointer;
+}
+
+.icon-btn:hover {
+	background: #f0f2f5;
 }
 
 .composer textarea {

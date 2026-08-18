@@ -1,14 +1,14 @@
 /**
- * Pi Web 控制台 — 第 1 步：后端骨架 + 最简对话页面
+ * Pi Web 控制台 — 第 2 步：能力包框架 + Office 助手包 + 前端增强
  *
- * 纯净原生 Pi：不注册自定义工具、不覆盖系统提示词，
- * 默认启用内置 read/bash/edit/write 工具与官方系统提示词。
+ * 默认形态仍是纯净原生 Pi（read/bash/edit/write + 官方系统提示词）；
+ * 能力包通过 customTools 注册、setActiveToolsByName 挂载/卸载。
  *
- * 全部后端逻辑都在这一个文件里，只用 node:http 原生模块，不引入框架。
+ * 全部后端逻辑都在 src/ 下按模块拆分，HTTP 层只用 node:http 原生模块，不引入框架。
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import {
@@ -18,6 +18,16 @@ import {
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import * as officecli from "./officecli.ts";
+import {
+	activeToolNames,
+	instantiatePackTools,
+	listPacks,
+	loadPacks,
+	mountedPacks,
+	mountPack,
+	unmountPack,
+} from "./packs.ts";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -27,17 +37,27 @@ const HOST = "127.0.0.1";
 const PORT = Number(process.env.PORT ?? 3200);
 /** 可选鉴权：设置后所有 /api/* 请求必须带 Authorization: Bearer <token>（或 ?token=），静态页面放行 */
 const AUTH_TOKEN = process.env.PI_CONSOLE_TOKEN;
-/** 可选模型：格式 provider/model-id，如 zai-coding-cn/glm-5.2；未设置则走 Pi 默认解析 */
+/** 可选模型：格式 provider/model-id，如 deepseek/deepseek-v4-flash；未设置则走 Pi 默认解析（含上次选择） */
 const MODEL_SPEC = process.env.PI_CONSOLE_MODEL;
 
 const PACKAGE_ROOT = join(import.meta.dirname, ".."); // packages/console
 const WEB_DIR = join(PACKAGE_ROOT, "web");
 const WORKSPACES_DIR = join(PACKAGE_ROOT, "data", "workspaces");
+/**
+ * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
+ * （data/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
+ */
+const CONSOLE_AGENT_DIR = join(PACKAGE_ROOT, "data", "agent");
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
-/** 请求 body 大小上限 */
+/** 普通请求 body 大小上限（文件上传接口单独放宽） */
 const MAX_BODY_BYTES = 1024 * 1024;
+/** 文件上传上限：单文件 20MB、总量 50MB */
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_FILE_BYTES = 50 * 1024 * 1024;
+/** 思考等级合法值（与 pi-ai ThinkingLevel 一致） */
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 // ---------------------------------------------------------------------------
 // 会话与事件缓冲
@@ -65,6 +85,9 @@ const sessions = new Map<string, ConsoleSession>();
 
 /** 全服共享一个 ModelRuntime，启动时创建 */
 const modelRuntime = await ModelRuntime.create();
+
+// 加载能力包（新加的包重启服务后生效）
+await loadPacks();
 
 // 预热：扩展注册的自定义 provider 只有在某个会话加载扩展之后才会出现在
 // ModelRuntime 里。启动时先加载一次全局扩展，PI_CONSOLE_MODEL 才能引用它们。
@@ -135,23 +158,25 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 			return { type: "compaction_start" };
 		case "compaction_end":
 			return { type: "compaction_end" };
+		case "thinking_level_changed":
+			return { type: "thinking_level_changed", level: ev.level };
 		default:
 			return undefined;
 	}
 }
 
-/** 工具结果可能很长，压成单行摘要再转发 */
+/** 工具结果可能很长，压成单行摘要再转发。真实结构为 { content: [{type:"text",text}...], details } */
 function summarizeToolResult(result: unknown): string {
 	if (result === undefined || result === null) return "";
 	let text: string;
 	if (typeof result === "string") {
 		text = result;
-	} else if (
-		typeof result === "object" &&
-		"text" in result &&
-		typeof (result as { text: unknown }).text === "string"
-	) {
-		text = (result as { text: string }).text;
+	} else if (typeof result === "object" && Array.isArray((result as { content?: unknown }).content)) {
+		// AgentToolResult：拼 content 里全部 text 块
+		text = (result as { content: Array<{ type?: string; text?: unknown }> }).content
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text as string)
+			.join("\n");
 	} else {
 		try {
 			text = JSON.stringify(result) ?? "";
@@ -179,12 +204,23 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 	const sessionId = randomUUID();
 	const cwd = join(WORKSPACES_DIR, sessionId);
 	mkdirSync(cwd, { recursive: true });
+	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
 
 	const sessionManager = SessionManager.inMemory(cwd);
-	const options: { cwd: string; modelRuntime: ModelRuntime; sessionManager: SessionManager; model?: SessionModel } = {
+	const options: {
+		cwd: string;
+		modelRuntime: ModelRuntime;
+		sessionManager: SessionManager;
+		agentDir: string;
+		model?: SessionModel;
+		customTools: ReturnType<typeof instantiatePackTools>;
+	} = {
 		cwd,
 		modelRuntime,
 		sessionManager,
+		agentDir: CONSOLE_AGENT_DIR,
+		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
+		customTools: instantiatePackTools({ getWorkspaceRoot: () => cwd }),
 	};
 
 	if (MODEL_SPEC) {
@@ -205,6 +241,9 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 	}
 
 	const { session, modelFallbackMessage } = await createAgentSession(options);
+
+	// 挂载语义：内置 4 个工具 + 已挂载包的工具；未挂载任何包 = 纯净原生 Pi
+	session.setActiveToolsByName(activeToolNames());
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -242,13 +281,19 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 	const items: HistoryItem[] = [];
 	for (const message of session.messages) {
 		if (message.role === "user") {
-			const text =
-				typeof message.content === "string"
-					? message.content
-					: message.content
-							.filter((block) => block.type === "text")
-							.map((block) => (block.type === "text" ? block.text : ""))
-							.join("\n");
+			let text: string;
+			let hasImage = false;
+			if (typeof message.content === "string") {
+				text = message.content;
+			} else {
+				const parts: string[] = [];
+				for (const block of message.content) {
+					if (block.type === "text") parts.push(block.text);
+					else if (block.type === "image") hasImage = true;
+				}
+				text = parts.join("\n");
+				if (hasImage) text = `${text}${text ? "\n" : ""}[图片]`;
+			}
 			if (text.trim()) items.push({ role: "user", text });
 		} else if (message.role === "assistant") {
 			const text = message.content
@@ -283,6 +328,51 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 }
 
 // ---------------------------------------------------------------------------
+// 模型枚举 / 图片解析 / 文件命名
+// ---------------------------------------------------------------------------
+
+/** 枚举全部 provider 的模型（含是否已配置鉴权），供前端模型选择器 */
+function listModels(): Array<{ provider: string; modelId: string; label: string; hasAuth: boolean }> {
+	const items: Array<{ provider: string; modelId: string; label: string; hasAuth: boolean }> = [];
+	for (const provider of modelRuntime.getProviders()) {
+		const hasAuth = modelRuntime.hasConfiguredAuth(provider.id);
+		for (const model of modelRuntime.getModels(provider.id)) {
+			items.push({
+				provider: provider.id,
+				modelId: model.id,
+				label: `${provider.name ?? provider.id} · ${model.name ?? model.id}`,
+				hasAuth,
+			});
+		}
+	}
+	return items;
+}
+
+/** 校验并归一化 prompt 的 images 参数；格式不对返回 undefined */
+function parseImages(images: unknown): Array<{ type: "image"; data: string; mimeType: string }> | undefined {
+	if (!Array.isArray(images)) return [];
+	const result: Array<{ type: "image"; data: string; mimeType: string }> = [];
+	for (const item of images) {
+		const entry = item as { data?: unknown; mimeType?: unknown };
+		if (typeof entry?.data !== "string" || typeof entry?.mimeType !== "string") return undefined;
+		result.push({ type: "image", data: entry.data, mimeType: entry.mimeType });
+	}
+	return result;
+}
+
+/** 重名文件加后缀（name → name (1).ext），返回相对 uploads 目录的文件名 */
+function uniquePath(dir: string, name: string): string {
+	if (!existsSync(join(dir, name))) return name;
+	const dot = name.lastIndexOf(".");
+	const base = dot > 0 ? name.slice(0, dot) : name;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	for (let i = 1; ; i++) {
+		const candidate = `${base} (${i})${ext}`;
+		if (!existsSync(join(dir, candidate))) return candidate;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 基础设施
 // ---------------------------------------------------------------------------
 
@@ -291,14 +381,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
-function readBodyJson(req: IncomingMessage): Promise<unknown> {
+function readBodyJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let size = 0;
 		req.on("data", (chunk: Buffer) => {
 			size += chunk.length;
-			if (size > MAX_BODY_BYTES) {
-				reject(new Error("请求体过大"));
+			if (size > maxBytes) {
+				reject(new HttpBodyError("请求体过大", 413));
 				req.destroy();
 				return;
 			}
@@ -313,6 +403,16 @@ function readBodyJson(req: IncomingMessage): Promise<unknown> {
 		});
 		req.on("error", reject);
 	});
+}
+
+/** 携带 HTTP 状态码的 body 错误（如 413） */
+class HttpBodyError extends Error {
+	readonly status: number;
+
+	constructor(message: string, status: number) {
+		super(message);
+		this.status = status;
+	}
 }
 
 /** 静态文件只映射三个固定路径，不读任意文件 */
@@ -381,7 +481,8 @@ function handleStream(req: IncomingMessage, res: ServerResponse, cs: ConsoleSess
 const server = createServer((req, res) => {
 	handleRequest(req, res).catch((error) => {
 		const message = error instanceof Error ? error.message : String(error);
-		if (!res.headersSent) sendJson(res, 500, { error: message });
+		const status = error instanceof HttpBodyError ? error.status : 500;
+		if (!res.headersSent) sendJson(res, status, { error: message });
 	});
 });
 
@@ -411,6 +512,55 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
+	// 能力包
+	if (pathname === "/api/packs" && req.method === "GET") {
+		sendJson(res, 200, listPacks());
+		return;
+	}
+	const packMatch = pathname.match(/^\/api\/packs\/([^/]+)\/(mount|unmount)$/);
+	if (packMatch && req.method === "POST") {
+		const [, packName, action] = packMatch;
+		const changed = action === "mount" ? mountPack(packName) : unmountPack(packName);
+		if (!changed) {
+			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
+			return;
+		}
+		// 对全部存活会话立即生效（下一轮起用，不丢历史）
+		const names = activeToolNames();
+		for (const cs of sessions.values()) {
+			cs.session.setActiveToolsByName(names);
+		}
+		sendJson(res, 200, { ok: true, mounted: action === "mount" });
+		return;
+	}
+
+	// OfficeCLI 管理
+	if (pathname === "/api/officecli/status" && req.method === "GET") {
+		sendJson(res, 200, await officecli.getStatus());
+		return;
+	}
+	if (pathname === "/api/officecli/download" && req.method === "POST") {
+		const progress = officecli.getDownloadProgress();
+		if (progress.running) {
+			sendJson(res, 409, { error: "下载已在进行中" });
+			return;
+		}
+		// 异步下载，进度通过轮询 /api/officecli/progress 获取
+		void officecli.downloadLatest();
+		sendJson(res, 202, { ok: true });
+		return;
+	}
+	if (pathname === "/api/officecli/progress" && req.method === "GET") {
+		sendJson(res, 200, officecli.getDownloadProgress());
+		return;
+	}
+
+	// 模型枚举
+	if (pathname === "/api/models" && req.method === "GET") {
+		sendJson(res, 200, listModels());
+		return;
+	}
+
 	// /api/sessions/:id/*
 	const match = pathname.match(/^\/api\/sessions\/([^/]+)(?:\/(.*))?$/);
 	if (!match) {
@@ -432,11 +582,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 
-		// POST /api/sessions/:id/messages — 发送用户消息
+		// POST /api/sessions/:id/messages — 发送用户消息（支持 images）
 		case "POST messages": {
-			const body = await readBodyJson(req);
-			const text =
-				typeof (body as { text?: unknown })?.text === "string" ? (body as { text: string }).text.trim() : "";
+			const body = (await readBodyJson(req)) as { text?: unknown; images?: unknown };
+			const text = typeof body?.text === "string" ? body.text.trim() : "";
 			if (!text) {
 				sendJson(res, 400, { error: '请求体需为 {"text": "..."} 且不能为空' });
 				return;
@@ -445,14 +594,58 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 409, { error: "当前正在运行中，请先停止或等待完成" });
 				return;
 			}
+			const images = parseImages(body.images);
+			if (Array.isArray(body.images) && !images) {
+				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
+				return;
+			}
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
-			cs.session.prompt(text).catch((error) => {
+			cs.session.prompt(text, { images }).catch((error) => {
 				bufferAndBroadcast(cs, {
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
 				});
 			});
+			return;
+		}
+
+		// POST /api/sessions/:id/files — 保存附件到会话工作目录 uploads/
+		case "POST files": {
+			const body = (await readBodyJson(req, MAX_TOTAL_FILE_BYTES + 4096)) as {
+				files?: unknown;
+			};
+			if (!Array.isArray(body?.files) || body.files.length === 0) {
+				sendJson(res, 400, { error: '请求体需为 {"files": [...]}' });
+				return;
+			}
+			const uploadsDir = join(cs.session.sessionManager.getCwd(), "uploads");
+			mkdirSync(uploadsDir, { recursive: true });
+			const saved: string[] = [];
+			let totalBytes = 0;
+			for (const file of body.files as Array<{ name?: unknown; mimeType?: unknown; dataBase64?: unknown }>) {
+				if (typeof file?.name !== "string" || typeof file?.dataBase64 !== "string") {
+					sendJson(res, 400, { error: "files 每项需含 name 与 dataBase64" });
+					return;
+				}
+				const data = Buffer.from(file.dataBase64, "base64");
+				totalBytes += data.length;
+				if (totalBytes > MAX_TOTAL_FILE_BYTES) {
+					sendJson(res, 413, { error: `附件总量超过 ${MAX_TOTAL_FILE_BYTES / 1024 / 1024}MB 上限` });
+					return;
+				}
+				if (data.length > MAX_FILE_BYTES) {
+					sendJson(res, 413, { error: `单文件 ${file.name} 超过 ${MAX_FILE_BYTES / 1024 / 1024}MB 上限` });
+					return;
+				}
+				const safeName = String(file.name)
+					.replace(/[\\/:*?"<>|]/g, "_")
+					.slice(0, 200);
+				const relative = uniquePath(uploadsDir, safeName);
+				writeFileSync(join(uploadsDir, relative), data);
+				saved.push(`uploads/${relative}`);
+			}
+			sendJson(res, 200, { files: saved });
 			return;
 		}
 
@@ -463,12 +656,55 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 
+		// POST /api/sessions/:id/model — 切换模型
+		case "POST model": {
+			const body = (await readBodyJson(req)) as { provider?: unknown; modelId?: unknown };
+			if (typeof body?.provider !== "string" || typeof body?.modelId !== "string") {
+				sendJson(res, 400, { error: '请求体需为 {"provider": "...", "modelId": "..."}' });
+				return;
+			}
+			const model = modelRuntime.getModel(body.provider, body.modelId);
+			if (!model) {
+				sendJson(res, 404, { error: `模型不存在：${body.provider}/${body.modelId}` });
+				return;
+			}
+			try {
+				await cs.session.setModel(model);
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+				return;
+			}
+			// 通过 SSE 通知前端同步（persist 由 setModel 内部写 settingsManager 完成）
+			bufferAndBroadcast(cs, {
+				type: "model_changed",
+				provider: body.provider,
+				modelId: body.modelId,
+			});
+			sendJson(res, 200, { ok: true, provider: body.provider, modelId: body.modelId });
+			return;
+		}
+
+		// POST /api/sessions/:id/thinking — 切换思考等级
+		case "POST thinking": {
+			const body = (await readBodyJson(req)) as { level?: unknown };
+			if (typeof body?.level !== "string" || !(THINKING_LEVELS as readonly string[]).includes(body.level)) {
+				sendJson(res, 400, { error: `level 需为：${THINKING_LEVELS.join(" / ")}` });
+				return;
+			}
+			cs.session.setThinkingLevel(body.level as (typeof THINKING_LEVELS)[number]);
+			sendJson(res, 200, { level: cs.session.thinkingLevel });
+			return;
+		}
+
 		// GET /api/sessions/:id/history — 消息快照
 		case "GET history": {
+			const model = cs.session.model;
 			sendJson(res, 200, {
 				sessionId: cs.sessionId,
 				streaming: cs.session.isStreaming,
 				messages: buildHistory(cs.session),
+				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
+				thinkingLevel: cs.session.thinkingLevel,
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
 			});
@@ -492,6 +728,12 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 server.listen(PORT, HOST, () => {
 	console.log(`Pi 控制台已启动：http://${HOST}:${PORT}`);
 	if (MODEL_SPEC) console.log(`模型（PI_CONSOLE_MODEL）：${MODEL_SPEC}`);
-	else console.log("模型：Pi 默认解析（settings / 可用凭据）");
+	else console.log("模型：Pi 默认解析（settings / 上次选择）");
 	if (AUTH_TOKEN) console.log("鉴权：已启用（PI_CONSOLE_TOKEN），/api/* 需要 Bearer token");
+	const packs = listPacks();
+	console.log(`能力包：${packs.length} 个已安装，已挂载：${mountedPacks().join(", ") || "(无)"}`);
+	void officecli.getStatus().then((status) => {
+		if (status.installed) console.log(`OfficeCLI：已安装 v${status.version}`);
+		else console.log("OfficeCLI：未安装（页面可一键下载）");
+	});
 });
