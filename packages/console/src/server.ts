@@ -686,8 +686,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		try {
-			const path = workspace.setWorkspacePath(body.path);
-			sendJson(res, 200, { ok: true, path });
+			const result = workspace.setWorkspacePath(body.path);
+			// sessionReset：工作区变了，前端应重建会话（旧会话 cwd 固化无法迁移）
+			sendJson(res, 200, { ok: true, path: result.path, migrated: result.migrated, sessionReset: true });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}

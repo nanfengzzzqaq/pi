@@ -1251,3 +1251,89 @@ body {
 	margin-bottom: 8px;
 	word-break: break-all;
 }
+
+/* 消息区折叠控制条（sticky，不随滚动消失） */
+.messages-toolbar {
+	position: sticky;
+	top: 0;
+	z-index: 10;
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 4px 0;
+	margin-bottom: 4px;
+}
+
+.collapse-btn {
+	padding: 4px 12px;
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	background: color-mix(in srgb, var(--panel) 88%, transparent);
+	backdrop-filter: blur(4px);
+	color: var(--muted);
+	font: inherit;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.collapse-btn:hover {
+	border-color: var(--accent);
+	color: var(--accent);
+}
+
+.collapse-hint {
+	font-size: 11px;
+	color: var(--muted);
+}
+
+.message.collapsed-hidden {
+	display: none;
+}
+
+/* 复制按钮 */
+.copy-btn {
+	background: transparent;
+	border: none;
+	color: var(--muted);
+	cursor: pointer;
+	font-size: 13px;
+	padding: 1px 6px;
+	border-radius: 4px;
+	line-height: 1.4;
+	opacity: 0.6;
+}
+
+.copy-btn:hover {
+	opacity: 1;
+	color: var(--accent);
+	background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.message-meta {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.message-meta .copy-btn {
+	margin-left: auto;
+}
+
+/* 代码块复制按钮（hover 显示） */
+.text pre {
+	position: relative;
+}
+
+.text pre .copy-btn {
+	position: absolute;
+	top: 6px;
+	right: 8px;
+	opacity: 0;
+	background: rgba(255, 255, 255, 0.08);
+	color: var(--code-text);
+	transition: opacity 0.15s;
+}
+
+.text pre:hover .copy-btn {
+	opacity: 0.9;
+}
