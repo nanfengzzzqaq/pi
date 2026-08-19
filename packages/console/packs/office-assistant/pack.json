@@ -2,7 +2,71 @@
 	"name": "office-assistant",
 	"displayName": "Office 助手",
 	"description": "通过 OfficeCLI 创建与编辑 Word/Excel/PowerPoint 文档（docx/xlsx/pptx）",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"deferred": true,
-	"metaTool": "office_enable"
+	"metaTool": "office_enable",
+	"activation": {
+		"extensions": [".docx", ".xlsx", ".pptx", ".csv", ".tsv"],
+		"keywords": [
+			"Office",
+			"Word",
+			"Excel",
+			"PowerPoint",
+			"PPT",
+			"文档",
+			"表格",
+			"工作簿",
+			"幻灯片",
+			"演示文稿",
+			"报告",
+			"合同",
+			"简历",
+			"模板",
+			"CSV"
+		],
+		"minimumScore": 2,
+		"defaultGroups": ["inspect"]
+	},
+	"toolGroups": [
+		{
+			"name": "inspect",
+			"displayName": "读取与检查",
+			"description": "查看、读取、查询和检查 Office 文档",
+			"tools": ["office_view", "office_get", "office_query", "office_help"],
+			"keywords": ["查看", "读取", "分析", "检查", "查询", "预览", "统计", "问题", "内容", "是什么"]
+		},
+		{
+			"name": "create",
+			"displayName": "创建与生成",
+			"description": "新建文档、批量生成、导入数据或合并模板",
+			"tools": [
+				"office_create",
+				"office_add",
+				"office_set",
+				"office_batch",
+				"office_import",
+				"office_merge",
+				"office_help"
+			],
+			"keywords": ["创建", "新建", "生成", "制作", "撰写", "做一份", "导入", "合并", "套用", "填写"]
+		},
+		{
+			"name": "edit",
+			"displayName": "编辑与修改",
+			"description": "读取现有文档后修改、删除、移动或批量处理元素",
+			"tools": [
+				"office_view",
+				"office_get",
+				"office_query",
+				"office_add",
+				"office_set",
+				"office_remove",
+				"office_move",
+				"office_swap",
+				"office_batch",
+				"office_help"
+			],
+			"keywords": ["修改", "编辑", "替换", "删除", "移动", "交换", "调整", "更新", "批量", "处理", "修复"]
+		}
+	]
 }

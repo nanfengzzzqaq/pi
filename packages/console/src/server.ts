@@ -1,13 +1,14 @@
 /**
- * Pi Web 控制台 — 第 2 步：能力包框架 + Office 助手包 + 前端增强
+ * Pi Web 控制台 — 通用能力包 + 按会话/按本轮工具加载
  *
  * 默认形态仍是纯净原生 Pi（read/bash/edit/write + 官方系统提示词）；
- * 能力包通过 customTools 注册、setActiveToolsByName 挂载/卸载。
+ * 能力包只在内部注册；每轮先读取 pack.json 的通用规则，再用
+ * setActiveToolsByName 只注入真正命中的最小工具组。
  *
  * 全部后端逻辑都在 src/ 下按模块拆分，HTTP 层只用 node:http 原生模块，不引入框架。
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
@@ -22,12 +23,17 @@ import * as fsExplorer from "./fs.ts";
 import * as officecli from "./officecli.ts";
 import {
 	baseToolNames,
+	type CapabilityMatch,
 	fullPackToolNames,
 	instantiatePackTools,
+	isMountedPack,
 	listPacks,
 	loadPacks,
 	mountedPacks,
 	mountPack,
+	packSummaries,
+	selectCapabilities,
+	toolDisplayName,
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
@@ -89,21 +95,40 @@ interface ConsoleSession {
 	events: BufferedEvent[];
 	nextSeq: number;
 	sseClients: Set<ServerResponse>;
-	/** 触发式加载：本会话已被元工具激活的 deferred 包 */
-	activatedPacks: Set<string>;
+	/** 这个会话绑定的助手；与全局“已启用”目录分离。 */
+	enabledPacks: Set<string>;
+	/** 本轮临时激活的最小工具组；agent_settled 后清空。 */
+	activePackTools: Map<string, Set<string>>;
+	lastCapabilityTrace: CapabilityTrace | null;
+	lastUsage: unknown;
 }
 
 const sessions = new Map<string, ConsoleSession>();
 
-/** 会话当前应生效的工具名单 = 基础名单（含元工具） + 已激活 deferred 包的完整工具 */
-function effectiveToolNames(activatedPacks: Set<string>): string[] {
-	const names = baseToolNames();
-	for (const packName of activatedPacks) {
-		for (const toolName of fullPackToolNames(packName)) {
+/** 会话当前应生效的工具名单 = 原生/兼容工具 + 本轮命中的最小工具组。 */
+function effectiveToolNames(enabledPacks: Set<string>, activePackTools: Map<string, Set<string>>): string[] {
+	const names = baseToolNames(enabledPacks);
+	for (const toolNames of activePackTools.values()) {
+		for (const toolName of toolNames) {
 			if (!names.includes(toolName)) names.push(toolName);
 		}
 	}
 	return names;
+}
+
+interface ToolSnapshot {
+	tools: Array<{ name: string; displayName: string }>;
+	toolCount: number;
+	schemaBytes: number;
+	schemaFingerprint: string;
+}
+
+interface CapabilityTrace extends ToolSnapshot {
+	stepId: string;
+	stepName: "capability_search";
+	stepDisplayName: string;
+	enabledCapabilities: Array<{ name: string; displayName: string }>;
+	selectedCapabilities: CapabilityMatch[];
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +139,8 @@ interface SessionIndexEntry {
 	cwd: string;
 	/** Pi 会话文件路径（恢复消息用） */
 	sessionFile?: string;
+	/** 会话绑定的助手。旧索引没有该字段时，在恢复时迁移一次。 */
+	enabledPacks?: string[];
 	title: string;
 	createdAt: number;
 	updatedAt: number;
@@ -134,12 +161,18 @@ function writeSessionIndex(index: Record<string, SessionIndexEntry>): void {
 	writeFileSync(SESSION_INDEX_FILE, `${JSON.stringify(index, null, "\t")}\n`, "utf8");
 }
 
-function touchSessionIndex(sessionId: string, cwd: string, sessionFile?: string): void {
+function touchSessionIndex(
+	sessionId: string,
+	cwd: string,
+	sessionFile: string | undefined,
+	enabledPacks: Iterable<string>,
+): void {
 	const index = readSessionIndex();
 	const existing = index[sessionId];
 	index[sessionId] = {
 		cwd,
 		sessionFile: sessionFile ?? existing?.sessionFile,
+		enabledPacks: [...enabledPacks],
 		title: existing?.title ?? "",
 		createdAt: existing?.createdAt ?? Date.now(),
 		updatedAt: Date.now(),
@@ -204,6 +237,7 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				type: "tool_execution_start",
 				toolCallId: ev.toolCallId,
 				toolName: ev.toolName,
+				toolDisplayName: toolDisplayName(ev.toolName),
 				args: ev.args,
 			};
 		case "tool_execution_end":
@@ -211,6 +245,7 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				type: "tool_execution_end",
 				toolCallId: ev.toolCallId,
 				toolName: ev.toolName,
+				toolDisplayName: toolDisplayName(ev.toolName),
 				isError: ev.isError,
 				result: summarizeToolResult(ev.result),
 			};
@@ -270,6 +305,53 @@ function summarizeToolResult(result: unknown): string {
 	return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
+/** 记录真正送入当前模型调用的工具定义，便于在客户端核对 token 优化是否生效。 */
+function activeToolSnapshot(session: AgentSession): ToolSnapshot {
+	const names = session.getActiveToolNames();
+	const schemas = names.map((name) => {
+		const definition = session.getToolDefinition(name);
+		return {
+			name,
+			description: definition?.description ?? "",
+			parameters: definition?.parameters ?? null,
+			promptSnippet: definition?.promptSnippet ?? null,
+			promptGuidelines: definition?.promptGuidelines ?? [],
+		};
+	});
+	const serialized = JSON.stringify(schemas);
+	return {
+		tools: names.map((name) => ({ name, displayName: toolDisplayName(name) })),
+		toolCount: names.length,
+		schemaBytes: Buffer.byteLength(serialized, "utf8"),
+		schemaFingerprint: createHash("sha256").update(serialized).digest("hex").slice(0, 12),
+	};
+}
+
+function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTrace {
+	cs.activePackTools.clear();
+	const selectedCapabilities = selectCapabilities(text, cs.enabledPacks);
+	for (const match of selectedCapabilities) {
+		cs.activePackTools.set(match.packName, new Set(match.toolNames));
+	}
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	const trace: CapabilityTrace = {
+		stepId: `capability-${randomUUID()}`,
+		stepName: "capability_search",
+		stepDisplayName: "查找可用能力（capability_search）",
+		enabledCapabilities: packSummaries(cs.enabledPacks),
+		selectedCapabilities,
+		...activeToolSnapshot(cs.session),
+	};
+	cs.lastCapabilityTrace = trace;
+	return trace;
+}
+
+function releaseTurnCapabilities(cs: ConsoleSession): void {
+	if (cs.activePackTools.size === 0) return;
+	cs.activePackTools.clear();
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+}
+
 function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [key: string]: unknown }): void {
 	const event: BufferedEvent = { seq: cs.nextSeq++, ...clientEvent };
 	cs.events.push(event);
@@ -289,13 +371,15 @@ function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [ke
  */
 async function buildSession(
 	cwd: string,
+	enabledPackNames: Iterable<string>,
 	modelOverride?: SessionModel,
 	sessionFile?: string,
 ): Promise<{
 	session: AgentSession;
 	sessionFile: string | undefined;
 	modelFallbackMessage?: string;
-	activatedPacks: Set<string>;
+	enabledPacks: Set<string>;
+	activePackTools: Map<string, Set<string>>;
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -303,8 +387,9 @@ async function buildSession(
 	const sessionManager = sessionFile
 		? SessionManager.open(sessionFile, SESSION_DIR, cwd)
 		: SessionManager.create(cwd, SESSION_DIR);
-	const activatedPacks = new Set<string>();
-	// 元工具（office_enable 等）触发时回调：为本会话激活对应包的完整工具组
+	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
+	const activePackTools = new Map<string, Set<string>>();
+	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
 		cwd: string;
@@ -322,8 +407,9 @@ async function buildSession(
 		customTools: instantiatePackTools({
 			getWorkspaceRoot: () => cwd,
 			activatePack: (packName) => {
-				activatedPacks.add(packName);
-				sessionRef?.setActiveToolsByName(effectiveToolNames(activatedPacks));
+				if (!enabledPacks.has(packName)) return;
+				activePackTools.set(packName, new Set(fullPackToolNames(packName)));
+				sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
 			},
 		}),
 		model: modelOverride,
@@ -349,17 +435,29 @@ async function buildSession(
 	const { session, modelFallbackMessage } = await createAgentSession(options);
 	sessionRef = session;
 
-	// 挂载语义：内置 4 个工具 + 已挂载包（deferred 包只放元工具，触发后才激活完整工具组）
-	session.setActiveToolsByName(effectiveToolNames(activatedPacks));
-	return { session, sessionFile: session.sessionFile, modelFallbackMessage, activatedPacks };
+	// 新会话只带原生工具；声明了通用激活规则的能力包等到本轮确实命中才注入。
+	session.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
+	return { session, sessionFile: session.sessionFile, modelFallbackMessage, enabledPacks, activePackTools };
 }
 
-async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
+function subscribeConsoleSession(cs: ConsoleSession): void {
+	cs.session.subscribe((ev) => {
+		if (ev.type === "turn_end") cs.lastUsage = (ev.message as { usage?: unknown }).usage ?? null;
+		if (ev.type === "agent_settled") releaseTurnCapabilities(cs);
+		const clientEvent = toClientEvent(ev);
+		if (clientEvent) bufferAndBroadcast(cs, clientEvent);
+	});
+}
+
+async function createConsoleSession(enabledPackNames: string[] = []): Promise<{ sessionId: string; warning?: string }> {
 	const sessionId = randomUUID();
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const { session, sessionFile, modelFallbackMessage, activatedPacks } = await buildSession(cwd);
+	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
+		cwd,
+		enabledPackNames,
+	);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -367,15 +465,14 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 		events: [],
 		nextSeq: 0,
 		sseClients: new Set(),
-		activatedPacks,
+		enabledPacks,
+		activePackTools,
+		lastCapabilityTrace: null,
+		lastUsage: null,
 	};
 	sessions.set(sessionId, cs);
-	touchSessionIndex(sessionId, cwd, sessionFile);
-
-	session.subscribe((ev) => {
-		const clientEvent = toClientEvent(ev);
-		if (clientEvent) bufferAndBroadcast(cs, clientEvent);
-	});
+	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
+	subscribeConsoleSession(cs);
 
 	// 默认模型解析失败时（如未配置任何 Key），通过 SSE 告知前端
 	if (modelFallbackMessage) {
@@ -391,8 +488,11 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	const entry = index[sessionId];
 	if (!entry) return null;
 	try {
-		const { session, modelFallbackMessage, activatedPacks } = await buildSession(
+		// v0.3.3 及更早的索引没有会话级助手字段；迁移时沿用当时全局已启用的助手。
+		const restoredEnabledPacks = entry.enabledPacks ?? mountedPacks();
+		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
 			entry.cwd,
+			restoredEnabledPacks,
 			undefined,
 			entry.sessionFile,
 		);
@@ -402,13 +502,14 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			events: [],
 			nextSeq: 0,
 			sseClients: new Set(),
-			activatedPacks,
+			enabledPacks,
+			activePackTools,
+			lastCapabilityTrace: null,
+			lastUsage: null,
 		};
 		sessions.set(sessionId, cs);
-		session.subscribe((ev) => {
-			const clientEvent = toClientEvent(ev);
-			if (clientEvent) bufferAndBroadcast(cs, clientEvent);
-		});
+		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
+		subscribeConsoleSession(cs);
 		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
 		return cs;
 	} catch (error) {
@@ -460,7 +561,9 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 			const toolCalls = message.content
 				.filter((block) => block.type === "toolCall")
 				.map((block) =>
-					block.type === "toolCall" ? { id: block.id, name: block.name, args: block.arguments } : undefined,
+					block.type === "toolCall"
+						? { id: block.id, name: block.name, displayName: toolDisplayName(block.name), args: block.arguments }
+						: undefined,
 				)
 				.filter((call) => call !== undefined);
 			const item: HistoryItem = { role: "assistant", text };
@@ -476,6 +579,7 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 				role: "toolResult",
 				toolCallId: message.toolCallId,
 				toolName: message.toolName,
+				toolDisplayName: toolDisplayName(message.toolName),
 				isError: message.isError,
 				text: text.trim(),
 			});
@@ -738,6 +842,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				createdAt: entry.createdAt,
 				updatedAt: entry.updatedAt,
 				cwd: entry.cwd,
+				assistants: packSummaries(entry.enabledPacks ?? []),
 				active: sessions.has(id),
 			}))
 			.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -747,7 +852,24 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 	// POST /api/sessions — 创建会话
 	if (req.method === "POST" && pathname === "/api/sessions") {
-		const result = await createConsoleSession();
+		const body = (await readBodyJson(req)) as { assistants?: unknown };
+		if (body?.assistants !== undefined && !Array.isArray(body.assistants)) {
+			sendJson(res, 400, { error: 'assistants 需为能力包代码名数组，例如 ["office-assistant"]' });
+			return;
+		}
+		const assistantNames = Array.isArray(body?.assistants)
+			? body.assistants.filter((name): name is string => typeof name === "string")
+			: [];
+		if (Array.isArray(body?.assistants) && assistantNames.length !== body.assistants.length) {
+			sendJson(res, 400, { error: "assistants 只能包含字符串" });
+			return;
+		}
+		const unavailable = assistantNames.filter((name) => !isMountedPack(name));
+		if (unavailable.length > 0) {
+			sendJson(res, 400, { error: `助手未启用或不存在：${unavailable.join("、")}` });
+			return;
+		}
+		const result = await createConsoleSession([...new Set(assistantNames)]);
 		sendJson(res, 200, result);
 		return;
 	}
@@ -765,9 +887,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
 			return;
 		}
-		// 对全部存活会话立即生效（下一轮起用，不丢历史；已激活的 deferred 包保持完整工具组）
-		for (const cs of sessions.values()) {
-			cs.session.setActiveToolsByName(effectiveToolNames(cs.activatedPacks));
+		// 全局启用只改变助手目录；停用时从已绑定会话移除，避免继续暴露其工具。
+		if (action === "unmount") {
+			for (const cs of sessions.values()) {
+				cs.enabledPacks.delete(packName);
+				cs.activePackTools.delete(packName);
+				cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+			}
+			const index = readSessionIndex();
+			for (const entry of Object.values(index)) {
+				entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
+			}
+			writeSessionIndex(index);
 		}
 		sendJson(res, 200, { ok: true, mounted: action === "mount" });
 		return;
@@ -957,10 +1088,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
 				return;
 			}
+			const capabilityTrace = prepareTurnCapabilities(cs, text);
+			if (cs.enabledPacks.size > 0) {
+				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
+			}
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
 			updateSessionTitle(cs.sessionId, text);
 			cs.session.prompt(text, { images }).catch((error) => {
+				releaseTurnCapabilities(cs);
 				bufferAndBroadcast(cs, {
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
@@ -1004,6 +1140,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				thinkingLevel: cs.session.thinkingLevel,
 				cacheRead,
 				cacheWrite,
+				enabledCapabilities: packSummaries(cs.enabledPacks),
+				activeTools: activeToolSnapshot(cs.session),
+				lastCapabilityTrace: cs.lastCapabilityTrace,
+				lastUsage: cs.lastUsage,
 			});
 			return;
 		}
@@ -1094,6 +1234,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				provider: body.provider,
 				modelId: body.modelId,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				enabledCapabilities: packSummaries(cs.enabledPacks),
 			});
 			sendJson(res, 200, {
 				ok: true,
@@ -1127,6 +1268,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				enabledCapabilities: packSummaries(cs.enabledPacks),
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
 			});

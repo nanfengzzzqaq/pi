@@ -98,14 +98,14 @@ export function setWorkspacePath(path: string): WorkspaceResult {
 	const defaultWorkspaces = join(DATA_DIR, "workspaces");
 	let migrated = 0;
 	if (oldCustom && oldCustom !== abs && existsSync(oldCustom)) {
-		if (abs.startsWith(oldCustom + "\\") || abs.startsWith(oldCustom + "/")) {
+		if (abs.startsWith(`${oldCustom}\\`) || abs.startsWith(`${oldCustom}/`)) {
 			/* 目标在旧工作区内部，跳过避免递归复制 */
 		} else {
 			migrated += mergeDir(oldCustom, abs);
 		}
 	}
 	if (existsSync(defaultWorkspaces) && defaultWorkspaces !== abs) {
-		if (abs.startsWith(defaultWorkspaces + "\\") || abs.startsWith(defaultWorkspaces + "/")) {
+		if (abs.startsWith(`${defaultWorkspaces}\\`) || abs.startsWith(`${defaultWorkspaces}/`)) {
 			/* 同上 */
 		} else {
 			migrated += mergeWorkspacesFlat(defaultWorkspaces, abs);
