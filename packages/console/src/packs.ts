@@ -18,6 +18,11 @@ import { DATA_DIR } from "./paths.ts";
 export interface PackContext {
 	/** 解析"本次调用所属会话"的工作目录 */
 	getWorkspaceRoot(): string;
+	/**
+	 * 触发式加载（deferred 包的元工具调用）：激活本会话里该包的完整工具组。
+	 * 由服务端按会话注入；探测实例化时不提供（可为 undefined）。
+	 */
+	activatePack?: (packName: string) => void;
 }
 
 export type PackDefinition = (ctx: PackContext) => { tools: ToolDefinition[] };
@@ -30,6 +35,13 @@ export interface PackInfo {
 	version: string;
 	/** 模块里实际注册的工具名 */
 	toolNames: string[];
+	/**
+	 * 触发式加载：挂载后默认只把元工具放进上下文，
+	 * 模型调用元工具时才激活完整工具组，避免日常对话白付工具 schema 的 token。
+	 */
+	deferred: boolean;
+	/** deferred 包的元工具名（pack.json 的 metaTool 或首个 *_enable 工具；不存在则为 null，退化为全量注册） */
+	metaToolName: string | null;
 }
 
 interface LoadedPack {
@@ -95,13 +107,23 @@ export async function loadPacks(): Promise<void> {
 			}
 			// 实例化一次拿工具名清单（工具定义本身每次会话重新实例化）
 			const probe = mod.default({ getWorkspaceRoot: () => DATA_DIR });
+			const toolNames = probe.tools.map((tool) => tool.name);
+			const deferred = manifest.deferred === true;
+			// 元工具名：pack.json 可用 metaTool 显式指定；缺省按约定取第一个 *_enable 工具
+			const metaToolName = deferred
+				? typeof manifest.metaTool === "string" && toolNames.includes(manifest.metaTool)
+					? manifest.metaTool
+					: (toolNames.find((t) => t.endsWith("_enable")) ?? null)
+				: null;
 			loadedPacks.push({
 				info: {
 					name: manifest.name,
 					displayName: manifest.displayName ?? manifest.name,
 					description: manifest.description ?? "",
 					version: manifest.version,
-					toolNames: probe.tools.map((tool) => tool.name),
+					toolNames,
+					deferred,
+					metaToolName,
 				},
 				define: mod.default,
 			});
@@ -131,10 +153,33 @@ export function listPacks(): Array<Omit<PackInfo, "toolNames"> & { tools: string
 		version: pack.info.version,
 		tools: pack.info.toolNames,
 		mounted: mountedPackNames.includes(pack.info.name),
+		deferred: pack.info.deferred,
+		metaToolName: pack.info.metaToolName,
 	}));
 }
 
-/** 挂载/卸载后应生效的完整工具名名单：内置 4 个 + 已挂载包的工具 */
+/**
+ * 挂载后的基础工具名单：内置 4 个 + 已挂载包的工具。
+ * deferred 包只放元工具（触发式加载），完整工具组由会话内 activatePack 后再加。
+ */
+export function baseToolNames(): string[] {
+	const names = [...BUILTIN_TOOL_NAMES];
+	for (const name of mountedPackNames) {
+		const pack = findPack(name);
+		if (!pack) continue;
+		if (pack.info.deferred && pack.info.metaToolName) names.push(pack.info.metaToolName);
+		else names.push(...pack.info.toolNames);
+	}
+	return names;
+}
+
+/** 某包的完整工具名单（activatePack 触发后追加到会话） */
+export function fullPackToolNames(name: string): string[] {
+	const pack = findPack(name);
+	return pack ? [...pack.info.toolNames] : [];
+}
+
+/** 完整名单（含 deferred 包的全部工具）：仅给不需要触发式加载的调用方用 */
 export function activeToolNames(): string[] {
 	const names = [...BUILTIN_TOOL_NAMES];
 	for (const name of mountedPackNames) {
