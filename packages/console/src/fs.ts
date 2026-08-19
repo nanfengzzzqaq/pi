@@ -111,3 +111,12 @@ function guessMime(path: string): string {
 export function ensureExists(path: string): boolean {
 	return existsSync(path);
 }
+
+/** 校验并返回可浏览根目录内的文件绝对路径，供流式预览等无需读取全文件的功能复用。 */
+export function resolveAllowedFilePath(path: string): string {
+	const abs = resolve(path);
+	if (!withinRoots(abs)) throw new Error("路径不在可浏览范围内");
+	const stat = statSync(abs);
+	if (!stat.isFile()) throw new Error("目标不是文件");
+	return abs;
+}
