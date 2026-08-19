@@ -1,7 +1,7 @@
 "use strict";
 
 // Pi 控制台前端：纯原生 JS，无构建步骤。
-// 三栏布局：左栏（助手/技能/文件）、聊天区、右栏（上下文）。
+// 布局：左栏（助手/技能/文件）+ 聊天区 + 右侧能力详情抽屉（点击助手才展开）。
 // Claude 风格：Markdown 渲染、代码高亮、思考过程折叠滚动、工具调用块折叠。
 
 const SESSION_KEY = "pi-console-session";
@@ -51,8 +51,15 @@ const previewTitleEl = $("preview-title");
 const previewContentEl = $("preview-content");
 const previewCloseEl = $("preview-close");
 const previewAttachBtnEl = $("preview-attach");
-const contextToolsEl = $("context-tools");
 const contextInfoEl = $("context-info");
+const assistantAddBtnEl = $("assistant-add-btn");
+const assistantsModalEl = $("assistants-modal");
+const assistantsModalCloseEl = $("assistants-modal-close");
+const assistantsModalListEl = $("assistants-modal-list");
+const drawerEl = $("drawer");
+const drawerTitleEl = $("drawer-title");
+const drawerContentEl = $("drawer-content");
+const drawerCloseEl = $("drawer-close");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
@@ -863,102 +870,190 @@ document.querySelectorAll(".side-header").forEach((header) => {
 	});
 });
 
+/** 能力包数据缓存：侧栏精简列表、添加弹窗、详情抽屉共用一份 */
+let packsCache = [];
+
+/** 当前抽屉里展示的助手名（null = 抽屉关闭） */
+let drawerPackName = null;
+
+async function refreshPacks() {
+	packsCache = await api("/api/packs");
+}
+
+/** 挂载 / 停用，并刷新相关 UI */
+async function togglePack(pack) {
+	const action = pack.mounted ? "unmount" : "mount";
+	try {
+		await api(`/api/packs/${pack.name}/${action}`, { method: "POST", body: "{}" });
+		showInfo(action === "mount" ? `已启用 ${pack.displayName}，下一轮生效` : `已停用 ${pack.displayName}`);
+		await loadAssistants();
+		await loadContextPanel();
+		// 抽屉正展示这个助手：停用后顺手关上，启用后刷新详情
+		if (drawerPackName === pack.name) {
+			if (action === "unmount") closeDrawer();
+			else openDrawer(pack.name);
+		}
+	} catch (error) {
+		showError(`操作失败：${error.message}`);
+	}
+}
+
+/** 左栏：只列"已启用"的助手（精简行），其余收进"添加助手"弹窗 */
 async function loadAssistants() {
 	try {
-		const packs = await api("/api/packs");
+		await refreshPacks();
 		assistantsListEl.innerHTML = "";
-		if (packs.length === 0) {
-			assistantsListEl.innerHTML = '<div class="skills-empty">暂无可用助手</div>';
+		const mounted = packsCache.filter((p) => p.mounted);
+		if (mounted.length === 0) {
+			const empty = document.createElement("div");
+			empty.className = "skills-empty";
+			empty.textContent = "还没有启用的助手";
+			assistantsListEl.appendChild(empty);
 			return;
 		}
-		for (const pack of packs) {
-			const card = document.createElement("div");
-			card.className = "assistant-card";
-			card.dataset.packName = pack.name;
+		for (const pack of mounted) {
+			const row = document.createElement("div");
+			row.className = "assistant-row";
+			row.dataset.packName = pack.name;
 
-			const head = document.createElement("div");
-			head.className = "assistant-head";
-			const title = document.createElement("div");
-			title.className = "assistant-title";
-			title.textContent = `${pack.displayName} v${pack.version}`;
-			const badge = document.createElement("span");
-			badge.className = "assistant-badge";
-			badge.textContent = pack.mounted ? "使用中" : "未启用";
-			head.appendChild(title);
-			head.appendChild(badge);
+			const dot = document.createElement("span");
+			dot.className = "assistant-dot";
+			const name = document.createElement("span");
+			name.className = "assistant-row-name";
+			name.textContent = pack.displayName;
+			const go = document.createElement("span");
+			go.className = "assistant-row-go";
+			go.textContent = "›";
 
-			const desc = document.createElement("div");
-			desc.className = "assistant-desc";
-			desc.textContent = pack.description;
-
-			// 工具 chips（点开助手显示其 agent 能力）
-			const toolsWrap = document.createElement("div");
-			toolsWrap.className = "assistant-tools";
-			for (const tool of pack.tools) {
-				const chip = document.createElement("span");
-				chip.className = "tool-chip";
-				chip.textContent = tool;
-				toolsWrap.appendChild(chip);
-			}
-
-			const actions = document.createElement("div");
-			actions.className = "assistant-actions";
-			const useBtn = document.createElement("button");
-			useBtn.className = pack.mounted ? "secondary-btn" : "primary-btn";
-			useBtn.textContent = pack.mounted ? "停用" : "在对话中使用";
-			useBtn.addEventListener("click", async () => {
-				const action = pack.mounted ? "unmount" : "mount";
-				try {
-					await api(`/api/packs/${pack.name}/${action}`, { method: "POST", body: "{}" });
-					showInfo(action === "mount" ? `已启用 ${pack.displayName}，下一轮生效` : `已停用 ${pack.displayName}`);
-					await loadAssistants();
-					await loadContextPanel();
-				} catch (error) {
-					showError(`操作失败：${error.message}`);
-				}
-			});
-			actions.appendChild(useBtn);
-			// 展开/收起 agent 详情
-			const detailBtn = document.createElement("button");
-			detailBtn.className = "secondary-btn small";
-			detailBtn.textContent = "能力详情";
-			detailBtn.addEventListener("click", () => {
-				toolsWrap.hidden = !toolsWrap.hidden;
-			});
-			actions.appendChild(detailBtn);
-
-			card.appendChild(head);
-			card.appendChild(desc);
-			card.appendChild(actions);
-			card.appendChild(toolsWrap);
-			toolsWrap.hidden = true;
-			assistantsListEl.appendChild(card);
+			row.appendChild(dot);
+			row.appendChild(name);
+			row.appendChild(go);
+			row.addEventListener("click", () => openDrawer(pack.name));
+			assistantsListEl.appendChild(row);
 		}
 	} catch (error) {
 		assistantsListEl.textContent = `加载失败：${error.message}`;
 	}
 }
 
+/** "添加助手"弹窗：列出全部可用助手 */
+function openAssistantsModal() {
+	assistantsModalListEl.innerHTML = "";
+	if (packsCache.length === 0) {
+		assistantsModalListEl.innerHTML = '<div class="skills-empty">暂无可用助手</div>';
+	} else {
+		for (const pack of packsCache) {
+			const item = document.createElement("div");
+			item.className = "pack-option";
+
+			const main = document.createElement("div");
+			main.className = "pack-option-main";
+			const title = document.createElement("div");
+			title.className = "pack-option-title";
+			title.textContent = `${pack.displayName} v${pack.version}`;
+			const desc = document.createElement("div");
+			desc.className = "pack-option-desc";
+			desc.textContent = pack.description;
+			main.appendChild(title);
+			main.appendChild(desc);
+
+			const actions = document.createElement("div");
+			actions.className = "pack-option-actions";
+			const useBtn = document.createElement("button");
+			useBtn.className = pack.mounted ? "secondary-btn small" : "primary-btn small";
+			useBtn.textContent = pack.mounted ? "停用" : "启用";
+			useBtn.addEventListener("click", async () => {
+				await togglePack(pack);
+				openAssistantsModal(); // 重新渲染弹窗列表
+			});
+			actions.appendChild(useBtn);
+			if (pack.mounted) {
+				const detailBtn = document.createElement("button");
+				detailBtn.className = "secondary-btn small";
+				detailBtn.textContent = "能力详情";
+				detailBtn.addEventListener("click", () => {
+					closeAssistantsModal();
+					openDrawer(pack.name);
+				});
+				actions.appendChild(detailBtn);
+			}
+
+			item.appendChild(main);
+			item.appendChild(actions);
+			assistantsModalListEl.appendChild(item);
+		}
+	}
+	assistantsModalEl.hidden = false;
+}
+
+function closeAssistantsModal() {
+	assistantsModalEl.hidden = true;
+}
+
+/** 右侧抽屉：某个助手的能力详情（工具列表 + 停用），不点开不显示 */
+function openDrawer(packName) {
+	const pack = packsCache.find((p) => p.name === packName);
+	if (!pack) return;
+	drawerPackName = packName;
+	drawerTitleEl.textContent = pack.displayName;
+	drawerContentEl.innerHTML = "";
+
+	const meta = document.createElement("div");
+	meta.className = "drawer-meta";
+	meta.textContent = `v${pack.version} · ${pack.mounted ? "已启用" : "未启用"}`;
+
+	const desc = document.createElement("div");
+	desc.className = "drawer-desc";
+	desc.textContent = pack.description;
+
+	const toolsTitle = document.createElement("div");
+	toolsTitle.className = "drawer-block-title";
+	toolsTitle.textContent = `工具（${pack.tools.length}）`;
+	const toolsWrap = document.createElement("div");
+	toolsWrap.className = "context-tools";
+	for (const tool of pack.tools) {
+		const chip = document.createElement("span");
+		chip.className = "tool-chip";
+		chip.textContent = tool;
+		toolsWrap.appendChild(chip);
+	}
+
+	const actions = document.createElement("div");
+	actions.className = "drawer-actions";
+	const useBtn = document.createElement("button");
+	useBtn.className = pack.mounted ? "secondary-btn" : "primary-btn";
+	useBtn.textContent = pack.mounted ? "停用助手" : "启用助手";
+	useBtn.addEventListener("click", () => togglePack(pack));
+	actions.appendChild(useBtn);
+
+	drawerContentEl.appendChild(meta);
+	drawerContentEl.appendChild(desc);
+	drawerContentEl.appendChild(toolsTitle);
+	drawerContentEl.appendChild(toolsWrap);
+	drawerContentEl.appendChild(actions);
+	drawerEl.hidden = false;
+}
+
+function closeDrawer() {
+	drawerPackName = null;
+	drawerEl.hidden = true;
+}
+
+assistantAddBtnEl.addEventListener("click", openAssistantsModal);
+assistantsModalCloseEl.addEventListener("click", closeAssistantsModal);
+assistantsModalEl.addEventListener("click", (e) => {
+	if (e.target === assistantsModalEl) closeAssistantsModal();
+});
+drawerCloseEl.addEventListener("click", closeDrawer);
+
 // ---------------------------------------------------------------------------
-// 右栏：上下文面板（已启用能力 / MCP 占位）
+// 输入区底行：已启用能力摘要
 // ---------------------------------------------------------------------------
 
 async function loadContextPanel() {
 	try {
-		const packs = await api("/api/packs");
-		const mounted = packs.filter((p) => p.mounted);
-		const tools = mounted.flatMap((p) => p.tools);
-		contextToolsEl.innerHTML = "";
-		if (tools.length === 0) {
-			contextToolsEl.textContent = "（未挂载助手）";
-		} else {
-			for (const tool of tools) {
-				const chip = document.createElement("span");
-				chip.className = "tool-chip";
-				chip.textContent = tool;
-				contextToolsEl.appendChild(chip);
-			}
-		}
+		await refreshPacks();
+		const mounted = packsCache.filter((p) => p.mounted);
 		contextInfoEl.textContent = mounted.length > 0 ? `${mounted.length} 个助手已启用` : "";
 	} catch {
 		/* 忽略 */

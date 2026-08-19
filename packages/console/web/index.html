@@ -22,6 +22,7 @@
 				<div class="side-header" data-panel="assistants-panel">助手 <span class="chevron">▾</span></div>
 				<div id="assistants-panel" class="side-body">
 					<div id="assistants-list" class="assistants-list">加载中…</div>
+					<button id="assistant-add-btn" class="add-assistant-btn">＋ 添加助手</button>
 				</div>
 			</section>
 			<section class="side-section">
@@ -82,21 +83,13 @@
 			</footer>
 		</main>
 
-		<!-- 右栏：上下文 / MCP 占位 -->
-		<aside class="context-panel">
-			<section class="side-section">
-				<div class="side-header" data-panel="context-panel-body">上下文 <span class="chevron">▾</span></div>
-				<div id="context-panel-body" class="side-body">
-					<div class="context-block">
-						<div class="context-block-title">MCP 服务</div>
-						<div class="context-empty">暂无 MCP 服务。<br>此面板为能力上下文预留（MCP/工具/知识库），后续版本开放。</div>
-					</div>
-					<div class="context-block">
-						<div class="context-block-title">已启用能力</div>
-						<div id="context-tools" class="context-tools">（未挂载助手）</div>
-					</div>
-				</div>
-			</section>
+		<!-- 右侧抽屉：助手能力详情（默认隐藏，点击左侧助手才展开） -->
+		<aside id="drawer" class="drawer" hidden>
+			<div class="drawer-header">
+				<span id="drawer-title" class="drawer-title">能力详情</span>
+				<button id="drawer-close" class="icon-btn" title="关闭">×</button>
+			</div>
+			<div id="drawer-content" class="drawer-content"></div>
 		</aside>
 	</div>
 
@@ -115,6 +108,18 @@
 			<div class="preview-actions">
 				<button id="preview-attach" class="primary-btn">＋ 添加到对话</button>
 			</div>
+		</div>
+	</div>
+
+	<!-- 添加助手弹层 -->
+	<div id="assistants-modal" class="modal" hidden>
+		<div class="modal-body">
+			<div class="modal-header">
+				<span class="modal-title">添加助手</span>
+				<button id="assistants-modal-close" class="icon-btn" title="关闭">×</button>
+			</div>
+			<p class="modal-hint">选择助手挂载到当前对话，挂载后模型即可调用它的工具；随时可以停用。</p>
+			<div id="assistants-modal-list" class="assistants-modal-list"></div>
 		</div>
 	</div>
 
