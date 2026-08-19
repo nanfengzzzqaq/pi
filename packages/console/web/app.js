@@ -496,8 +496,11 @@ function appendMessage(role, text) {
 			processBody.appendChild(toolBlock);
 			scrollToBottom();
 		},
-		/** 一轮结束：执行过程默认折叠（用户可点开） */
+		/** 一轮结束：执行过程默认折叠（用户可点开），思考块从"思考中"落定 */
 		foldProcess() {
+			thinking.classList.remove("active");
+			const thinkingLabel = thinking.querySelector(".thinking-label");
+			if (thinkingLabel) thinkingLabel.textContent = "思考过程";
 			if (!processWrap || processWrap.hidden) return;
 			const body = processWrap.querySelector(".process-body");
 			const chevron = processWrap.querySelector(".tool-chevron");
@@ -511,9 +514,13 @@ function appendMessage(role, text) {
 				this._thinkingOpen = true;
 				thinking.hidden = false;
 				thinking.innerHTML = "";
+				thinking.classList.add("active");
 				const head = document.createElement("div");
 				head.className = "thinking-head";
-				head.textContent = "💭 思考过程";
+				const label = document.createElement("span");
+				label.className = "thinking-label";
+				label.textContent = "思考中";
+				head.appendChild(label);
 				const toggle = document.createElement("span");
 				toggle.className = "thinking-toggle";
 				toggle.textContent = "展开";
