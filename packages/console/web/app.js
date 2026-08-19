@@ -123,6 +123,7 @@ async function ensureSession() {
 			renderHistory(history);
 			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
 			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
+			syncThinkingOptions(history.availableThinkingLevels);
 			if (history.streaming) setRunning(true, true);
 			return;
 		} catch (error) {
@@ -138,6 +139,21 @@ async function ensureSession() {
 	const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
+	syncThinkingOptions(history?.availableThinkingLevels);
+}
+
+/** 根据当前模型的推理能力禁用不支持的思考等级选项（避免选中后被服务端钳制弹回） */
+function syncThinkingOptions(availableLevels) {
+	const supported = Array.isArray(availableLevels) ? availableLevels : null;
+	for (const opt of thinkingSelectEl.options) {
+		const ok = !supported || supported.includes(opt.value);
+		opt.disabled = !ok;
+		opt.title = ok ? "" : "当前模型不支持此等级";
+	}
+	if (supported && !supported.includes(thinkingSelectEl.value)) {
+		const firstEnabled = [...thinkingSelectEl.options].find((o) => !o.disabled);
+		if (firstEnabled) thinkingSelectEl.value = firstEnabled.value;
+	}
 }
 
 /** 清空消息区（保留折叠控制条） */
@@ -466,6 +482,7 @@ function handleEvent(event) {
 			break;
 		case "model_changed":
 			syncModelSelect(event.provider, event.modelId);
+			syncThinkingOptions(event.availableThinkingLevels);
 			break;
 		case "thinking_level_changed":
 			thinkingSelectEl.value = event.level;
@@ -1257,14 +1274,17 @@ modelSelectEl.addEventListener("change", async () => {
 	const [provider, ...rest] = value.split("/");
 	const modelId = rest.join("/");
 	try {
-		await api(`/api/sessions/${sessionId}/model`, {
+		const result = await api(`/api/sessions/${sessionId}/model`, {
 			method: "POST",
 			body: JSON.stringify({ provider, modelId }),
 		});
+		if (result?.thinkingLevel) thinkingSelectEl.value = result.thinkingLevel;
+		syncThinkingOptions(result?.availableThinkingLevels);
 	} catch (error) {
 		showError(`切换模型失败：${error.message}`);
 		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+		syncThinkingOptions(history?.availableThinkingLevels);
 	}
 });
 

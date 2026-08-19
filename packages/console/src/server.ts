@@ -1093,8 +1093,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				type: "model_changed",
 				provider: body.provider,
 				modelId: body.modelId,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
 			});
-			sendJson(res, 200, { ok: true, provider: body.provider, modelId: body.modelId });
+			sendJson(res, 200, {
+				ok: true,
+				provider: body.provider,
+				modelId: body.modelId,
+				thinkingLevel: cs.session.thinkingLevel,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+			});
 			return;
 		}
 
@@ -1119,6 +1126,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				messages: buildHistory(cs.session),
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
 			});
