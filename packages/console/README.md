@@ -40,6 +40,12 @@ npx tsx packages/console/src/server.ts
 - **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup 静默重装并自动重启；私有仓库需在设置里填写 GitHub Token；启动器为 ASCII 文件名 launcher.vbs 以规避控制台代码页问题）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
 
+## 客户端形态
+
+- **v0.3.0 起为 Electron 桌面客户端**（独立窗口、自带运行时、数据目录不变）。旧版（vbs + Edge 模式）点击更新后会自动进入 Electron，无需额外操作。
+- 更新链路不变：设置 → 关于与更新 → 立即更新（从 GitHub Release 拉取 Setup 静默重装并自动重启）。
+- 新增：会话删除（左侧对话列表 ×）、主题切换（顶栏 🌙/☀️，亮/暗双主题）。
+
 ## Windows 安装包（installer/）
 
 给没有 Node/开发环境的普通用户：双击 Setup exe 安装，桌面图标点开即用。
