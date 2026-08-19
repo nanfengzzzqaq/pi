@@ -1,0 +1,68 @@
+{
+	"name": "pi-console-electron",
+	"version": "0.3.0",
+	"private": true,
+	"description": "Pi 控制台 Electron 壳（主进程）",
+	"main": "main.js",
+	"type": "module",
+	"scripts": {
+		"icon": "node scripts/generate-icon.js",
+		"dist": "node scripts/generate-icon.js && electron-builder --win nsis"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "0.84.2",
+		"typebox": "1.3.7"
+	},
+	"devDependencies": {
+		"electron": "40.10.6",
+		"electron-builder": "26.15.3"
+	},
+	"build": {
+		"appId": "com.pi.console",
+		"productName": "pi-console",
+		"executableName": "PiConsole",
+		"directories": {
+			"output": "dist",
+			"buildResources": "build"
+		},
+		"files": [
+			"main.js",
+			"icon.png",
+			"src/**",
+			"web/**",
+			"packs/**",
+			"extra/**",
+			"package.json",
+			"node_modules/**"
+		],
+		"asarUnpack": [
+			"src/**",
+			"packs/**",
+			"web/**",
+			"extra/**"
+		],
+		"win": {
+			"icon": "icon.png",
+			"target": [
+				{
+					"target": "nsis",
+					"arch": [
+						"x64"
+					]
+				}
+			]
+		},
+		"nsis": {
+			"oneClick": false,
+			"perMachine": false,
+			"allowToChangeInstallationDirectory": true,
+			"shortcutName": "Pi 控制台",
+			"createDesktopShortcut": true,
+			"createStartMenuShortcut": true,
+			"artifactName": "Pi控制台-Setup-${version}.exe",
+			"deleteAppDataOnUninstall": false,
+			"include": "extra/installer.nsh"
+		}
+	},
+	"productName": "PiConsole"
+}
