@@ -73,6 +73,11 @@
 					<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
 					<span id="collapse-hint" class="collapse-hint"></span>
 				</div>
+				<div id="messages-empty" class="messages-empty">
+					<div class="messages-empty-mark">π</div>
+					<div class="messages-empty-title">有什么需要处理？</div>
+					<div class="messages-empty-hint">直接开始对话，或从左侧选择文件和助手。</div>
+				</div>
 			</main>
 
 			<div id="indicator" class="indicator" hidden>思考中…</div>
@@ -83,7 +88,7 @@
 					<div class="composer-input-box">
 						<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
 						<input type="file" id="file-input" multiple hidden>
-						<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+						<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
 					</div>
 					<div class="composer-buttons">
 						<button id="send-btn" disabled>发送</button>
