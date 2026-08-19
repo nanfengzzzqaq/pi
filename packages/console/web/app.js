@@ -14,6 +14,7 @@ const TOKEN_KEY = "pi-console-token";
 const $ = (id) => document.getElementById(id);
 
 const messagesEl = $("messages");
+const messagesEmptyEl = $("messages-empty");
 const inputEl = $("input");
 const sendBtn = $("send-btn");
 const stopBtn = $("stop-btn");
@@ -161,6 +162,7 @@ function syncThinkingOptions(availableLevels) {
 /** 清空消息区（保留折叠控制条） */
 function clearMessages() {
 	messagesEl.querySelectorAll(".message").forEach((m) => m.remove());
+	messagesEmptyEl.hidden = false;
 }
 
 function renderHistory(history) {
@@ -393,6 +395,7 @@ function renderContextRing(info) {
 	const fmtTokens = (v) => (v === null || v === undefined ? "" : `${(v / 1000).toFixed(1)}k`);
 	const capabilityNames = (info?.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、");
 	const lastTrace = info?.lastCapabilityTrace;
+	const compaction = info?.compaction;
 	const rows = [
 		`模型：${info?.model ? info.model.name : ""}`,
 		`上下文窗口：${contextWindow ? `${(contextWindow / 1000).toFixed(0)}k tokens` : ""}`,
@@ -401,6 +404,7 @@ function renderContextRing(info) {
 		`缓存写入：${fmtTokens(info?.cacheWrite)} tokens`,
 		`消息数：${info?.messageCount ?? ""}`,
 		`思考等级：${info?.thinkingLevel ?? ""}`,
+		`自动压缩：${compaction ? (compaction.enabled ? "已开启" : "已关闭") : ""}`,
 		`本会话助手：${capabilityNames}`,
 		`上轮实际工具：${lastTrace ? `${lastTrace.toolCount} 个 / ${formatByteSize(lastTrace.schemaBytes)}` : ""}`,
 		`工具定义指纹：${lastTrace?.schemaFingerprint ?? ""}`,
@@ -424,6 +428,7 @@ contextBtnEl.addEventListener("click", async () => {
 	try {
 		const info = await api(`/api/sessions/${sessionId}/context`);
 		const usage = info.usage ?? {};
+		const compaction = info.compaction;
 		const fmt = (v) => (v === null || v === undefined ? "（暂无统计）" : `${(v / 1000).toFixed(1)}k`);
 		const lines = [
 			`模型：${info.model ? `${info.model.name}（${info.model.provider}/${info.model.modelId}）` : "未配置"}`,
@@ -433,6 +438,7 @@ contextBtnEl.addEventListener("click", async () => {
 			`缓存写入：${fmt(info.cacheWrite)} tokens`,
 			`消息数：${info.messageCount}`,
 			`思考等级：${info.thinkingLevel}`,
+			`自动压缩：${compaction ? (compaction.enabled ? `已开启（接近上限时预留 ${fmt(compaction.reserveTokens)} token，压缩后保留近期约 ${fmt(compaction.keepRecentTokens)} token）` : "已关闭") : "暂无设置"}`,
 			`本会话助手：${(info.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、") || "未绑定"}`,
 			`上轮实际工具：${info.lastCapabilityTrace ? `${info.lastCapabilityTrace.toolCount} 个（工具定义 ${formatByteSize(info.lastCapabilityTrace.schemaBytes)}，指纹 ${info.lastCapabilityTrace.schemaFingerprint}）` : "暂无记录"}`,
 			`上轮模型用量：${typeof info.lastUsage?.totalTokens === "number" ? `${info.lastUsage.totalTokens.toLocaleString("zh-CN")} token` : "暂无统计"}`,
@@ -577,6 +583,7 @@ function formatModelUsage(usage) {
 // ---------------------------------------------------------------------------
 
 function appendMessage(role, text) {
+	messagesEmptyEl.hidden = true;
 	const wrap = document.createElement("div");
 	wrap.className = `message ${role}`;
 
@@ -586,7 +593,7 @@ function appendMessage(role, text) {
 		const meta = document.createElement("div");
 		meta.className = "message-meta";
 		const modelName = document.createElement("span");
-		modelName.textContent = modelSelectEl.value || "助手";
+		modelName.textContent = modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "助手";
 		const copyBtn = document.createElement("button");
 		copyBtn.className = "copy-btn";
 		copyBtn.textContent = "⧉";
@@ -1242,6 +1249,7 @@ async function sendMessage() {
 	const text = inputEl.value.trim();
 	if (!text || running || !sessionId) return;
 	inputEl.value = "";
+	resizeComposerInput();
 	errorBarEl.hidden = true;
 	appendMessage("user", text);
 	setRunning(true);
@@ -1286,12 +1294,21 @@ async function abortRun() {
 
 sendBtn.addEventListener("click", sendMessage);
 stopBtn.addEventListener("click", abortRun);
+
+/** 输入框按内容增高，避免空白时占据过多聊天空间。 */
+function resizeComposerInput() {
+	inputEl.style.height = "auto";
+	inputEl.style.height = `${Math.min(inputEl.scrollHeight, 160)}px`;
+}
+
+inputEl.addEventListener("input", resizeComposerInput);
 inputEl.addEventListener("keydown", (e) => {
 	if (e.key === "Enter" && !e.shiftKey) {
 		e.preventDefault();
 		sendMessage();
 	}
 });
+resizeComposerInput();
 
 // ---------------------------------------------------------------------------
 // 模型 / 思考等级（输入区右下角）

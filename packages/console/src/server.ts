@@ -1109,6 +1109,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		case "GET context": {
 			const usage = cs.session.getContextUsage?.();
 			const model = cs.session.model;
+			const compaction = cs.session.settingsManager.getCompactionSettings();
 			// 缓存统计：汇总消息 usage 的 cacheRead/cacheWrite（无法统计时为 null）
 			let cacheRead = null;
 			let cacheWrite = null;
@@ -1138,6 +1139,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					: null,
 				messageCount: cs.session.messages.length,
 				thinkingLevel: cs.session.thinkingLevel,
+				compaction,
 				cacheRead,
 				cacheWrite,
 				enabledCapabilities: packSummaries(cs.enabledPacks),
