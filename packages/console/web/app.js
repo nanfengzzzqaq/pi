@@ -78,6 +78,16 @@ const drawerEl = $("drawer");
 const drawerTitleEl = $("drawer-title");
 const drawerContentEl = $("drawer-content");
 const drawerCloseEl = $("drawer-close");
+const conversationWorkbenchEl = $("conversation-workbench");
+const officePreviewPaneEl = $("office-preview-pane");
+const officePreviewResizerEl = $("office-preview-resizer");
+const officePreviewTitleEl = $("office-preview-title");
+const officePreviewStatusEl = $("office-preview-status");
+const officePreviewLoadingEl = $("office-preview-loading");
+const officePreviewFrameEl = $("office-preview-frame");
+const officePreviewRefreshEl = $("office-preview-refresh");
+const officePreviewExternalEl = $("office-preview-external");
+const officePreviewCloseEl = $("office-preview-close");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
@@ -91,6 +101,12 @@ let catalogCache = null;
 let catalogMode = "tools";
 let catalogFilter = "全部";
 let catalogDownloadTimer = null;
+let officePreview = null;
+let officePreviewRequest = 0;
+const officeToolCalls = new Map();
+
+const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
+const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
 
 // ---------------------------------------------------------------------------
 // 基础请求
@@ -122,6 +138,154 @@ async function api(path, options = {}) {
 	}
 	return body;
 }
+
+// ---------------------------------------------------------------------------
+// OfficeCLI 实时渲染（office_preview_watch）
+// ---------------------------------------------------------------------------
+
+function isOfficeFilePath(path) {
+	return typeof path === "string" && OFFICE_FILE_RE.test(path.trim().replace(/["']$/, ""));
+}
+
+function cleanOfficeFilePath(path) {
+	return path.trim().replace(/^["']|["']$/g, "");
+}
+
+function applyOfficePreviewWidth(width) {
+	const bounds = conversationWorkbenchEl.getBoundingClientRect();
+	const max = Math.max(360, bounds.width - 340);
+	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.56), max));
+	officePreviewPaneEl.style.width = `${next}px`;
+}
+
+function showOfficePreviewPane(fileName) {
+	applyOfficePreviewWidth(localStorage.getItem(OFFICE_PREVIEW_WIDTH_KEY));
+	officePreviewTitleEl.textContent = fileName || "Office 文档";
+	officePreviewPaneEl.hidden = false;
+	officePreviewResizerEl.hidden = false;
+}
+
+async function stopOfficePreviewSession(preview) {
+	if (!preview?.id) return;
+	try {
+		await api(`/api/office-preview/${preview.id}/stop`, { method: "POST", body: "{}" });
+	} catch {
+		// 关闭预览不阻断会话操作；服务端退出时仍会清理残留进程。
+	}
+}
+
+async function closeOfficePreview() {
+	officePreviewRequest++;
+	const closing = officePreview;
+	officePreview = null;
+	officePreviewFrameEl.src = "about:blank";
+	officePreviewPaneEl.hidden = true;
+	officePreviewResizerEl.hidden = true;
+	officePreviewLoadingEl.hidden = false;
+	await stopOfficePreviewSession(closing);
+}
+
+async function openOfficePreview(path, source = "manual") {
+	if (!isOfficeFilePath(path)) return false;
+	const cleanPath = cleanOfficeFilePath(path);
+	const request = ++officePreviewRequest;
+	const shownName = cleanPath.split(/[\\/]/).pop() || cleanPath;
+	const previous = officePreview;
+	showOfficePreviewPane(shownName);
+	officePreviewLoadingEl.hidden = false;
+	officePreviewStatusEl.textContent = "正在启动实时预览（office_preview_start）";
+
+	try {
+		const next = await api("/api/office-preview/start", {
+			method: "POST",
+			body: JSON.stringify({ path: cleanPath, sessionId }),
+		});
+		if (request !== officePreviewRequest) {
+			if (next.id !== officePreview?.id) await stopOfficePreviewSession(next);
+			return true;
+		}
+		if (previous && previous.id !== next.id) void stopOfficePreviewSession(previous);
+		const samePreview = officePreview?.id === next.id;
+		officePreview = next;
+		officePreviewTitleEl.textContent = next.fileName;
+		officePreviewTitleEl.title = next.filePath;
+		if (!samePreview || officePreviewFrameEl.src !== next.url) {
+			officePreviewFrameEl.src = next.url;
+		} else {
+			officePreviewLoadingEl.hidden = true;
+			officePreviewStatusEl.textContent =
+				source === "tool" ? "文档修改已同步（office_preview_update）" : "实时预览已连接（office_preview_watch）";
+		}
+		return true;
+	} catch (error) {
+		if (request !== officePreviewRequest) return false;
+		officePreviewLoadingEl.hidden = true;
+		officePreviewStatusEl.textContent = "实时预览启动失败（office_preview_error）";
+		if (!previous) {
+			officePreviewPaneEl.hidden = true;
+			officePreviewResizerEl.hidden = true;
+		}
+		showError(`Office 实时预览失败：${error.message}`);
+		return false;
+	}
+}
+
+function findOfficePath(value, preferredKeys = []) {
+	if (!value) return null;
+	if (typeof value === "string") return isOfficeFilePath(value) ? cleanOfficeFilePath(value) : null;
+	if (typeof value !== "object") return null;
+	for (const key of preferredKeys) {
+		const found = findOfficePath(value[key]);
+		if (found) return found;
+	}
+	for (const [key, child] of Object.entries(value)) {
+		if (preferredKeys.includes(key)) continue;
+		const found = findOfficePath(child);
+		if (found) return found;
+	}
+	return null;
+}
+
+function maybePreviewOfficeTool(toolCall) {
+	if (!toolCall?.toolName?.startsWith("office_")) return;
+	const path = findOfficePath(toolCall.args, ["output", "file"]);
+	if (path) void openOfficePreview(path, "tool");
+}
+
+officePreviewFrameEl.addEventListener("load", () => {
+	if (!officePreview || officePreviewFrameEl.src === "about:blank") return;
+	officePreviewLoadingEl.hidden = true;
+	officePreviewStatusEl.textContent = "实时预览已连接（office_preview_watch）";
+});
+
+officePreviewRefreshEl.addEventListener("click", () => {
+	if (!officePreview) return;
+	officePreviewLoadingEl.hidden = false;
+	officePreviewStatusEl.textContent = "正在重新加载（office_preview_refresh）";
+	const separator = officePreview.url.includes("?") ? "&" : "?";
+	officePreviewFrameEl.src = `${officePreview.url}${separator}refresh=${Date.now()}`;
+});
+
+officePreviewExternalEl.addEventListener("click", () => {
+	if (officePreview) window.open(officePreview.url, "_blank", "noopener");
+});
+officePreviewCloseEl.addEventListener("click", () => void closeOfficePreview());
+
+officePreviewResizerEl.addEventListener("pointerdown", (event) => {
+	event.preventDefault();
+	officePreviewResizerEl.setPointerCapture(event.pointerId);
+	const resize = (moveEvent) => {
+		const bounds = conversationWorkbenchEl.getBoundingClientRect();
+		applyOfficePreviewWidth(bounds.right - moveEvent.clientX);
+	};
+	const finish = () => {
+		officePreviewResizerEl.removeEventListener("pointermove", resize);
+		localStorage.setItem(OFFICE_PREVIEW_WIDTH_KEY, String(Math.round(officePreviewPaneEl.getBoundingClientRect().width)));
+	};
+	officePreviewResizerEl.addEventListener("pointermove", resize);
+	officePreviewResizerEl.addEventListener("pointerup", finish, { once: true });
+	officePreviewResizerEl.addEventListener("pointercancel", finish, { once: true });
+});
 
 // ---------------------------------------------------------------------------
 // 会话初始化与恢复
@@ -287,6 +451,7 @@ async function loadSessions() {
 /** 切换到历史会话（服务端从磁盘恢复，消息与 SSE 随之切换） */
 async function switchSession(id) {
 	if (id === sessionId) return;
+	await closeOfficePreview();
 	sessionId = id;
 	localStorage.setItem(SESSION_KEY, id);
 	clearMessages();
@@ -365,6 +530,7 @@ document.addEventListener("contextmenu", hideSessionContextMenu);
 
 sessionNewBtnEl.addEventListener("click", async () => {
 	try {
+		await closeOfficePreview();
 		const result = await api("/api/sessions", { method: "POST", body: "{}" });
 		sessionId = result.sessionId;
 		localStorage.setItem(SESSION_KEY, sessionId);
@@ -480,6 +646,7 @@ function handleEvent(event) {
 			break;
 		case "tool_execution_start":
 			setIndicator(false);
+			officeToolCalls.set(event.toolCallId, { toolName: event.toolName, args: event.args });
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
 			ensureAssistant().addTool(
 				appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running"),
@@ -488,6 +655,9 @@ function handleEvent(event) {
 		case "tool_execution_end": {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(event.toolCallId)}"]`);
 			if (block) updateToolBlock(block, event.isError, event.result);
+			const toolCall = officeToolCalls.get(event.toolCallId);
+			officeToolCalls.delete(event.toolCallId);
+			if (!event.isError) maybePreviewOfficeTool(toolCall);
 			break;
 		}
 		case "capability_selection": {
@@ -1159,7 +1329,8 @@ messagesEl.addEventListener("click", (e) => {
 	const fileLink = e.target.closest("[data-path]");
 	if (fileLink) {
 		e.preventDefault();
-		attachPathLink(fileLink.dataset.path);
+		if (isOfficeFilePath(fileLink.dataset.path)) void openOfficePreview(fileLink.dataset.path, "tool-result");
+		else attachPathLink(fileLink.dataset.path);
 		return;
 	}
 	const btn = e.target.closest("[data-copy]");
@@ -1858,6 +2029,7 @@ async function loadWorkspaceState() {
 /** 把当前浏览目录设为工作区 */
 /** 工作区切换后：重建会话（旧会话 cwd 固化无法迁移），提示迁移结果 */
 async function afterWorkspaceChanged(result) {
+	await closeOfficePreview();
 	await loadWorkspaceState();
 	await loadFsRoots();
 	const migratedNote = result.migrated > 0 ? `，已从旧工作区迁移 ${result.migrated} 个文件` : "";
@@ -1997,6 +2169,10 @@ fsRefreshBtnEl.addEventListener("click", () => {
 
 async function previewFsFile(row) {
 	try {
+		if (isOfficeFilePath(row.dataset.path)) {
+			await openOfficePreview(row.dataset.path, "file");
+			return;
+		}
 		const file = await api(`/api/fs/read?path=${encodeURIComponent(row.dataset.path)}`);
 		previewFile = {
 			name: row.dataset.name,

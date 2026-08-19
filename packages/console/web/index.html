@@ -87,61 +87,85 @@
 				</div>
 			</section>
 
-			<div id="error-bar" class="error-bar" hidden></div>
+			<div id="conversation-workbench" class="conversation-workbench">
+				<section id="chat-pane" class="chat-pane">
+					<div id="error-bar" class="error-bar" hidden></div>
 
-			<main id="messages" class="messages">
-				<div class="messages-toolbar" id="messages-toolbar" hidden>
-					<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
-					<span id="collapse-hint" class="collapse-hint"></span>
-				</div>
-				<div id="messages-empty" class="messages-empty">
-					<div class="messages-empty-mark">π</div>
-					<div class="messages-empty-title">有什么需要处理？</div>
-					<div class="messages-empty-hint">直接开始对话，或从左侧选择文件、工具和技能。</div>
-				</div>
-			</main>
+					<main id="messages" class="messages">
+						<div class="messages-toolbar" id="messages-toolbar" hidden>
+							<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
+							<span id="collapse-hint" class="collapse-hint"></span>
+						</div>
+						<div id="messages-empty" class="messages-empty">
+							<div class="messages-empty-mark">π</div>
+							<div class="messages-empty-title">有什么需要处理？</div>
+							<div class="messages-empty-hint">直接开始对话，或从左侧选择文件、工具和技能。</div>
+						</div>
+					</main>
 
-			<div id="indicator" class="indicator" hidden>思考中…</div>
+					<div id="indicator" class="indicator" hidden>思考中…</div>
 
-			<footer class="composer">
-				<div class="attachments" id="attachments" hidden></div>
-				<div class="composer-row">
-					<div class="composer-input-box">
-						<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
-						<input type="file" id="file-input" multiple hidden>
-						<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+					<footer class="composer">
+						<div class="attachments" id="attachments" hidden></div>
+						<div class="composer-row">
+							<div class="composer-input-box">
+								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
+								<input type="file" id="file-input" multiple hidden>
+								<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+							</div>
+							<div class="composer-buttons">
+								<button id="send-btn" disabled>发送</button>
+								<button id="stop-btn" hidden>停止</button>
+							</div>
+						</div>
+						<div class="composer-bottom">
+							<span class="composer-model-label">模型</span>
+							<select id="model-select" title="模型" disabled>
+								<option value="">加载中…</option>
+							</select>
+							<span class="composer-model-label">思考</span>
+							<select id="thinking-select" title="思考等级" disabled>
+								<option value="off">off</option>
+								<option value="minimal">minimal</option>
+								<option value="low">low</option>
+								<option value="medium">medium</option>
+								<option value="high">high</option>
+								<option value="xhigh">xhigh</option>
+								<option value="max">max</option>
+							</select>
+							<button id="context-btn" class="context-ring-btn" title="上下文使用量">
+								<svg viewBox="0 0 36 36" class="context-ring">
+									<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
+									<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
+								</svg>
+								<span id="context-ring-text" class="context-ring-text">–</span>
+							</button>
+							<span class="composer-spacer"></span>
+							<span id="context-info" class="context-info" title="已启用能力"></span>
+						</div>
+					</footer>
+				</section>
+
+				<div id="office-preview-resizer" class="office-preview-resizer" title="拖动调整预览宽度" hidden></div>
+				<section id="office-preview-pane" class="office-preview-pane" hidden>
+					<header class="office-preview-header">
+						<div class="office-preview-heading">
+							<span class="office-preview-kicker">实时渲染（office_preview_watch）</span>
+							<strong id="office-preview-title" class="office-preview-title">Office 文档</strong>
+							<span id="office-preview-status" class="office-preview-status">准备预览</span>
+						</div>
+						<div class="office-preview-actions">
+							<button id="office-preview-refresh" class="icon-btn small" type="button" title="重新加载实时预览（office_preview_refresh）">⟳</button>
+							<button id="office-preview-external" class="icon-btn small" type="button" title="在浏览器中打开">↗</button>
+							<button id="office-preview-close" class="icon-btn small" type="button" title="关闭实时预览（office_preview_stop）">×</button>
+						</div>
+					</header>
+					<div class="office-preview-stage">
+						<div id="office-preview-loading" class="office-preview-loading">正在启动 OfficeCLI 实时渲染…</div>
+						<iframe id="office-preview-frame" class="office-preview-frame" title="OfficeCLI 实时渲染画面"></iframe>
 					</div>
-					<div class="composer-buttons">
-						<button id="send-btn" disabled>发送</button>
-						<button id="stop-btn" hidden>停止</button>
-					</div>
-				</div>
-				<div class="composer-bottom">
-					<span class="composer-model-label">模型</span>
-					<select id="model-select" title="模型" disabled>
-						<option value="">加载中…</option>
-					</select>
-					<span class="composer-model-label">思考</span>
-					<select id="thinking-select" title="思考等级" disabled>
-						<option value="off">off</option>
-						<option value="minimal">minimal</option>
-						<option value="low">low</option>
-						<option value="medium">medium</option>
-						<option value="high">high</option>
-						<option value="xhigh">xhigh</option>
-						<option value="max">max</option>
-					</select>
-					<button id="context-btn" class="context-ring-btn" title="上下文使用量">
-						<svg viewBox="0 0 36 36" class="context-ring">
-							<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
-							<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
-						</svg>
-						<span id="context-ring-text" class="context-ring-text">–</span>
-					</button>
-					<span class="composer-spacer"></span>
-					<span id="context-info" class="context-info" title="已启用能力"></span>
-				</div>
-			</footer>
+				</section>
+			</div>
 		</main>
 
 		<!-- 右侧抽屉：工具或技能详情 -->

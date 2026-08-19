@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -20,6 +20,7 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import * as fsExplorer from "./fs.ts";
+import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
 import { installAllOfficeCliSkills, installOfficeCliSkill, listOfficeCliSkills } from "./officecli-skills.ts";
 import {
@@ -1034,6 +1035,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, officecli.getDownloadProgress());
 		return;
 	}
+	if (pathname === "/api/office-preview/start" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { path?: unknown; sessionId?: unknown };
+		if (typeof body?.path !== "string" || !body.path.trim()) {
+			sendJson(res, 400, { error: '请求体需为 {"path": "文档路径"}' });
+			return;
+		}
+		try {
+			const cs = typeof body.sessionId === "string" ? sessions.get(body.sessionId) : undefined;
+			const cwd = cs?.session.sessionManager.getCwd() ?? workspace.getWorkspacePath() ?? DATA_DIR;
+			const filePath = fsExplorer.resolveAllowedFilePath(resolve(cwd, body.path.trim()));
+			sendJson(res, 200, await officePreview.startOfficePreview(filePath));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	const officePreviewStopMatch = pathname.match(/^\/api\/office-preview\/([a-f0-9-]+)\/stop$/);
+	if (officePreviewStopMatch && req.method === "POST") {
+		sendJson(res, 200, { ok: await officePreview.stopOfficePreview(officePreviewStopMatch[1]) });
+		return;
+	}
 
 	// 模型枚举
 	if (pathname === "/api/models" && req.method === "GET") {
@@ -1419,6 +1441,11 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 	}
 	process.exit(1);
 });
+
+server.on("close", () => {
+	void officePreview.stopAllOfficePreviews();
+});
+process.once("exit", officePreview.terminateAllOfficePreviewsNow);
 
 server.listen(PORT, HOST, () => {
 	console.log(`Pi 控制台已启动：http://${HOST}:${PORT}`);
