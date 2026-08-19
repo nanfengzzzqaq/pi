@@ -31,16 +31,21 @@
 					<div class="skills-empty">技能将在这里列出，可选用作对话能力（即将支持）。</div>
 				</div>
 			</section>
-			<section class="side-section side-section-grow">
-				<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
-				<div id="files-panel" class="side-body side-body-grow">
-					<div class="files-toolbar">
-						<select id="fs-root-select" title="浏览根目录"></select>
-						<button id="fs-refresh" class="icon-btn small" title="刷新">⟳</button>
+				<section class="side-section side-section-grow">
+					<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
+					<div id="files-panel" class="side-body side-body-grow">
+						<div class="files-toolbar">
+							<select id="fs-root-select" title="浏览根目录"></select>
+							<button id="fs-refresh" class="icon-btn small" title="刷新">⟳</button>
+						</div>
+						<div class="files-workspace-line" id="files-workspace-line" title="当前工作区（会话工作目录）">
+							<span class="files-workspace-label">工作区</span>
+							<span id="fs-workspace-path" class="files-workspace-path">（未设置）</span>
+							<button id="fs-set-workspace" class="secondary-btn small" title="把当前浏览目录设为工作区">设为工作区</button>
+						</div>
+						<div id="fs-tree" class="fs-tree"></div>
 					</div>
-					<div id="fs-tree" class="fs-tree"></div>
-				</div>
-			</section>
+				</section>
 		</aside>
 
 		<!-- 中间：聊天区 -->
@@ -129,6 +134,16 @@
 				<span class="modal-title">设置</span>
 				<button id="settings-close" class="icon-btn" title="关闭">×</button>
 			</div>
+
+			<section class="modal-section">
+				<h3>工作区</h3>
+				<p class="modal-hint">会话的工作目录：Pi 读写文件、运行命令都在这里进行。设置后新会话直接在此目录工作；留空则使用默认工作区。也可在左侧「文件」面板浏览到目标目录后点「设为工作区」。</p>
+				<div class="key-add-row">
+					<input type="text" id="workspace-input" placeholder="例如 D:\projects\myapp（留空并保存 = 清除工作区）" autocomplete="off">
+					<button id="workspace-save-btn">保存</button>
+				</div>
+				<div class="workspace-current" id="workspace-current">当前：未设置（默认工作区）</div>
+			</section>
 
 			<section class="modal-section">
 				<h3>模型服务</h3>

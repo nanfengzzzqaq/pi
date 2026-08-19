@@ -1218,3 +1218,36 @@ body {
 	display: flex;
 	justify-content: flex-end;
 }
+
+/* 工作区行（文件面板） */
+.files-workspace-line {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+	margin-bottom: 6px;
+	color: var(--muted);
+	flex-wrap: wrap;
+}
+
+.files-workspace-label {
+	font-weight: 600;
+	color: var(--text);
+}
+
+.files-workspace-path {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--mono);
+	font-size: 11px;
+}
+
+.workspace-current {
+	color: var(--muted);
+	font-size: 12px;
+	margin-bottom: 8px;
+	word-break: break-all;
+}

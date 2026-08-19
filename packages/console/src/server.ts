@@ -31,6 +31,7 @@ import {
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
 import * as updates from "./updates.ts";
+import * as workspace from "./workspace.ts";
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -214,7 +215,9 @@ function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [ke
 
 async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
 	const sessionId = randomUUID();
-	const cwd = join(WORKSPACES_DIR, sessionId);
+	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
+	const workspacePath = workspace.getWorkspacePath();
+	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
 
@@ -668,6 +671,26 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		await modelRuntime.refresh();
 		sendJson(res, 200, { ok: true });
+		return;
+	}
+
+	// 工作区设置（用户可自行指定会话工作目录）
+	if (pathname === "/api/workspace" && req.method === "GET") {
+		sendJson(res, 200, { path: workspace.getWorkspacePath() });
+		return;
+	}
+	if (pathname === "/api/workspace" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { path?: unknown };
+		if (typeof body?.path !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"path": "..."}（空串表示清除工作区）' });
+			return;
+		}
+		try {
+			const path = workspace.setWorkspacePath(body.path);
+			sendJson(res, 200, { ok: true, path });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
 		return;
 	}
 
