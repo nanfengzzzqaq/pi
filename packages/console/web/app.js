@@ -128,14 +128,19 @@ async function ensureSession() {
 	const result = await api("/api/sessions", { method: "POST", body: "{}" });
 	sessionId = result.sessionId;
 	localStorage.setItem(SESSION_KEY, sessionId);
-	messagesEl.innerHTML = "";
+	clearMessages();
 	const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 }
 
+/** 清空消息区（保留折叠控制条） */
+function clearMessages() {
+	messagesEl.querySelectorAll(".message").forEach((m) => m.remove());
+}
+
 function renderHistory(history) {
-	messagesEl.innerHTML = "";
+	clearMessages();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
 	for (const item of history.messages) {
 		if (item.role === "user") {
@@ -273,7 +278,15 @@ function appendMessage(role, text) {
 	if (role === "assistant") {
 		const meta = document.createElement("div");
 		meta.className = "message-meta";
-		meta.textContent = modelSelectEl.value || "助手";
+		const modelName = document.createElement("span");
+		modelName.textContent = modelSelectEl.value || "助手";
+		const copyBtn = document.createElement("button");
+		copyBtn.className = "copy-btn";
+		copyBtn.textContent = "⧉";
+		copyBtn.title = "复制本条回复";
+		copyBtn.dataset.copy = "msg";
+		meta.appendChild(modelName);
+		meta.appendChild(copyBtn);
 		bubble.appendChild(meta);
 	}
 
@@ -291,6 +304,7 @@ function appendMessage(role, text) {
 
 	wrap.appendChild(bubble);
 	messagesEl.appendChild(wrap);
+	applyCollapse();
 	scrollToBottom();
 
 	return {
@@ -512,6 +526,15 @@ function renderMarkdownInto(el, text, options = {}) {
 	closeList();
 	closeTable();
 	el.innerHTML = html;
+	// 给每个代码块加复制按钮（流式重渲染时统一重建）
+	for (const pre of el.querySelectorAll("pre")) {
+		const btn = document.createElement("button");
+		btn.className = "copy-btn";
+		btn.textContent = "⧉";
+		btn.title = "复制代码";
+		btn.dataset.copy = "code";
+		pre.appendChild(btn);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +658,57 @@ function scrollToBottom() {
 	const should = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 160;
 	if (should) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
+
+// ---------------------------------------------------------------------------
+// 折叠历史消息（sticky 控制条，不随滚动消失）
+// ---------------------------------------------------------------------------
+
+const collapseBtnEl = $("collapse-btn");
+const collapseHintEl = $("collapse-hint");
+const messagesToolbarEl = $("messages-toolbar");
+let collapsed = false;
+
+/** 折叠状态应用到消息列表：隐藏除最后 2 条外的消息 */
+function applyCollapse() {
+	const msgs = messagesEl.querySelectorAll(".message");
+	const keep = Math.max(0, msgs.length - 2);
+	messagesToolbarEl.hidden = msgs.length <= 2;
+	for (let i = 0; i < keep; i++) {
+		msgs[i].classList.toggle("collapsed-hidden", collapsed);
+	}
+	collapseHintEl.textContent = collapsed && keep > 0 ? `已折叠 ${keep} 条较早的消息` : "";
+	collapseBtnEl.textContent = collapsed ? "▾ 展开历史消息" : "▴ 折叠历史消息";
+}
+
+collapseBtnEl.addEventListener("click", () => {
+	collapsed = !collapsed;
+	applyCollapse();
+	// 折叠后回到顶部，展开后回到底部
+	messagesEl.scrollTop = collapsed ? 0 : messagesEl.scrollHeight;
+});
+
+// ---------------------------------------------------------------------------
+// 复制（消息 / 代码块）
+// ---------------------------------------------------------------------------
+
+messagesEl.addEventListener("click", (e) => {
+	const btn = e.target.closest("[data-copy]");
+	if (!btn) return;
+	let text = "";
+	if (btn.dataset.copy === "msg") {
+		const bubble = btn.closest(".bubble");
+		const textEl = bubble?.querySelector(".text");
+		text = textEl ? textEl.innerText : "";
+	} else if (btn.dataset.copy === "code") {
+		const codeEl = btn.closest("pre")?.querySelector("code");
+		text = codeEl ? codeEl.innerText : "";
+	}
+	if (!text) return;
+	navigator.clipboard
+		.writeText(text)
+		.then(() => showInfo(`已复制（${text.length} 字符）`))
+		.catch(() => showError("复制失败"));
+});
 
 // ---------------------------------------------------------------------------
 // 附件（＋按钮 / 拖拽 / 粘贴）
@@ -1110,6 +1184,24 @@ async function loadWorkspaceState() {
 }
 
 /** 把当前浏览目录设为工作区 */
+/** 工作区切换后：重建会话（旧会话 cwd 固化无法迁移），提示迁移结果 */
+async function afterWorkspaceChanged(result) {
+	await loadWorkspaceState();
+	await loadFsRoots();
+	const migratedNote = result.migrated > 0 ? `，已从旧工作区迁移 ${result.migrated} 个文件` : "";
+	if (result.sessionReset) {
+		localStorage.removeItem(SESSION_KEY);
+		sessionId = null;
+		clearMessages();
+		lastSeq = -1;
+		await ensureSession();
+		connectSSE();
+		showInfo(`工作区已切换${migratedNote}，会话已重建，现在在新工作区工作`);
+	} else {
+		showInfo(`工作区已设为 ${result.path}${migratedNote}`);
+	}
+}
+
 fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 	if (!currentFsPath) {
 		showError("请先在文件面板浏览到一个目录");
@@ -1117,9 +1209,7 @@ fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 	}
 	try {
 		const result = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: currentFsPath }) });
-		showInfo(`工作区已设为 ${result.path}，新会话将在此目录工作`);
-		await loadWorkspaceState();
-		await loadFsRoots();
+		await afterWorkspaceChanged(result);
 	} catch (error) {
 		showError(`设置工作区失败：${error.message}`);
 	}
@@ -1134,9 +1224,7 @@ workspaceSaveBtnEl.addEventListener("click", async () => {
 			body: JSON.stringify({ path: workspaceInputEl.value.trim() }),
 		});
 		workspaceInputEl.value = "";
-		showInfo(result.path ? `工作区已设为 ${result.path}` : "已清除工作区（使用默认）");
-		await loadWorkspaceState();
-		await loadFsRoots();
+		await afterWorkspaceChanged(result);
 	} catch (error) {
 		showError(`保存工作区失败：${error.message}`);
 	} finally {

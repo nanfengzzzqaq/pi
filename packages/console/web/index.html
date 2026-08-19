@@ -52,7 +52,12 @@
 		<main class="content">
 			<div id="error-bar" class="error-bar" hidden></div>
 
-			<main id="messages" class="messages"></main>
+			<main id="messages" class="messages">
+				<div class="messages-toolbar" id="messages-toolbar" hidden>
+					<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
+					<span id="collapse-hint" class="collapse-hint"></span>
+				</div>
+			</main>
 
 			<div id="indicator" class="indicator" hidden>思考中…</div>
 
