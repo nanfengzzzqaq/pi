@@ -4,14 +4,14 @@ Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 
-Rem Electron 版已安装则直接启动（升级衔接）
+Rem If Electron build is installed, launch it (upgrade path)
 electron = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\PiConsole\PiConsole.exe"
 If fso.FileExists(electron) Then
   sh.Run """" & electron & """", 1, False
   WScript.Quit
 End If
 
-Rem 以下为旧版（node 服务 + Edge 独立窗口）逻辑
+Rem Legacy mode: node server + Edge app window
 edge = ""
 If fso.FileExists(sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\Microsoft\Edge\Application\msedge.exe") Then
   edge = sh.ExpandEnvironmentStrings("%ProgramFiles(x86)%") & "\Microsoft\Edge\Application\msedge.exe"
