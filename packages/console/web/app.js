@@ -260,6 +260,7 @@ async function loadSessions() {
 			row.addEventListener("click", () => switchSession(session.id));
 			row.addEventListener("contextmenu", (e) => {
 				e.preventDefault();
+				e.stopPropagation(); // 阻止冒泡到 document 层，避免菜单被立即隐藏
 				showSessionContextMenu(e.clientX, e.clientY, session.id);
 			});
 			sessionsListEl.appendChild(row);
