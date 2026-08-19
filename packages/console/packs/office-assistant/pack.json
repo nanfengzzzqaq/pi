@@ -1,8 +1,8 @@
 {
 	"name": "office-assistant",
-	"displayName": "Office 助手",
-	"description": "通过 OfficeCLI 创建与编辑 Word/Excel/PowerPoint 文档（docx/xlsx/pptx）",
-	"version": "0.2.0",
+	"displayName": "Office 文件处理",
+	"description": "通过 OfficeCLI 创建、读取、编辑与检查 Word、Excel、PowerPoint 文件",
+	"version": "0.3.0",
 	"deferred": true,
 	"metaTool": "office_enable",
 	"activation": {

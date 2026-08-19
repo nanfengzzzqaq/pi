@@ -21,6 +21,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import * as fsExplorer from "./fs.ts";
 import * as officecli from "./officecli.ts";
+import { installAllOfficeCliSkills, installOfficeCliSkill, listOfficeCliSkills } from "./officecli-skills.ts";
 import {
 	baseToolNames,
 	type CapabilityMatch,
@@ -64,6 +65,8 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
+/** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
+const OFFICECLI_PACK_NAME = "office-assistant";
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
@@ -180,6 +183,38 @@ function touchSessionIndex(
 	writeSessionIndex(index);
 }
 
+/**
+ * “安装工具”替代旧的“给某个会话添加助手”：OfficeCLI 一旦可用，就绑定到全部会话；
+ * 每轮仍由本地能力路由只注入命中的最小工具组。
+ */
+function activateOfficeCliForAllSessions(): void {
+	mountPack(OFFICECLI_PACK_NAME);
+	for (const cs of sessions.values()) {
+		cs.enabledPacks.add(OFFICECLI_PACK_NAME);
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	}
+	const enabled = mountedPacks();
+	const index = readSessionIndex();
+	for (const entry of Object.values(index)) {
+		entry.enabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...enabled])];
+	}
+	writeSessionIndex(index);
+}
+
+async function reloadInstalledSkillsInSessions(): Promise<number> {
+	let reloaded = 0;
+	for (const cs of sessions.values()) {
+		if (cs.session.isStreaming) continue;
+		try {
+			await cs.session.reload();
+			reloaded += 1;
+		} catch (error) {
+			console.warn(`会话 ${cs.sessionId} 刷新技能失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	return reloaded;
+}
+
 /** 首条 user 消息作为会话标题 */
 function updateSessionTitle(sessionId: string, text: string): void {
 	const index = readSessionIndex();
@@ -203,6 +238,8 @@ await loadPacks();
 if (officecli.seedBundledBinary()) {
 	console.log("已把预置的 OfficeCLI 复制到数据目录");
 }
+officecli.ensureBinaryOnProcessPath();
+if (await officecli.isBinaryReady()) activateOfficeCliForAllSessions();
 
 // 预热：扩展注册的自定义 provider 只有在某个会话加载扩展之后才会出现在
 // ModelRuntime 里。启动时先加载一次全局扩展，PI_CONSOLE_MODEL 才能引用它们。
@@ -449,7 +486,9 @@ function subscribeConsoleSession(cs: ConsoleSession): void {
 	});
 }
 
-async function createConsoleSession(enabledPackNames: string[] = []): Promise<{ sessionId: string; warning?: string }> {
+async function createConsoleSession(
+	enabledPackNames: string[] = mountedPacks(),
+): Promise<{ sessionId: string; warning?: string }> {
 	const sessionId = randomUUID();
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
@@ -488,8 +527,8 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	const entry = index[sessionId];
 	if (!entry) return null;
 	try {
-		// v0.3.3 及更早的索引没有会话级助手字段；迁移时沿用当时全局已启用的助手。
-		const restoredEnabledPacks = entry.enabledPacks ?? mountedPacks();
+		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
+		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
 		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
 			entry.cwd,
 			restoredEnabledPacks,
@@ -586,6 +625,47 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 		}
 	}
 	return items;
+}
+
+/** 工具/技能目录：当前只发布经过验证的 OfficeCLI，后续工具沿用同一结构追加。 */
+async function buildCapabilityCatalog() {
+	const status = await officecli.getLocalStatus();
+	const pack = listPacks().find((item) => item.name === OFFICECLI_PACK_NAME);
+	const skills = listOfficeCliSkills(CONSOLE_AGENT_DIR);
+	return {
+		tools: [
+			{
+				id: "officecli",
+				internalName: "officecli",
+				displayName: "Office 文件处理",
+				description: "在本地创建、读取、编辑、检查和预览 Word、Excel、PowerPoint 文件。",
+				category: "文档办公",
+				formats: [".docx", ".xlsx", ".pptx", ".csv", ".tsv"],
+				installed: status.installed,
+				version: status.version,
+				installPath: status.path,
+				platform: `${process.platform}-${process.arch}`,
+				icon: "/officecli.svg",
+				sourceName: "OfficeCLI 官方项目",
+				sourceUrl: "https://github.com/iOfficeAI/OfficeCLI",
+				activation: "按本轮需求加载",
+				capabilities: pack?.tools ?? [],
+				skillCount: skills.length,
+				installedSkillCount: skills.filter((skill) => skill.installed).length,
+			},
+		],
+		skillGroups: [
+			{
+				toolId: "officecli",
+				toolInternalName: "officecli",
+				toolDisplayName: "Office 文件处理",
+				toolInstalled: status.installed,
+				icon: "/officecli.svg",
+				skills,
+			},
+		],
+		download: officecli.getDownloadProgress(),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +828,7 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/index.html": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
+	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
 };
 
 function serveStatic(pathname: string, res: ServerResponse): boolean {
@@ -869,8 +950,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 400, { error: `助手未启用或不存在：${unavailable.join("、")}` });
 			return;
 		}
-		const result = await createConsoleSession([...new Set(assistantNames)]);
+		const result = await createConsoleSession([...new Set([...mountedPacks(), ...assistantNames])]);
 		sendJson(res, 200, result);
+		return;
+	}
+
+	// 工具与技能目录（当前仅 OfficeCLI）
+	if (pathname === "/api/catalog" && req.method === "GET") {
+		sendJson(res, 200, await buildCapabilityCatalog());
+		return;
+	}
+	const officeSkillInstallMatch = pathname.match(/^\/api\/tools\/officecli\/skills\/([a-z0-9-]+)\/install$/);
+	if (officeSkillInstallMatch && req.method === "POST") {
+		const installed = await installOfficeCliSkill(CONSOLE_AGENT_DIR, officeSkillInstallMatch[1]);
+		activateOfficeCliForAllSessions();
+		const reloadedSessions = installed.length > 0 ? await reloadInstalledSkillsInSessions() : 0;
+		sendJson(res, 200, { ok: true, installed, reloadedSessions });
+		return;
+	}
+	if (pathname === "/api/tools/officecli/skills/install-all" && req.method === "POST") {
+		const installed = await installAllOfficeCliSkills(CONSOLE_AGENT_DIR);
+		activateOfficeCliForAllSessions();
+		const reloadedSessions = installed.length > 0 ? await reloadInstalledSkillsInSessions() : 0;
+		sendJson(res, 200, { ok: true, installed, reloadedSessions });
 		return;
 	}
 
@@ -909,14 +1011,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, await officecli.getStatus());
 		return;
 	}
-	if (pathname === "/api/officecli/download" && req.method === "POST") {
+	if (
+		(pathname === "/api/officecli/download" || pathname === "/api/tools/officecli/install") &&
+		req.method === "POST"
+	) {
 		const progress = officecli.getDownloadProgress();
 		if (progress.running) {
 			sendJson(res, 409, { error: "下载已在进行中" });
 			return;
 		}
 		// 异步下载，进度通过轮询 /api/officecli/progress 获取
-		void officecli.downloadLatest();
+		void officecli.downloadLatest().then(async () => {
+			if (await officecli.isBinaryReady()) {
+				officecli.ensureBinaryOnProcessPath();
+				activateOfficeCliForAllSessions();
+			}
+		});
 		sendJson(res, 202, { ok: true });
 		return;
 	}

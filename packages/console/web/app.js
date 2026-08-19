@@ -1,7 +1,7 @@
 "use strict";
 
 // Pi 控制台前端：纯原生 JS，无构建步骤。
-// 布局：左栏（助手/技能/文件）+ 聊天区 + 右侧能力详情抽屉（点击助手才展开）。
+// 布局：左栏（工具/技能/对话/文件）+ 聊天区 + 右侧详情抽屉。
 // Claude 风格：Markdown 渲染、代码高亮、思考过程折叠滚动、工具调用块折叠。
 
 const SESSION_KEY = "pi-console-session";
@@ -44,7 +44,6 @@ const dropOverlayEl = $("drop-overlay");
 const githubTokenInputEl = $("github-token-input");
 const githubTokenSaveBtnEl = $("github-token-save-btn");
 const githubTokenClearBtnEl = $("github-token-clear-btn");
-const assistantsListEl = $("assistants-list");
 const fsRootSelectEl = $("fs-root-select");
 const fsTreeEl = $("fs-tree");
 const fsRefreshBtnEl = $("fs-refresh");
@@ -64,10 +63,17 @@ const previewContentEl = $("preview-content");
 const previewCloseEl = $("preview-close");
 const previewAttachBtnEl = $("preview-attach");
 const contextInfoEl = $("context-info");
-const assistantAddBtnEl = $("assistant-add-btn");
-const assistantsModalEl = $("assistants-modal");
-const assistantsModalCloseEl = $("assistants-modal-close");
-const assistantsModalListEl = $("assistants-modal-list");
+const toolsNavBtnEl = $("tools-nav-btn");
+const skillsNavBtnEl = $("skills-nav-btn");
+const catalogViewEl = $("catalog-view");
+const catalogTitleEl = $("catalog-title");
+const catalogSubtitleEl = $("catalog-subtitle");
+const catalogCloseBtnEl = $("catalog-close-btn");
+const catalogToolsTabEl = $("catalog-tools-tab");
+const catalogSkillsTabEl = $("catalog-skills-tab");
+const catalogSearchInputEl = $("catalog-search-input");
+const catalogFiltersEl = $("catalog-filters");
+const catalogContentEl = $("catalog-content");
 const drawerEl = $("drawer");
 const drawerTitleEl = $("drawer-title");
 const drawerContentEl = $("drawer-content");
@@ -81,6 +87,10 @@ let reconnectTimer = null;
 let currentAssistant = null;
 let pendingAttachments = [];
 let previewFile = null; // 预览中的文件 {name, mimeType, dataBase64, size}
+let catalogCache = null;
+let catalogMode = "tools";
+let catalogFilter = "全部";
+let catalogDownloadTimer = null;
 
 // ---------------------------------------------------------------------------
 // 基础请求
@@ -405,7 +415,7 @@ function renderContextRing(info) {
 		`消息数：${info?.messageCount ?? ""}`,
 		`思考等级：${info?.thinkingLevel ?? ""}`,
 		`自动压缩：${compaction ? (compaction.enabled ? "已开启" : "已关闭") : ""}`,
-		`本会话助手：${capabilityNames}`,
+		`可用工具：${capabilityNames}`,
 		`上轮实际工具：${lastTrace ? `${lastTrace.toolCount} 个 / ${formatByteSize(lastTrace.schemaBytes)}` : ""}`,
 		`工具定义指纹：${lastTrace?.schemaFingerprint ?? ""}`,
 	];
@@ -439,7 +449,7 @@ contextBtnEl.addEventListener("click", async () => {
 			`消息数：${info.messageCount}`,
 			`思考等级：${info.thinkingLevel}`,
 			`自动压缩：${compaction ? (compaction.enabled ? `已开启（接近上限时预留 ${fmt(compaction.reserveTokens)} token，压缩后保留近期约 ${fmt(compaction.keepRecentTokens)} token）` : "已关闭") : "暂无设置"}`,
-			`本会话助手：${(info.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、") || "未绑定"}`,
+			`可用工具：${(info.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、") || "仅原生 Pi 工具"}`,
 			`上轮实际工具：${info.lastCapabilityTrace ? `${info.lastCapabilityTrace.toolCount} 个（工具定义 ${formatByteSize(info.lastCapabilityTrace.schemaBytes)}，指纹 ${info.lastCapabilityTrace.schemaFingerprint}）` : "暂无记录"}`,
 			`上轮模型用量：${typeof info.lastUsage?.totalTokens === "number" ? `${info.lastUsage.totalTokens.toLocaleString("zh-CN")} token` : "暂无统计"}`,
 			"",
@@ -593,7 +603,7 @@ function appendMessage(role, text) {
 		const meta = document.createElement("div");
 		meta.className = "message-meta";
 		const modelName = document.createElement("span");
-		modelName.textContent = modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "助手";
+		modelName.textContent = modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "Pi";
 		const copyBtn = document.createElement("button");
 		copyBtn.className = "copy-btn";
 		copyBtn.textContent = "⧉";
@@ -1396,10 +1406,10 @@ thinkingSelectEl.addEventListener("change", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 左栏：助手（能力包）与技能
+// 左栏：工具 / 技能目录
 // ---------------------------------------------------------------------------
 
-/** 折叠面板切换 */
+/** 折叠“对话”和“文件”面板。 */
 document.querySelectorAll(".side-header").forEach((header) => {
 	header.addEventListener("click", () => {
 		const panel = $(header.dataset.panel);
@@ -1409,204 +1419,374 @@ document.querySelectorAll(".side-header").forEach((header) => {
 	});
 });
 
-/** 能力包数据缓存：侧栏精简列表、添加弹窗、详情抽屉共用一份 */
-let packsCache = [];
-
-/** 当前抽屉里展示的助手名（null = 抽屉关闭） */
-let drawerPackName = null;
-
-async function refreshPacks() {
-	packsCache = await api("/api/packs");
+async function refreshCatalog() {
+	catalogCache = await api("/api/catalog");
+	renderCatalog();
 }
 
-/** 挂载 / 停用，并刷新相关 UI */
-async function togglePack(pack) {
-	const action = pack.mounted ? "unmount" : "mount";
+async function openCatalog(mode) {
+	catalogMode = mode;
+	catalogFilter = "全部";
+	catalogViewEl.hidden = false;
+	toolsNavBtnEl.classList.toggle("active", mode === "tools");
+	skillsNavBtnEl.classList.toggle("active", mode === "skills");
+	closeDrawer();
+	if (!catalogCache) catalogContentEl.textContent = "加载中…";
 	try {
-		await api(`/api/packs/${pack.name}/${action}`, { method: "POST", body: "{}" });
-		showInfo(action === "mount" ? `已启用 ${pack.displayName}，可用它开启新对话` : `已停用 ${pack.displayName}`);
-		await loadAssistants();
-		await loadContextPanel();
-		// 抽屉正展示这个助手：停用后顺手关上，启用后刷新详情
-		if (drawerPackName === pack.name) {
-			if (action === "unmount") closeDrawer();
-			else openDrawer(pack.name);
-		}
+		if (!catalogCache) await refreshCatalog();
+		else renderCatalog();
 	} catch (error) {
-		showError(`操作失败：${error.message}`);
+		catalogContentEl.textContent = `加载失败：${error.message}`;
 	}
 }
 
-/** 左栏：只列"已启用"的助手（精简行），其余收进"添加助手"弹窗 */
-async function loadAssistants() {
-	try {
-		await refreshPacks();
-		assistantsListEl.innerHTML = "";
-		const mounted = packsCache.filter((p) => p.mounted);
-		if (mounted.length === 0) {
-			const empty = document.createElement("div");
-			empty.className = "skills-empty";
-			empty.textContent = "还没有启用的助手";
-			assistantsListEl.appendChild(empty);
-			return;
-		}
-		for (const pack of mounted) {
-			const row = document.createElement("div");
-			row.className = "assistant-row";
-			row.dataset.packName = pack.name;
-
-			const dot = document.createElement("span");
-			dot.className = "assistant-dot";
-			const name = document.createElement("span");
-			name.className = "assistant-row-name";
-			name.textContent = pack.displayName;
-			const go = document.createElement("span");
-			go.className = "assistant-row-go";
-			go.textContent = "›";
-
-			row.appendChild(dot);
-			row.appendChild(name);
-			row.appendChild(go);
-			row.addEventListener("click", () => openDrawer(pack.name));
-			assistantsListEl.appendChild(row);
-		}
-	} catch (error) {
-		assistantsListEl.textContent = `加载失败：${error.message}`;
-	}
+function closeCatalog() {
+	catalogViewEl.hidden = true;
+	toolsNavBtnEl.classList.remove("active");
+	skillsNavBtnEl.classList.remove("active");
+	closeDrawer();
+	inputEl.focus();
 }
 
-/** "添加助手"弹窗：列出全部可用助手 */
-function openAssistantsModal() {
-	assistantsModalListEl.innerHTML = "";
-	if (packsCache.length === 0) {
-		assistantsModalListEl.innerHTML = '<div class="skills-empty">暂无可用助手</div>';
-	} else {
-		for (const pack of packsCache) {
-			const item = document.createElement("div");
-			item.className = "pack-option";
-
-			const main = document.createElement("div");
-			main.className = "pack-option-main";
-			const title = document.createElement("div");
-			title.className = "pack-option-title";
-			title.textContent = `${pack.displayName} v${pack.version}`;
-			const desc = document.createElement("div");
-			desc.className = "pack-option-desc";
-			desc.textContent = pack.description;
-			main.appendChild(title);
-			main.appendChild(desc);
-
-			const actions = document.createElement("div");
-			actions.className = "pack-option-actions";
-			const useBtn = document.createElement("button");
-			useBtn.className = pack.mounted ? "secondary-btn small" : "primary-btn small";
-			useBtn.textContent = pack.mounted ? "以此助手开新对话" : "启用并开新对话";
-			useBtn.title = "挂载该助手并新建一个会话（历史对话保留在左侧）";
-			useBtn.addEventListener("click", async () => {
-				await useAssistantInNewSession(pack);
-			});
-			actions.appendChild(useBtn);
-			const detailBtn = document.createElement("button");
-			detailBtn.className = "secondary-btn small";
-			detailBtn.textContent = "能力详情";
-			detailBtn.addEventListener("click", () => {
-				closeAssistantsModal();
-				openDrawer(pack.name);
-			});
-			actions.appendChild(detailBtn);
-
-			item.appendChild(main);
-			item.appendChild(actions);
-			assistantsModalListEl.appendChild(item);
-		}
-	}
-	assistantsModalEl.hidden = false;
+function setCatalogMode(mode) {
+	catalogMode = mode;
+	catalogFilter = "全部";
+	catalogSearchInputEl.value = "";
+	toolsNavBtnEl.classList.toggle("active", mode === "tools");
+	skillsNavBtnEl.classList.toggle("active", mode === "skills");
+	closeDrawer();
+	renderCatalog();
 }
 
-/** "添加助手" = 挂载助手并新建一个会话，在新会话里与助手沟通 */
-async function useAssistantInNewSession(pack) {
-	try {
-		if (!pack.mounted) {
-			await api(`/api/packs/${pack.name}/mount`, { method: "POST", body: "{}" });
-			pack.mounted = true;
-		}
-		const result = await api("/api/sessions", {
-			method: "POST",
-			body: JSON.stringify({ assistants: [pack.name] }),
+function renderCatalogFilters(filters) {
+	catalogFiltersEl.innerHTML = "";
+	for (const value of filters) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = `catalog-filter${catalogFilter === value ? " active" : ""}`;
+		button.textContent = value;
+		button.addEventListener("click", () => {
+			catalogFilter = value;
+			renderCatalog();
 		});
-		sessionId = result.sessionId;
-		localStorage.setItem(SESSION_KEY, sessionId);
-		clearMessages();
-		lastSeq = -1;
-		await ensureSession();
-		connectSSE();
-		closeAssistantsModal();
-		showInfo(`已用「${pack.displayName}」开启新对话`);
-		await Promise.all([loadSessions(), loadAssistants(), loadContextPanel()]);
-	} catch (error) {
-		showError(`开启新对话失败：${error.message}`);
+		catalogFiltersEl.appendChild(button);
 	}
 }
 
-function closeAssistantsModal() {
-	assistantsModalEl.hidden = true;
+function catalogMatches(item, query) {
+	if (!query) return true;
+	return [item.displayName, item.internalName, item.description, ...(item.formats || [])]
+		.join(" ")
+		.toLocaleLowerCase("zh-CN")
+		.includes(query);
 }
 
-/** 右侧抽屉：某个助手的能力详情（工具列表 + 停用），不点开不显示 */
-function openDrawer(packName) {
-	const pack = packsCache.find((p) => p.name === packName);
-	if (!pack) return;
-	drawerPackName = packName;
-	drawerTitleEl.textContent = pack.displayName;
-	drawerContentEl.innerHTML = "";
+function createCatalogIcon(kind, icon) {
+	const wrap = document.createElement("div");
+	wrap.className = `catalog-card-icon ${String(kind || "").toLocaleLowerCase("en-US")}`;
+	if (icon) {
+		const image = document.createElement("img");
+		image.src = icon;
+		image.alt = "";
+		wrap.appendChild(image);
+	} else {
+		wrap.textContent = kind === "PowerPoint" ? "P" : kind === "Excel" ? "X" : "W";
+	}
+	return wrap;
+}
 
+function createCard(item, options) {
+	const card = document.createElement("article");
+	card.className = "catalog-card";
+	card.appendChild(createCatalogIcon(options.kind, options.icon));
+	const main = document.createElement("div");
+	main.className = "catalog-card-main";
+	const titleRow = document.createElement("div");
+	titleRow.className = "catalog-card-title-row";
+	const title = document.createElement("span");
+	title.className = "catalog-card-title";
+	title.textContent = item.displayName;
+	const code = document.createElement("span");
+	code.className = "catalog-card-code";
+	code.textContent = `（${item.internalName}）`;
+	titleRow.append(title, code);
+	const desc = document.createElement("div");
+	desc.className = "catalog-card-desc";
+	desc.textContent = item.description;
+	main.append(titleRow, desc);
+	const actions = document.createElement("div");
+	actions.className = "catalog-card-actions";
+	const status = document.createElement("span");
+	status.className = `catalog-status${item.installed ? " installed" : ""}`;
+	status.textContent = item.installed ? "已安装" : "未安装";
+	actions.appendChild(status);
+	if (!item.installed) {
+		const install = document.createElement("button");
+		install.type = "button";
+		install.className = "primary-btn small";
+		install.textContent = "安装";
+		install.disabled = options.installDisabled === true;
+		if (options.installDisabled) install.title = "请先安装所属工具";
+		install.addEventListener("click", async (event) => {
+			event.stopPropagation();
+			await options.onInstall(install);
+		});
+		actions.appendChild(install);
+	}
+	card.append(main, actions);
+	card.addEventListener("click", options.onOpen);
+	return card;
+}
+
+function renderTools(query) {
+	const tools = (catalogCache?.tools || []).filter((tool) => {
+		if (catalogFilter === "已安装" && !tool.installed) return false;
+		if (catalogFilter === "文档办公" && tool.category !== "文档办公") return false;
+		return catalogMatches(tool, query);
+	});
+	const grid = document.createElement("div");
+	grid.className = "catalog-grid";
+	for (const tool of tools) {
+		grid.appendChild(
+			createCard(tool, {
+				kind: "tool",
+				icon: tool.icon,
+				onOpen: () => openToolDetail(tool),
+				onInstall: installOfficeCli,
+			}),
+		);
+	}
+	if (tools.length === 0) grid.innerHTML = '<div class="catalog-empty">没有符合条件的工具</div>';
+	catalogContentEl.appendChild(grid);
+}
+
+function renderSkills(query) {
+	for (const group of catalogCache?.skillGroups || []) {
+		const skills = group.skills.filter((skill) => {
+			if (catalogFilter === "已安装" && !skill.installed) return false;
+			if (["Word", "PowerPoint", "Excel"].includes(catalogFilter) && skill.category !== catalogFilter) return false;
+			return catalogMatches(skill, query);
+		});
+		if (skills.length === 0) continue;
+		const section = document.createElement("section");
+		section.className = "catalog-group";
+		const header = document.createElement("div");
+		header.className = "catalog-group-header";
+		const image = document.createElement("img");
+		image.src = group.icon;
+		image.alt = "";
+		const heading = document.createElement("div");
+		const installedCount = group.skills.filter((skill) => skill.installed).length;
+		heading.innerHTML = `<div class="catalog-group-title">${group.toolDisplayName}（${group.toolInternalName}）</div><div class="catalog-group-meta">${installedCount}/${group.skills.length} 个技能已安装</div>`;
+		const spacer = document.createElement("div");
+		spacer.className = "catalog-group-spacer";
+		header.append(image, heading, spacer);
+		if (group.toolInstalled && installedCount < group.skills.length) {
+			const allButton = document.createElement("button");
+			allButton.type = "button";
+			allButton.className = "secondary-btn small";
+			allButton.textContent = "安装全部官方技能";
+			allButton.addEventListener("click", () => installAllOfficeCliSkills(allButton));
+			header.appendChild(allButton);
+		}
+		const grid = document.createElement("div");
+		grid.className = "catalog-grid";
+		for (const skill of skills) {
+			grid.appendChild(
+				createCard(skill, {
+					kind: skill.category,
+					installDisabled: !group.toolInstalled,
+					onOpen: () => openSkillDetail(skill, group),
+					onInstall: (button) => installOfficeCliSkill(skill, button),
+				}),
+			);
+		}
+		section.append(header, grid);
+		catalogContentEl.appendChild(section);
+	}
+	if (!catalogContentEl.children.length) catalogContentEl.innerHTML = '<div class="catalog-empty">没有符合条件的技能</div>';
+}
+
+function renderCatalog() {
+	if (!catalogCache) return;
+	const toolsMode = catalogMode === "tools";
+	catalogTitleEl.textContent = toolsMode ? "工具" : "技能";
+	catalogSubtitleEl.textContent = toolsMode
+		? "按需安装本地能力，未命中任务时不会把工具定义放入模型上下文。"
+		: "技能是写好的专业工作方法，按所属工具分类；完整说明只在任务匹配时读取。";
+	catalogSearchInputEl.placeholder = toolsMode ? "搜索工具" : "搜索技能";
+	catalogToolsTabEl.classList.toggle("active", toolsMode);
+	catalogSkillsTabEl.classList.toggle("active", !toolsMode);
+	renderCatalogFilters(toolsMode ? ["全部", "已安装", "文档办公"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"]);
+	catalogContentEl.innerHTML = "";
+	const query = catalogSearchInputEl.value.trim().toLocaleLowerCase("zh-CN");
+	if (toolsMode) renderTools(query);
+	else renderSkills(query);
+}
+
+async function installOfficeCli(button) {
+	button.disabled = true;
+	button.textContent = "准备安装…";
+	try {
+		await api("/api/tools/officecli/install", { method: "POST", body: "{}" });
+		showInfo("OfficeCLI 正在从官方来源下载并校验");
+		clearInterval(catalogDownloadTimer);
+		catalogDownloadTimer = setInterval(pollOfficeCliInstall, 700);
+		await pollOfficeCliInstall();
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`OfficeCLI 安装失败：${error.message}`);
+	}
+}
+
+async function pollOfficeCliInstall() {
+	const progress = await api("/api/officecli/progress");
+	if (progress.running) return;
+	clearInterval(catalogDownloadTimer);
+	catalogDownloadTimer = null;
+	if (progress.error) {
+		showError(`OfficeCLI 安装失败：${progress.error}`);
+		await refreshCatalog();
+		return;
+	}
+	await refreshCatalog();
+	showInfo(`OfficeCLI 已安装${progress.version ? `，版本 ${progress.version}` : ""}`);
+}
+
+async function installOfficeCliSkill(skill, button) {
+	button.disabled = true;
+	button.textContent = "安装中…";
+	try {
+		const result = await api(`/api/tools/officecli/skills/${skill.id}/install`, { method: "POST", body: "{}" });
+		await refreshCatalog();
+		const count = result.installed?.length || 0;
+		showInfo(count > 1 ? `已安装 ${skill.displayName} 及其 ${count - 1} 个基础技能` : `已安装 ${skill.displayName}`);
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`技能安装失败：${error.message}`);
+	}
+}
+
+async function installAllOfficeCliSkills(button) {
+	button.disabled = true;
+	button.textContent = "安装中…";
+	try {
+		await api("/api/tools/officecli/skills/install-all", { method: "POST", body: "{}" });
+		await refreshCatalog();
+		showInfo("OfficeCLI 的全部官方技能已安装");
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装全部官方技能";
+		showError(`技能安装失败：${error.message}`);
+	}
+}
+
+function appendDrawerDetails(rows) {
+	const list = document.createElement("dl");
+	list.className = "drawer-detail-list";
+	for (const [label, value] of rows) {
+		const term = document.createElement("dt");
+		term.textContent = label;
+		const detail = document.createElement("dd");
+		if (value instanceof Node) detail.appendChild(value);
+		else detail.textContent = value || "—";
+		list.append(term, detail);
+	}
+	drawerContentEl.appendChild(list);
+}
+
+function openToolDetail(tool) {
+	drawerTitleEl.textContent = `${tool.displayName}（${tool.internalName}）`;
+	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
 	meta.className = "drawer-meta";
-	meta.textContent = `v${pack.version} · ${pack.mounted ? "已启用" : "未启用"}${pack.activation ? " · 按本轮加载" : ""}`;
-
+	meta.textContent = `${tool.installed ? "已安装" : "未安装"}${tool.version ? ` · ${tool.version}` : ""} · ${tool.activation}`;
 	const desc = document.createElement("div");
 	desc.className = "drawer-desc";
-	desc.textContent = pack.description;
-
+	desc.textContent = tool.description;
+	drawerContentEl.append(meta, desc);
+	const source = document.createElement("a");
+	source.className = "drawer-link";
+	source.href = tool.sourceUrl;
+	source.target = "_blank";
+	source.rel = "noreferrer";
+	source.textContent = tool.sourceName;
+	appendDrawerDetails([
+		["文件类型", tool.formats.join("、")],
+		["运行环境", tool.platform],
+		["安装位置", tool.installPath],
+		["技能", `${tool.installedSkillCount}/${tool.skillCount} 个已安装`],
+		["来源", source],
+	]);
 	const toolsTitle = document.createElement("div");
 	toolsTitle.className = "drawer-block-title";
-	toolsTitle.textContent = `工具（${pack.tools.length}）`;
+	toolsTitle.textContent = `代码能力（${tool.capabilities.length}）`;
 	const toolsWrap = document.createElement("div");
 	toolsWrap.className = "context-tools";
-	for (const tool of pack.tools) {
+	for (const capability of tool.capabilities) {
 		const chip = document.createElement("span");
 		chip.className = "tool-chip";
-		chip.textContent =
-			typeof tool === "string" ? tool : `${tool.displayName || tool.name}${tool.displayName === tool.name ? "" : `（${tool.name}）`}`;
+		chip.textContent = `${capability.displayName}（${capability.name}）`;
 		toolsWrap.appendChild(chip);
 	}
+	drawerContentEl.append(toolsTitle, toolsWrap);
+	if (!tool.installed) {
+		const actions = document.createElement("div");
+		actions.className = "drawer-actions";
+		const install = document.createElement("button");
+		install.className = "primary-btn";
+		install.textContent = "安装 OfficeCLI";
+		install.addEventListener("click", () => installOfficeCli(install));
+		actions.appendChild(install);
+		drawerContentEl.appendChild(actions);
+	}
+	drawerEl.hidden = false;
+}
 
-	const actions = document.createElement("div");
-	actions.className = "drawer-actions";
-	const useBtn = document.createElement("button");
-	useBtn.className = pack.mounted ? "secondary-btn" : "primary-btn";
-	useBtn.textContent = pack.mounted ? "停用助手" : "启用助手";
-	useBtn.addEventListener("click", () => togglePack(pack));
-	actions.appendChild(useBtn);
-
-	drawerContentEl.appendChild(meta);
-	drawerContentEl.appendChild(desc);
-	drawerContentEl.appendChild(toolsTitle);
-	drawerContentEl.appendChild(toolsWrap);
-	drawerContentEl.appendChild(actions);
+function openSkillDetail(skill, group) {
+	drawerTitleEl.textContent = `${skill.displayName}（${skill.internalName}）`;
+	drawerContentEl.innerHTML = "";
+	const meta = document.createElement("div");
+	meta.className = "drawer-meta";
+	meta.textContent = `${skill.installed ? "已安装" : "未安装"} · ${skill.category}`;
+	const desc = document.createElement("div");
+	desc.className = "drawer-desc";
+	desc.textContent = skill.description;
+	drawerContentEl.append(meta, desc);
+	const skillNames = new Map(group.skills.map((item) => [item.id, `${item.displayName}（${item.internalName}）`]));
+	appendDrawerDetails([
+		["所属工具", `${group.toolDisplayName}（${group.toolInternalName}）`],
+		["文件类型", skill.formats.join("、")],
+		["基础技能", skill.requires.length ? skill.requires.map((id) => skillNames.get(id) || id).join("、") : "无"],
+		["安装位置", skill.installPath],
+		["来源", "OfficeCLI 二进制内置官方技能"],
+	]);
+	if (!skill.installed) {
+		const actions = document.createElement("div");
+		actions.className = "drawer-actions";
+		const install = document.createElement("button");
+		install.className = "primary-btn";
+		install.textContent = group.toolInstalled ? "安装技能" : "请先安装 OfficeCLI";
+		install.disabled = !group.toolInstalled;
+		install.addEventListener("click", () => installOfficeCliSkill(skill, install));
+		actions.appendChild(install);
+		drawerContentEl.appendChild(actions);
+	}
 	drawerEl.hidden = false;
 }
 
 function closeDrawer() {
-	drawerPackName = null;
 	drawerEl.hidden = true;
 }
 
-assistantAddBtnEl.addEventListener("click", openAssistantsModal);
-assistantsModalCloseEl.addEventListener("click", closeAssistantsModal);
-assistantsModalEl.addEventListener("click", (e) => {
-	if (e.target === assistantsModalEl) closeAssistantsModal();
-});
+toolsNavBtnEl.addEventListener("click", () => openCatalog("tools"));
+skillsNavBtnEl.addEventListener("click", () => openCatalog("skills"));
+catalogCloseBtnEl.addEventListener("click", closeCatalog);
+catalogToolsTabEl.addEventListener("click", () => setCatalogMode("tools"));
+catalogSkillsTabEl.addEventListener("click", () => setCatalogMode("skills"));
+catalogSearchInputEl.addEventListener("input", renderCatalog);
 drawerCloseEl.addEventListener("click", closeDrawer);
 
 // ---------------------------------------------------------------------------
@@ -1628,7 +1808,7 @@ async function loadContextPanel() {
 
 function renderSessionCapabilities(capabilities) {
 	const names = Array.isArray(capabilities) ? capabilities.map((item) => item.displayName) : [];
-	contextInfoEl.textContent = names.length > 0 ? `${names.join("、")} · 按本轮加载` : "原生 Pi";
+	contextInfoEl.textContent = names.length > 0 ? `${names.join("、")} · 按本轮加载` : "原生 Pi 工具";
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,7 +2019,7 @@ async function previewFsFile(row) {
 			previewContentEl.appendChild(pre);
 		} else if (file.mimeType.includes("officedocument") || file.mimeType === "application/pdf") {
 			previewContentEl.innerHTML =
-				'<div class="context-empty">该文件类型暂不支持内联预览。<br>可"添加到对话"后交给 Office 助手处理。</div>';
+				'<div class="context-empty">该文件类型暂不支持内联预览。<br>可“添加到对话”后交给 Office 文件处理工具。</div>';
 		} else {
 			const pre = document.createElement("pre");
 			pre.className = "preview-text";
@@ -2107,7 +2287,7 @@ updateRunBtnEl.addEventListener("click", async () => {
 
 (async function init() {
 	try {
-		await Promise.all([loadModels(), loadAssistants(), loadFsRoots(), loadContextPanel(), loadSessions()]);
+		await Promise.all([refreshCatalog(), loadModels(), loadFsRoots(), loadContextPanel(), loadSessions()]);
 		await ensureSession();
 		connectSSE();
 		inputEl.disabled = false;
