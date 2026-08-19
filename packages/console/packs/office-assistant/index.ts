@@ -40,6 +40,28 @@ export default function definePack(ctx: PackContext) {
 
 	const tools: ToolDefinition[] = [
 		{
+			// 元工具（触发式加载）：挂载后上下文里只有它，模型处理文档任务时调用一次，
+			// 才激活下面 13 个完整工具——日常闲聊不付工具 schema 的 token。
+			name: "office_enable",
+			label: "启用 Office 文档能力",
+			description:
+				"当用户要求创建、查看或编辑 Word/Excel/PowerPoint 文档（docx/xlsx/pptx）时，先调用本工具一次以启用完整 Office 工具组。纯聊天或与文档无关的请求不要调用。",
+			parameters: Type.Object({}),
+			execute: async () => {
+				ctx.activatePack?.("office-assistant");
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								"Office 工具组已启用，本会话现在可用：office_create（新建）、office_view（查看）、office_get/query（读取）、office_add/set/remove/move/swap（编辑）、office_batch（批量）、office_import（CSV 导入）、office_merge（模板合并）、office_help（元素与属性参考）。",
+						},
+					],
+					details: {},
+				};
+			},
+		},
+		{
 			name: "office_create",
 			label: "新建 Office 文档",
 			description:
