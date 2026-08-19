@@ -37,6 +37,11 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" ""
 
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+!define MUI_FINISHPAGE_RUN "$WINDIR\System32\wscript.exe"
+!define MUI_FINISHPAGE_RUN_PARAMETERS '$\"$INSTDIR\launcher.vbs$\"'
+!define MUI_FINISHPAGE_RUN_TEXT "运行 Pi 控制台"
+!define MUI_FINISHPAGE_SHOWREADME ""
+!insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
