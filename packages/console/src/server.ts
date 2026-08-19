@@ -21,6 +21,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { extractFileReferences } from "./artifacts.ts";
 import * as fsExplorer from "./fs.ts";
+import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
 import { installAllOfficeCliSkills, installOfficeCliSkill, listOfficeCliSkills } from "./officecli-skills.ts";
@@ -42,6 +43,7 @@ import {
 import { DATA_DIR } from "./paths.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
+import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
 import * as workspace from "./workspace.ts";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +72,10 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
+
+// Electron/Node fetch does not automatically inherit the Windows WinINET proxy.
+// Configure it before any model catalog, provider, or updater network request.
+configureConsoleNetworking();
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
@@ -233,6 +239,9 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+if (await registerDetectedWhiteRabbitNeo(modelRuntime)) {
+	console.log("本地模型：已连接 WhiteRabbitNeo V3");
+}
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
@@ -1241,7 +1250,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/app/github-token" && req.method === "GET") {
-		sendJson(res, 200, { configured: updates.githubToken() !== null });
+		sendJson(res, 200, updates.githubAuthStatus());
 		return;
 	}
 	if (pathname === "/api/app/github-token" && req.method === "POST") {

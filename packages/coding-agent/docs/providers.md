@@ -8,6 +8,7 @@ Pi supports subscription-based providers via OAuth and API key providers via env
 - [API Keys](#api-keys)
 - [Auth File](#auth-file)
 - [Cloud Providers](#cloud-providers)
+- [WhiteRabbitNeo Local](#whiterabbitneo-local)
 - [llama.cpp](#llamacpp)
 - [Custom Providers](#custom-providers)
 - [Resolution Order](#resolution-order)
@@ -294,6 +295,26 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 ```
 
 Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file.
+
+## WhiteRabbitNeo Local
+
+Pi automatically detects `whiterabbitneo-v3:latest` when it is running through Ollama's OpenAI-compatible endpoint at `http://127.0.0.1:11434/v1`. The model then appears as **WhiteRabbitNeo V3 (Local)** in the model selector without an API key or `models.json` entry.
+
+Start the local model before starting pi:
+
+```bash
+ollama run whiterabbitneo-v3
+```
+
+Use these optional environment variables when the endpoint, model ID, or API key differs:
+
+```bash
+export WHITERABBITNEO_BASE_URL=http://127.0.0.1:1234/v1
+export WHITERABBITNEO_MODEL_ID=whiterabbitneo-v3:latest
+export WHITERABBITNEO_API_KEY=local
+```
+
+Localhost endpoints automatically bypass the configured HTTP proxy.
 
 ## llama.cpp
 

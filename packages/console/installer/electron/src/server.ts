@@ -1,16 +1,17 @@
 /**
- * Pi Web 控制台 — 第 2 步：能力包框架 + Office 助手包 + 前端增强
+ * Pi Web 控制台 — 通用能力包 + 按会话/按本轮工具加载
  *
  * 默认形态仍是纯净原生 Pi（read/bash/edit/write + 官方系统提示词）；
- * 能力包通过 customTools 注册、setActiveToolsByName 挂载/卸载。
+ * 能力包只在内部注册；每轮先读取 pack.json 的通用规则，再用
+ * setActiveToolsByName 只注入真正命中的最小工具组。
  *
  * 全部后端逻辑都在 src/ 下按模块拆分，HTTP 层只用 node:http 原生模块，不引入框架。
  */
 
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -18,20 +19,31 @@ import {
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { extractFileReferences } from "./artifacts.ts";
 import * as fsExplorer from "./fs.ts";
+import { configureConsoleNetworking } from "./network.ts";
+import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
+import { installAllOfficeCliSkills, installOfficeCliSkill, listOfficeCliSkills } from "./officecli-skills.ts";
 import {
 	baseToolNames,
+	type CapabilityMatch,
 	fullPackToolNames,
 	instantiatePackTools,
+	isMountedPack,
 	listPacks,
 	loadPacks,
 	mountedPacks,
 	mountPack,
+	packSummaries,
+	selectCapabilities,
+	toolDisplayName,
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
+import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
+import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
 import * as workspace from "./workspace.ts";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +70,12 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
+/** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
+const OFFICECLI_PACK_NAME = "office-assistant";
+
+// Electron/Node fetch does not automatically inherit the Windows WinINET proxy.
+// Configure it before any model catalog, provider, or updater network request.
+configureConsoleNetworking();
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
@@ -89,21 +107,40 @@ interface ConsoleSession {
 	events: BufferedEvent[];
 	nextSeq: number;
 	sseClients: Set<ServerResponse>;
-	/** 触发式加载：本会话已被元工具激活的 deferred 包 */
-	activatedPacks: Set<string>;
+	/** 这个会话绑定的助手；与全局“已启用”目录分离。 */
+	enabledPacks: Set<string>;
+	/** 本轮临时激活的最小工具组；agent_settled 后清空。 */
+	activePackTools: Map<string, Set<string>>;
+	lastCapabilityTrace: CapabilityTrace | null;
+	lastUsage: unknown;
 }
 
 const sessions = new Map<string, ConsoleSession>();
 
-/** 会话当前应生效的工具名单 = 基础名单（含元工具） + 已激活 deferred 包的完整工具 */
-function effectiveToolNames(activatedPacks: Set<string>): string[] {
-	const names = baseToolNames();
-	for (const packName of activatedPacks) {
-		for (const toolName of fullPackToolNames(packName)) {
+/** 会话当前应生效的工具名单 = 原生/兼容工具 + 本轮命中的最小工具组。 */
+function effectiveToolNames(enabledPacks: Set<string>, activePackTools: Map<string, Set<string>>): string[] {
+	const names = baseToolNames(enabledPacks);
+	for (const toolNames of activePackTools.values()) {
+		for (const toolName of toolNames) {
 			if (!names.includes(toolName)) names.push(toolName);
 		}
 	}
 	return names;
+}
+
+interface ToolSnapshot {
+	tools: Array<{ name: string; displayName: string }>;
+	toolCount: number;
+	schemaBytes: number;
+	schemaFingerprint: string;
+}
+
+interface CapabilityTrace extends ToolSnapshot {
+	stepId: string;
+	stepName: "capability_search";
+	stepDisplayName: string;
+	enabledCapabilities: Array<{ name: string; displayName: string }>;
+	selectedCapabilities: CapabilityMatch[];
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +151,8 @@ interface SessionIndexEntry {
 	cwd: string;
 	/** Pi 会话文件路径（恢复消息用） */
 	sessionFile?: string;
+	/** 会话绑定的助手。旧索引没有该字段时，在恢复时迁移一次。 */
+	enabledPacks?: string[];
 	title: string;
 	createdAt: number;
 	updatedAt: number;
@@ -134,17 +173,55 @@ function writeSessionIndex(index: Record<string, SessionIndexEntry>): void {
 	writeFileSync(SESSION_INDEX_FILE, `${JSON.stringify(index, null, "\t")}\n`, "utf8");
 }
 
-function touchSessionIndex(sessionId: string, cwd: string, sessionFile?: string): void {
+function touchSessionIndex(
+	sessionId: string,
+	cwd: string,
+	sessionFile: string | undefined,
+	enabledPacks: Iterable<string>,
+): void {
 	const index = readSessionIndex();
 	const existing = index[sessionId];
 	index[sessionId] = {
 		cwd,
 		sessionFile: sessionFile ?? existing?.sessionFile,
+		enabledPacks: [...enabledPacks],
 		title: existing?.title ?? "",
 		createdAt: existing?.createdAt ?? Date.now(),
 		updatedAt: Date.now(),
 	};
 	writeSessionIndex(index);
+}
+
+/**
+ * “安装工具”替代旧的“给某个会话添加助手”：OfficeCLI 一旦可用，就绑定到全部会话；
+ * 每轮仍由本地能力路由只注入命中的最小工具组。
+ */
+function activateOfficeCliForAllSessions(): void {
+	mountPack(OFFICECLI_PACK_NAME);
+	for (const cs of sessions.values()) {
+		cs.enabledPacks.add(OFFICECLI_PACK_NAME);
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	}
+	const enabled = mountedPacks();
+	const index = readSessionIndex();
+	for (const entry of Object.values(index)) {
+		entry.enabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...enabled])];
+	}
+	writeSessionIndex(index);
+}
+
+async function reloadInstalledSkillsInSessions(): Promise<number> {
+	let reloaded = 0;
+	for (const cs of sessions.values()) {
+		if (cs.session.isStreaming) continue;
+		try {
+			await cs.session.reload();
+			reloaded += 1;
+		} catch (error) {
+			console.warn(`会话 ${cs.sessionId} 刷新技能失败：${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	return reloaded;
 }
 
 /** 首条 user 消息作为会话标题 */
@@ -162,6 +239,9 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+if (await registerDetectedWhiteRabbitNeo(modelRuntime)) {
+	console.log("本地模型：已连接 WhiteRabbitNeo V3");
+}
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
@@ -170,6 +250,8 @@ await loadPacks();
 if (officecli.seedBundledBinary()) {
 	console.log("已把预置的 OfficeCLI 复制到数据目录");
 }
+officecli.ensureBinaryOnProcessPath();
+if (await officecli.isBinaryReady()) activateOfficeCliForAllSessions();
 
 // 预热：扩展注册的自定义 provider 只有在某个会话加载扩展之后才会出现在
 // ModelRuntime 里。启动时先加载一次全局扩展，PI_CONSOLE_MODEL 才能引用它们。
@@ -204,6 +286,7 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				type: "tool_execution_start",
 				toolCallId: ev.toolCallId,
 				toolName: ev.toolName,
+				toolDisplayName: toolDisplayName(ev.toolName),
 				args: ev.args,
 			};
 		case "tool_execution_end":
@@ -211,6 +294,7 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				type: "tool_execution_end",
 				toolCallId: ev.toolCallId,
 				toolName: ev.toolName,
+				toolDisplayName: toolDisplayName(ev.toolName),
 				isError: ev.isError,
 				result: summarizeToolResult(ev.result),
 			};
@@ -270,6 +354,53 @@ function summarizeToolResult(result: unknown): string {
 	return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
+/** 记录真正送入当前模型调用的工具定义，便于在客户端核对 token 优化是否生效。 */
+function activeToolSnapshot(session: AgentSession): ToolSnapshot {
+	const names = session.getActiveToolNames();
+	const schemas = names.map((name) => {
+		const definition = session.getToolDefinition(name);
+		return {
+			name,
+			description: definition?.description ?? "",
+			parameters: definition?.parameters ?? null,
+			promptSnippet: definition?.promptSnippet ?? null,
+			promptGuidelines: definition?.promptGuidelines ?? [],
+		};
+	});
+	const serialized = JSON.stringify(schemas);
+	return {
+		tools: names.map((name) => ({ name, displayName: toolDisplayName(name) })),
+		toolCount: names.length,
+		schemaBytes: Buffer.byteLength(serialized, "utf8"),
+		schemaFingerprint: createHash("sha256").update(serialized).digest("hex").slice(0, 12),
+	};
+}
+
+function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTrace {
+	cs.activePackTools.clear();
+	const selectedCapabilities = selectCapabilities(text, cs.enabledPacks);
+	for (const match of selectedCapabilities) {
+		cs.activePackTools.set(match.packName, new Set(match.toolNames));
+	}
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	const trace: CapabilityTrace = {
+		stepId: `capability-${randomUUID()}`,
+		stepName: "capability_search",
+		stepDisplayName: "查找可用能力（capability_search）",
+		enabledCapabilities: packSummaries(cs.enabledPacks),
+		selectedCapabilities,
+		...activeToolSnapshot(cs.session),
+	};
+	cs.lastCapabilityTrace = trace;
+	return trace;
+}
+
+function releaseTurnCapabilities(cs: ConsoleSession): void {
+	if (cs.activePackTools.size === 0) return;
+	cs.activePackTools.clear();
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+}
+
 function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [key: string]: unknown }): void {
 	const event: BufferedEvent = { seq: cs.nextSeq++, ...clientEvent };
 	cs.events.push(event);
@@ -289,13 +420,15 @@ function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [ke
  */
 async function buildSession(
 	cwd: string,
+	enabledPackNames: Iterable<string>,
 	modelOverride?: SessionModel,
 	sessionFile?: string,
 ): Promise<{
 	session: AgentSession;
 	sessionFile: string | undefined;
 	modelFallbackMessage?: string;
-	activatedPacks: Set<string>;
+	enabledPacks: Set<string>;
+	activePackTools: Map<string, Set<string>>;
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -303,8 +436,9 @@ async function buildSession(
 	const sessionManager = sessionFile
 		? SessionManager.open(sessionFile, SESSION_DIR, cwd)
 		: SessionManager.create(cwd, SESSION_DIR);
-	const activatedPacks = new Set<string>();
-	// 元工具（office_enable 等）触发时回调：为本会话激活对应包的完整工具组
+	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
+	const activePackTools = new Map<string, Set<string>>();
+	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
 		cwd: string;
@@ -322,8 +456,9 @@ async function buildSession(
 		customTools: instantiatePackTools({
 			getWorkspaceRoot: () => cwd,
 			activatePack: (packName) => {
-				activatedPacks.add(packName);
-				sessionRef?.setActiveToolsByName(effectiveToolNames(activatedPacks));
+				if (!enabledPacks.has(packName)) return;
+				activePackTools.set(packName, new Set(fullPackToolNames(packName)));
+				sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
 			},
 		}),
 		model: modelOverride,
@@ -349,17 +484,31 @@ async function buildSession(
 	const { session, modelFallbackMessage } = await createAgentSession(options);
 	sessionRef = session;
 
-	// 挂载语义：内置 4 个工具 + 已挂载包（deferred 包只放元工具，触发后才激活完整工具组）
-	session.setActiveToolsByName(effectiveToolNames(activatedPacks));
-	return { session, sessionFile: session.sessionFile, modelFallbackMessage, activatedPacks };
+	// 新会话只带原生工具；声明了通用激活规则的能力包等到本轮确实命中才注入。
+	session.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
+	return { session, sessionFile: session.sessionFile, modelFallbackMessage, enabledPacks, activePackTools };
 }
 
-async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
+function subscribeConsoleSession(cs: ConsoleSession): void {
+	cs.session.subscribe((ev) => {
+		if (ev.type === "turn_end") cs.lastUsage = (ev.message as { usage?: unknown }).usage ?? null;
+		if (ev.type === "agent_settled") releaseTurnCapabilities(cs);
+		const clientEvent = toClientEvent(ev);
+		if (clientEvent) bufferAndBroadcast(cs, clientEvent);
+	});
+}
+
+async function createConsoleSession(
+	enabledPackNames: string[] = mountedPacks(),
+): Promise<{ sessionId: string; warning?: string }> {
 	const sessionId = randomUUID();
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const { session, sessionFile, modelFallbackMessage, activatedPacks } = await buildSession(cwd);
+	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
+		cwd,
+		enabledPackNames,
+	);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -367,15 +516,14 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 		events: [],
 		nextSeq: 0,
 		sseClients: new Set(),
-		activatedPacks,
+		enabledPacks,
+		activePackTools,
+		lastCapabilityTrace: null,
+		lastUsage: null,
 	};
 	sessions.set(sessionId, cs);
-	touchSessionIndex(sessionId, cwd, sessionFile);
-
-	session.subscribe((ev) => {
-		const clientEvent = toClientEvent(ev);
-		if (clientEvent) bufferAndBroadcast(cs, clientEvent);
-	});
+	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
+	subscribeConsoleSession(cs);
 
 	// 默认模型解析失败时（如未配置任何 Key），通过 SSE 告知前端
 	if (modelFallbackMessage) {
@@ -391,8 +539,11 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	const entry = index[sessionId];
 	if (!entry) return null;
 	try {
-		const { session, modelFallbackMessage, activatedPacks } = await buildSession(
+		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
+		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
+		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
 			entry.cwd,
+			restoredEnabledPacks,
 			undefined,
 			entry.sessionFile,
 		);
@@ -402,13 +553,14 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			events: [],
 			nextSeq: 0,
 			sseClients: new Set(),
-			activatedPacks,
+			enabledPacks,
+			activePackTools,
+			lastCapabilityTrace: null,
+			lastUsage: null,
 		};
 		sessions.set(sessionId, cs);
-		session.subscribe((ev) => {
-			const clientEvent = toClientEvent(ev);
-			if (clientEvent) bufferAndBroadcast(cs, clientEvent);
-		});
+		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
+		subscribeConsoleSession(cs);
 		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
 		return cs;
 	} catch (error) {
@@ -460,7 +612,9 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 			const toolCalls = message.content
 				.filter((block) => block.type === "toolCall")
 				.map((block) =>
-					block.type === "toolCall" ? { id: block.id, name: block.name, args: block.arguments } : undefined,
+					block.type === "toolCall"
+						? { id: block.id, name: block.name, displayName: toolDisplayName(block.name), args: block.arguments }
+						: undefined,
 				)
 				.filter((call) => call !== undefined);
 			const item: HistoryItem = { role: "assistant", text };
@@ -476,12 +630,54 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 				role: "toolResult",
 				toolCallId: message.toolCallId,
 				toolName: message.toolName,
+				toolDisplayName: toolDisplayName(message.toolName),
 				isError: message.isError,
 				text: text.trim(),
 			});
 		}
 	}
 	return items;
+}
+
+/** 工具/技能目录：当前只发布经过验证的 OfficeCLI，后续工具沿用同一结构追加。 */
+async function buildCapabilityCatalog() {
+	const status = await officecli.getLocalStatus();
+	const pack = listPacks().find((item) => item.name === OFFICECLI_PACK_NAME);
+	const skills = listOfficeCliSkills(CONSOLE_AGENT_DIR);
+	return {
+		tools: [
+			{
+				id: "officecli",
+				internalName: "officecli",
+				displayName: "Office 文件处理",
+				description: "在本地创建、读取、编辑、检查和预览 Word、Excel、PowerPoint 文件。",
+				category: "文档办公",
+				formats: [".docx", ".xlsx", ".pptx", ".csv", ".tsv"],
+				installed: status.installed,
+				version: status.version,
+				installPath: status.path,
+				platform: `${process.platform}-${process.arch}`,
+				icon: "/officecli.svg",
+				sourceName: "OfficeCLI 官方项目",
+				sourceUrl: "https://github.com/iOfficeAI/OfficeCLI",
+				activation: "按本轮需求加载",
+				capabilities: pack?.tools ?? [],
+				skillCount: skills.length,
+				installedSkillCount: skills.filter((skill) => skill.installed).length,
+			},
+		],
+		skillGroups: [
+			{
+				toolId: "officecli",
+				toolInternalName: "officecli",
+				toolDisplayName: "Office 文件处理",
+				toolInstalled: status.installed,
+				icon: "/officecli.svg",
+				skills,
+			},
+		],
+		download: officecli.getDownloadProgress(),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +800,28 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
+async function resolveRequestFile(path: string, sessionId?: string): Promise<fsExplorer.AllowedFileInfo> {
+	let cwd = workspace.getWorkspacePath() ?? DATA_DIR;
+	if (sessionId) {
+		const cs = await getOrRestoreSession(sessionId);
+		if (cs) cwd = cs.session.sessionManager.getCwd();
+	}
+	return fsExplorer.getAllowedFileInfo(resolve(cwd, path));
+}
+
+function sendFileDownload(res: ServerResponse, file: fsExplorer.AllowedFileInfo): void {
+	res.writeHead(200, {
+		"Content-Type": file.mimeType,
+		"Content-Length": file.size,
+		"Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+		"Cache-Control": "no-store",
+		"X-File-Name": encodeURIComponent(file.name),
+	});
+	const stream = createReadStream(file.path);
+	stream.on("error", () => res.destroy());
+	stream.pipe(res);
+}
+
 function readBodyJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
@@ -644,6 +862,7 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/index.html": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
+	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
 };
 
 function serveStatic(pathname: string, res: ServerResponse): boolean {
@@ -738,6 +957,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				createdAt: entry.createdAt,
 				updatedAt: entry.updatedAt,
 				cwd: entry.cwd,
+				assistants: packSummaries(entry.enabledPacks ?? []),
 				active: sessions.has(id),
 			}))
 			.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -747,8 +967,46 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 	// POST /api/sessions — 创建会话
 	if (req.method === "POST" && pathname === "/api/sessions") {
-		const result = await createConsoleSession();
+		const body = (await readBodyJson(req)) as { assistants?: unknown };
+		if (body?.assistants !== undefined && !Array.isArray(body.assistants)) {
+			sendJson(res, 400, { error: 'assistants 需为能力包代码名数组，例如 ["office-assistant"]' });
+			return;
+		}
+		const assistantNames = Array.isArray(body?.assistants)
+			? body.assistants.filter((name): name is string => typeof name === "string")
+			: [];
+		if (Array.isArray(body?.assistants) && assistantNames.length !== body.assistants.length) {
+			sendJson(res, 400, { error: "assistants 只能包含字符串" });
+			return;
+		}
+		const unavailable = assistantNames.filter((name) => !isMountedPack(name));
+		if (unavailable.length > 0) {
+			sendJson(res, 400, { error: `助手未启用或不存在：${unavailable.join("、")}` });
+			return;
+		}
+		const result = await createConsoleSession([...new Set([...mountedPacks(), ...assistantNames])]);
 		sendJson(res, 200, result);
+		return;
+	}
+
+	// 工具与技能目录（当前仅 OfficeCLI）
+	if (pathname === "/api/catalog" && req.method === "GET") {
+		sendJson(res, 200, await buildCapabilityCatalog());
+		return;
+	}
+	const officeSkillInstallMatch = pathname.match(/^\/api\/tools\/officecli\/skills\/([a-z0-9-]+)\/install$/);
+	if (officeSkillInstallMatch && req.method === "POST") {
+		const installed = await installOfficeCliSkill(CONSOLE_AGENT_DIR, officeSkillInstallMatch[1]);
+		activateOfficeCliForAllSessions();
+		const reloadedSessions = installed.length > 0 ? await reloadInstalledSkillsInSessions() : 0;
+		sendJson(res, 200, { ok: true, installed, reloadedSessions });
+		return;
+	}
+	if (pathname === "/api/tools/officecli/skills/install-all" && req.method === "POST") {
+		const installed = await installAllOfficeCliSkills(CONSOLE_AGENT_DIR);
+		activateOfficeCliForAllSessions();
+		const reloadedSessions = installed.length > 0 ? await reloadInstalledSkillsInSessions() : 0;
+		sendJson(res, 200, { ok: true, installed, reloadedSessions });
 		return;
 	}
 
@@ -765,9 +1023,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
 			return;
 		}
-		// 对全部存活会话立即生效（下一轮起用，不丢历史；已激活的 deferred 包保持完整工具组）
-		for (const cs of sessions.values()) {
-			cs.session.setActiveToolsByName(effectiveToolNames(cs.activatedPacks));
+		// 全局启用只改变助手目录；停用时从已绑定会话移除，避免继续暴露其工具。
+		if (action === "unmount") {
+			for (const cs of sessions.values()) {
+				cs.enabledPacks.delete(packName);
+				cs.activePackTools.delete(packName);
+				cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+			}
+			const index = readSessionIndex();
+			for (const entry of Object.values(index)) {
+				entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
+			}
+			writeSessionIndex(index);
 		}
 		sendJson(res, 200, { ok: true, mounted: action === "mount" });
 		return;
@@ -778,19 +1045,48 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, await officecli.getStatus());
 		return;
 	}
-	if (pathname === "/api/officecli/download" && req.method === "POST") {
+	if (
+		(pathname === "/api/officecli/download" || pathname === "/api/tools/officecli/install") &&
+		req.method === "POST"
+	) {
 		const progress = officecli.getDownloadProgress();
 		if (progress.running) {
 			sendJson(res, 409, { error: "下载已在进行中" });
 			return;
 		}
 		// 异步下载，进度通过轮询 /api/officecli/progress 获取
-		void officecli.downloadLatest();
+		void officecli.downloadLatest().then(async () => {
+			if (await officecli.isBinaryReady()) {
+				officecli.ensureBinaryOnProcessPath();
+				activateOfficeCliForAllSessions();
+			}
+		});
 		sendJson(res, 202, { ok: true });
 		return;
 	}
 	if (pathname === "/api/officecli/progress" && req.method === "GET") {
 		sendJson(res, 200, officecli.getDownloadProgress());
+		return;
+	}
+	if (pathname === "/api/office-preview/start" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { path?: unknown; sessionId?: unknown };
+		if (typeof body?.path !== "string" || !body.path.trim()) {
+			sendJson(res, 400, { error: '请求体需为 {"path": "文档路径"}' });
+			return;
+		}
+		try {
+			const cs = typeof body.sessionId === "string" ? sessions.get(body.sessionId) : undefined;
+			const cwd = cs?.session.sessionManager.getCwd() ?? workspace.getWorkspacePath() ?? DATA_DIR;
+			const filePath = fsExplorer.resolveAllowedFilePath(resolve(cwd, body.path.trim()));
+			sendJson(res, 200, await officePreview.startOfficePreview(filePath));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	const officePreviewStopMatch = pathname.match(/^\/api\/office-preview\/([a-f0-9-]+)\/stop$/);
+	if (officePreviewStopMatch && req.method === "POST") {
+		sendJson(res, 200, { ok: await officePreview.stopOfficePreview(officePreviewStopMatch[1]) });
 		return;
 	}
 
@@ -853,7 +1149,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
-	// 本地资源管理器（受限浏览）
+	// Agent 数据目录：迁移完成后由桌面壳重启，下一次启动从新目录加载全部数据。
+	if (pathname === "/api/storage" && req.method === "GET") {
+		sendJson(res, 200, storage.getStorageInfo());
+		return;
+	}
+	if (pathname === "/api/storage/migrate" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { path?: unknown };
+		if (typeof body?.path !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"path": "..."}' });
+			return;
+		}
+		if ([...sessions.values()].some((item) => item.session.isStreaming)) {
+			sendJson(res, 409, { error: "Agent 正在执行任务，请等待本轮完成后再迁移" });
+			return;
+		}
+		try {
+			sendJson(res, 200, storage.migrateDataDirectory(body.path));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+
+	// 本地资源管理器（Windows 安装版可浏览本机磁盘）
 	if (pathname === "/api/fs/roots" && req.method === "GET") {
 		sendJson(res, 200, fsExplorer.listRoots());
 		return;
@@ -861,7 +1180,41 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	if (pathname === "/api/fs/list" && req.method === "GET") {
 		const path = url.searchParams.get("path") ?? "";
 		try {
-			sendJson(res, 200, { entries: fsExplorer.listDir(path) });
+			sendJson(res, 200, { ...fsExplorer.getDirectoryInfo(path), entries: fsExplorer.listDir(path) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/copy" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { source?: unknown; destination?: unknown };
+		if (typeof body?.source !== "string" || typeof body?.destination !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"source": "...", "destination": "..."}' });
+			return;
+		}
+		try {
+			sendJson(res, 200, fsExplorer.copyFileIntoDirectory(body.source, body.destination));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/import" && req.method === "POST") {
+		const body = (await readBodyJson(req, MAX_TOTAL_FILE_BYTES * 2)) as {
+			name?: unknown;
+			dataBase64?: unknown;
+			destination?: unknown;
+		};
+		if (
+			typeof body?.name !== "string" ||
+			typeof body?.dataBase64 !== "string" ||
+			typeof body?.destination !== "string"
+		) {
+			sendJson(res, 400, { error: "请求体需含 name、dataBase64 与 destination" });
+			return;
+		}
+		try {
+			sendJson(res, 200, fsExplorer.importFileIntoDirectory(body.name, body.dataBase64, body.destination));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -876,6 +1229,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		return;
 	}
+	if (pathname === "/api/fs/download" && req.method === "GET") {
+		const path = url.searchParams.get("path") ?? "";
+		const sessionId = url.searchParams.get("sessionId") ?? undefined;
+		if (!path) {
+			sendJson(res, 400, { error: "缺少文件路径" });
+			return;
+		}
+		try {
+			sendFileDownload(res, await resolveRequestFile(path, sessionId));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
 
 	// 应用版本与自更新
 	if (pathname === "/api/app/version" && req.method === "GET") {
@@ -883,7 +1250,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/app/github-token" && req.method === "GET") {
-		sendJson(res, 200, { configured: updates.githubToken() !== null });
+		sendJson(res, 200, updates.githubAuthStatus());
 		return;
 	}
 	if (pathname === "/api/app/github-token" && req.method === "POST") {
@@ -957,10 +1324,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
 				return;
 			}
+			const capabilityTrace = prepareTurnCapabilities(cs, text);
+			if (cs.enabledPacks.size > 0) {
+				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
+			}
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
 			updateSessionTitle(cs.sessionId, text);
 			cs.session.prompt(text, { images }).catch((error) => {
+				releaseTurnCapabilities(cs);
 				bufferAndBroadcast(cs, {
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
@@ -969,10 +1341,36 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 
+		// POST /api/sessions/:id/artifacts — 解析回复中的真实本地文件，供前端展示下载卡片
+		case "POST artifacts": {
+			const body = (await readBodyJson(req)) as { text?: unknown; paths?: unknown };
+			const text = typeof body?.text === "string" ? body.text : "";
+			const explicitPaths = Array.isArray(body?.paths)
+				? body.paths.filter((path): path is string => typeof path === "string").slice(0, 32)
+				: [];
+			const candidates = [...extractFileReferences(text), ...explicitPaths];
+			const files: Array<fsExplorer.AllowedFileInfo & { officePreview: boolean }> = [];
+			const seen = new Set<string>();
+			for (const candidate of candidates) {
+				try {
+					const info = fsExplorer.getAllowedFileInfo(resolve(cs.session.sessionManager.getCwd(), candidate));
+					const key = process.platform === "win32" ? info.path.toLocaleLowerCase("en-US") : info.path;
+					if (seen.has(key)) continue;
+					seen.add(key);
+					files.push({ ...info, officePreview: officePreview.isOfficePreviewPath(info.path) });
+				} catch {
+					// 模型回复可能含示例路径或网页域名，只展示当前确实存在且允许访问的文件。
+				}
+			}
+			sendJson(res, 200, { files });
+			return;
+		}
+
 		// GET /api/sessions/:id/context — 上下文使用统计（本地估算，零 token 消耗）
 		case "GET context": {
 			const usage = cs.session.getContextUsage?.();
 			const model = cs.session.model;
+			const compaction = cs.session.settingsManager.getCompactionSettings();
 			// 缓存统计：汇总消息 usage 的 cacheRead/cacheWrite（无法统计时为 null）
 			let cacheRead = null;
 			let cacheWrite = null;
@@ -1002,8 +1400,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					: null,
 				messageCount: cs.session.messages.length,
 				thinkingLevel: cs.session.thinkingLevel,
+				compaction,
 				cacheRead,
 				cacheWrite,
+				enabledCapabilities: packSummaries(cs.enabledPacks),
+				activeTools: activeToolSnapshot(cs.session),
+				lastCapabilityTrace: cs.lastCapabilityTrace,
+				lastUsage: cs.lastUsage,
 			});
 			return;
 		}
@@ -1093,8 +1496,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				type: "model_changed",
 				provider: body.provider,
 				modelId: body.modelId,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				enabledCapabilities: packSummaries(cs.enabledPacks),
 			});
-			sendJson(res, 200, { ok: true, provider: body.provider, modelId: body.modelId });
+			sendJson(res, 200, {
+				ok: true,
+				provider: body.provider,
+				modelId: body.modelId,
+				thinkingLevel: cs.session.thinkingLevel,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+			});
 			return;
 		}
 
@@ -1119,6 +1530,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				messages: buildHistory(cs.session),
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
+				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				enabledCapabilities: packSummaries(cs.enabledPacks),
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
 			});
@@ -1157,6 +1570,11 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 	}
 	process.exit(1);
 });
+
+server.on("close", () => {
+	void officePreview.stopAllOfficePreviews();
+});
+process.once("exit", officePreview.terminateAllOfficePreviewsNow);
 
 server.listen(PORT, HOST, () => {
 	console.log(`Pi 控制台已启动：http://${HOST}:${PORT}`);
