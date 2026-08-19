@@ -26,6 +26,26 @@ foreach ($Dir in @("src", "web", "packs")) {
     Write-Host "已拷贝 $Dir/"
 }
 
+# 2.5 预置 OfficeCLI（必要工具）：优先开发数据目录，其次当前用户已安装副本。
+# 只复制到安装包自身，不修改系统 PATH；客户端首启再复制到 %APPDATA% 的外置数据目录。
+$BundledBinDir = Join-Path $ElectronDir "data\bin"
+if (Test-Path $BundledBinDir) { Remove-Item $BundledBinDir -Recurse -Force }
+New-Item -ItemType Directory -Force $BundledBinDir | Out-Null
+$OfficeCliCandidates = @(
+    (Join-Path $ConsoleDir "data\bin\officecli.exe"),
+    (Join-Path $env:APPDATA "pi-console\data\bin\officecli.exe")
+)
+$OfficeCliSource = $OfficeCliCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $OfficeCliSource) {
+    throw "未找到 OfficeCLI。请先在开发客户端的工具页安装，再构建 Windows 安装包。"
+}
+Copy-Item -LiteralPath $OfficeCliSource (Join-Path $BundledBinDir "officecli.exe")
+$OfficeCliRecord = Join-Path (Split-Path $OfficeCliSource -Parent) "officecli.json"
+if (Test-Path -LiteralPath $OfficeCliRecord) {
+    Copy-Item -LiteralPath $OfficeCliRecord (Join-Path $BundledBinDir "officecli.json")
+}
+Write-Host "已预置 OfficeCLI：$OfficeCliSource"
+
 # 3. 生产依赖（registry 发布版 SDK；发布版自带 bundle 依赖，但显式声明 typebox 供 packs 引用）
 Push-Location $ElectronDir
 try {

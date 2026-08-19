@@ -22,21 +22,18 @@
 	</header>
 
 	<div class="layout">
-		<!-- 左栏：助手 / 技能 / 文件 -->
+		<!-- 左栏：工具 / 技能 / 对话 / 文件 -->
 		<aside class="sidebar">
-			<section class="side-section">
-				<div class="side-header" data-panel="assistants-panel">助手 <span class="chevron">▾</span></div>
-				<div id="assistants-panel" class="side-body">
-					<div id="assistants-list" class="assistants-list">加载中…</div>
-					<button id="assistant-add-btn" class="add-assistant-btn">＋ 添加助手</button>
-				</div>
-			</section>
-			<section class="side-section">
-				<div class="side-header" data-panel="skills-panel">技能 <span class="chevron">▾</span></div>
-				<div id="skills-panel" class="side-body">
-					<div class="skills-empty">技能将在这里列出，可选用作对话能力（即将支持）。</div>
-				</div>
-			</section>
+			<nav class="sidebar-primary-nav" aria-label="能力目录">
+				<button id="tools-nav-btn" class="catalog-nav-btn" type="button">
+					<span class="catalog-nav-icon">▦</span>
+					<span>工具</span>
+				</button>
+				<button id="skills-nav-btn" class="catalog-nav-btn" type="button">
+					<span class="catalog-nav-icon">◇</span>
+					<span>技能</span>
+				</button>
+			</nav>
 			<section class="side-section">
 				<div class="side-header" data-panel="sessions-panel">对话 <span class="chevron">▾</span></div>
 				<div id="sessions-panel" class="side-body">
@@ -66,6 +63,30 @@
 
 		<!-- 中间：聊天区 -->
 		<main class="content">
+			<section id="catalog-view" class="catalog-view" hidden>
+				<div class="catalog-shell">
+					<div class="catalog-heading-row">
+						<div>
+							<h1 id="catalog-title">工具</h1>
+							<p id="catalog-subtitle">按需安装本地能力，未命中任务时不会把工具定义放入模型上下文。</p>
+						</div>
+						<button id="catalog-close-btn" class="secondary-btn" type="button">返回对话</button>
+					</div>
+					<div class="catalog-toolbar">
+						<div class="catalog-tabs" role="tablist">
+							<button id="catalog-tools-tab" class="catalog-tab active" type="button">工具</button>
+							<button id="catalog-skills-tab" class="catalog-tab" type="button">技能</button>
+						</div>
+						<label class="catalog-search">
+							<span>⌕</span>
+							<input id="catalog-search-input" type="search" placeholder="搜索工具" autocomplete="off">
+						</label>
+					</div>
+					<div id="catalog-filters" class="catalog-filters"></div>
+					<div id="catalog-content" class="catalog-content">加载中…</div>
+				</div>
+			</section>
+
 			<div id="error-bar" class="error-bar" hidden></div>
 
 			<main id="messages" class="messages">
@@ -76,7 +97,7 @@
 				<div id="messages-empty" class="messages-empty">
 					<div class="messages-empty-mark">π</div>
 					<div class="messages-empty-title">有什么需要处理？</div>
-					<div class="messages-empty-hint">直接开始对话，或从左侧选择文件和助手。</div>
+					<div class="messages-empty-hint">直接开始对话，或从左侧选择文件、工具和技能。</div>
 				</div>
 			</main>
 
@@ -123,10 +144,10 @@
 			</footer>
 		</main>
 
-		<!-- 右侧抽屉：助手能力详情（默认隐藏，点击左侧助手才展开） -->
+		<!-- 右侧抽屉：工具或技能详情 -->
 		<aside id="drawer" class="drawer" hidden>
 			<div class="drawer-header">
-				<span id="drawer-title" class="drawer-title">能力详情</span>
+				<span id="drawer-title" class="drawer-title">详情</span>
 				<button id="drawer-close" class="icon-btn" title="关闭">×</button>
 			</div>
 			<div id="drawer-content" class="drawer-content"></div>
@@ -148,18 +169,6 @@
 			<div class="preview-actions">
 				<button id="preview-attach" class="primary-btn">＋ 添加到对话</button>
 			</div>
-		</div>
-	</div>
-
-	<!-- 添加助手弹层 -->
-	<div id="assistants-modal" class="modal" hidden>
-		<div class="modal-body">
-			<div class="modal-header">
-				<span class="modal-title">添加助手</span>
-				<button id="assistants-modal-close" class="icon-btn" title="关闭">×</button>
-			</div>
-			<p class="modal-hint">选择助手挂载到当前对话，挂载后模型即可调用它的工具；随时可以停用。</p>
-			<div id="assistants-modal-list" class="assistants-modal-list"></div>
 		</div>
 	</div>
 

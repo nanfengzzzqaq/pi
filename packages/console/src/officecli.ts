@@ -10,7 +10,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
@@ -58,6 +58,19 @@ function assetName(): string {
 
 export function binaryPath(): string {
 	return join(BIN_DIR, process.platform === "win32" ? "officecli.exe" : "officecli");
+}
+
+/**
+ * 让 Pi 的原生 bash 工具也能直接调用 `officecli`。
+ * 只修改当前客户端进程及其子进程环境，不写系统 PATH。
+ */
+export function ensureBinaryOnProcessPath(): void {
+	const binDir = dirname(binaryPath());
+	const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+	const current = process.env[pathKey] ?? "";
+	const entries = current.split(delimiter).filter(Boolean);
+	if (entries.some((entry) => entry.toLocaleLowerCase("en-US") === binDir.toLocaleLowerCase("en-US"))) return;
+	process.env[pathKey] = current ? `${binDir}${delimiter}${current}` : binDir;
 }
 
 interface VersionRecord {
@@ -130,6 +143,19 @@ export interface OfficeCliStatus {
 	latestTag: string | null;
 	updateAvailable: boolean | null;
 	path: string;
+}
+
+/** 只探测本机，不访问网络；工具目录页用它避免每次打开都请求 GitHub。 */
+export async function getLocalStatus(): Promise<OfficeCliStatus> {
+	const version = await probeInstalledVersion();
+	return {
+		installed: version !== null,
+		version,
+		latestVersion: null,
+		latestTag: null,
+		updateAvailable: null,
+		path: binaryPath(),
+	};
 }
 
 export async function getStatus(): Promise<OfficeCliStatus> {
@@ -323,6 +349,33 @@ export async function runOfficeCli(args: string[], cwd: string): Promise<{ stdou
 		if (err.killed) throw new Error("OfficeCLI 执行超时（120 秒）");
 		const detail = [err.stdout, err.stderr, err.message].filter(Boolean).join("\n").trim();
 		throw new Error(detail || "OfficeCLI 执行失败");
+	}
+}
+
+/**
+ * 读取 OfficeCLI 二进制内置的完整官方技能。
+ * 技能通常有数百行，不能复用普通工具调用的 8KB 输出截断。
+ */
+export async function loadOfficialSkill(skillName: string): Promise<string> {
+	if (!(await isBinaryReady())) {
+		throw new Error("OfficeCLI 未安装，请先在工具页安装");
+	}
+	try {
+		const { stdout, stderr } = await execFileAsync(binaryPath(), ["load_skill", skillName], {
+			timeout: 30_000,
+			maxBuffer: 5 * 1024 * 1024,
+			windowsHide: true,
+		});
+		const content = stdout.trim();
+		if (!content.startsWith("---\n") && !content.startsWith("---\r\n")) {
+			throw new Error(stderr.trim() || "OfficeCLI 返回的技能不是标准 SKILL.md");
+		}
+		return `${content}\n`;
+	} catch (error) {
+		const err = error as { stdout?: string; stderr?: string; message?: string; killed?: boolean };
+		if (err.killed) throw new Error("读取 OfficeCLI 官方技能超时");
+		const detail = [err.stderr, err.message].filter(Boolean).join("\n").trim();
+		throw new Error(detail || `无法读取 OfficeCLI 官方技能：${skillName}`);
 	}
 }
 
