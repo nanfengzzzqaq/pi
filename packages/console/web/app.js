@@ -124,6 +124,7 @@ async function ensureSession() {
 			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
 			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 			syncThinkingOptions(history.availableThinkingLevels);
+			renderSessionCapabilities(history.enabledCapabilities);
 			if (history.streaming) setRunning(true, true);
 			return;
 		} catch (error) {
@@ -140,6 +141,7 @@ async function ensureSession() {
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 	syncThinkingOptions(history?.availableThinkingLevels);
+	renderSessionCapabilities(history?.enabledCapabilities);
 }
 
 /** 根据当前模型的推理能力禁用不支持的思考等级选项（避免选中后被服务端钳制弹回） */
@@ -172,7 +174,7 @@ function renderHistory(history) {
 			if (Array.isArray(item.toolCalls)) {
 				// 历史恢复：工具块直接挂消息体（无执行过程容器）
 				for (const call of item.toolCalls) {
-					container.el.appendChild(appendToolBlock(call.id, call.name, call.args, "done"));
+					container.el.appendChild(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
 				}
 			}
 			if (item.errorMessage) showError(item.errorMessage);
@@ -389,6 +391,8 @@ function renderContextRing(info) {
 	}
 	// hover 完整信息（无法统计的字段显示空）
 	const fmtTokens = (v) => (v === null || v === undefined ? "" : `${(v / 1000).toFixed(1)}k`);
+	const capabilityNames = (info?.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、");
+	const lastTrace = info?.lastCapabilityTrace;
 	const rows = [
 		`模型：${info?.model ? info.model.name : ""}`,
 		`上下文窗口：${contextWindow ? `${(contextWindow / 1000).toFixed(0)}k tokens` : ""}`,
@@ -397,6 +401,9 @@ function renderContextRing(info) {
 		`缓存写入：${fmtTokens(info?.cacheWrite)} tokens`,
 		`消息数：${info?.messageCount ?? ""}`,
 		`思考等级：${info?.thinkingLevel ?? ""}`,
+		`本会话助手：${capabilityNames}`,
+		`上轮实际工具：${lastTrace ? `${lastTrace.toolCount} 个 / ${formatByteSize(lastTrace.schemaBytes)}` : ""}`,
+		`工具定义指纹：${lastTrace?.schemaFingerprint ?? ""}`,
 	];
 	contextBtnEl.title = rows.map((row) => row.replace(/^[^：]+：/, "") ? row : "").filter(Boolean).join("\n") || "上下文使用量";
 }
@@ -406,6 +413,7 @@ async function pollContext() {
 	try {
 		const info = await api(`/api/sessions/${sessionId}/context`);
 		renderContextRing(info);
+		renderSessionCapabilities(info.enabledCapabilities);
 	} catch {
 		/* 静默：会话可能刚切换 */
 	}
@@ -425,8 +433,11 @@ contextBtnEl.addEventListener("click", async () => {
 			`缓存写入：${fmt(info.cacheWrite)} tokens`,
 			`消息数：${info.messageCount}`,
 			`思考等级：${info.thinkingLevel}`,
+			`本会话助手：${(info.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`).join("、") || "未绑定"}`,
+			`上轮实际工具：${info.lastCapabilityTrace ? `${info.lastCapabilityTrace.toolCount} 个（工具定义 ${formatByteSize(info.lastCapabilityTrace.schemaBytes)}，指纹 ${info.lastCapabilityTrace.schemaFingerprint}）` : "暂无记录"}`,
+			`上轮模型用量：${typeof info.lastUsage?.totalTokens === "number" ? `${info.lastUsage.totalTokens.toLocaleString("zh-CN")} token` : "暂无统计"}`,
 			"",
-			"统计为本地估算（按消息内容推算 token 数），不产生任何 API 请求、不额外消耗 token。",
+			"上下文占用为本地估算；能力选择同样在本地完成，不请求模型、不额外消耗 token。",
 		];
 		showInfo(lines.join("\n"));
 	} catch (error) {
@@ -454,15 +465,41 @@ function handleEvent(event) {
 		case "tool_execution_start":
 			setIndicator(false);
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
-			ensureAssistant().addTool(appendToolBlock(event.toolCallId, event.toolName, event.args, "running"));
+			ensureAssistant().addTool(
+				appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running"),
+			);
 			break;
 		case "tool_execution_end": {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(event.toolCallId)}"]`);
 			if (block) updateToolBlock(block, event.isError, event.result);
 			break;
 		}
+		case "capability_selection": {
+			const block = appendToolBlock(
+				event.stepId,
+				event.stepDisplayName || "查找可用能力（capability_search）",
+				{
+					检查范围: (event.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`),
+					选择方式: "本地规则，零模型 token",
+				},
+				"done",
+			);
+			updateToolBlock(block, false, formatCapabilitySelection(event));
+			ensureAssistant().addTool(block);
+			break;
+		}
 		case "turn_end":
 			if (event.stopReason === "error") showError(event.errorMessage || "模型返回错误");
+			if (event.usage && currentAssistant) {
+				const block = appendToolBlock(
+					`usage-${event.seq}`,
+					"模型用量（model_usage）",
+					{ 统计来源: "模型服务商返回的本轮实际用量" },
+					"done",
+				);
+				updateToolBlock(block, false, formatModelUsage(event.usage));
+				currentAssistant.addTool(block);
+			}
 			if (currentAssistant) currentAssistant.foldProcess();
 			currentAssistant = null;
 			setIndicator(false);
@@ -494,6 +531,45 @@ function handleEvent(event) {
 			if (!event.fatal) setRunning(false);
 			break;
 	}
+}
+
+function formatCapabilitySelection(event) {
+	const selected = Array.isArray(event.selectedCapabilities) ? event.selectedCapabilities : [];
+	const lines = [];
+	if (selected.length === 0) {
+		lines.push("没有命中额外能力，本轮只使用原生 Pi 工具。");
+	} else {
+		for (const match of selected) {
+			const groups = (match.groupDisplayNames || []).map(
+				(name, index) => `${name}（${match.groupNames?.[index] || "未命名分组"}）`,
+			);
+			lines.push(`已加载：${match.displayName}（${match.packName}）${groups.length ? ` / ${groups.join("、")}` : ""}`);
+			if (match.reasons?.length) lines.push(`依据：${match.reasons.join("；")}`);
+		}
+	}
+	const tools = Array.isArray(event.tools) ? event.tools.map((tool) => tool.displayName || tool.name) : [];
+	lines.push(`本轮实际工具（${event.toolCount ?? tools.length}）：${tools.join("、") || "无"}`);
+	lines.push(`工具定义大小：${formatByteSize(event.schemaBytes)}；指纹：${event.schemaFingerprint || "无"}`);
+	return lines.join("\n");
+}
+
+function formatByteSize(value) {
+	if (typeof value !== "number") return "暂无统计";
+	return value < 1024 ? `${value} 字节` : `${(value / 1024).toFixed(1)} KB`;
+}
+
+function formatModelUsage(usage) {
+	const number = (value) => (typeof value === "number" ? value.toLocaleString("zh-CN") : "暂无统计");
+	const lines = [
+		`输入：${number(usage.input)} token`,
+		`输出：${number(usage.output)} token`,
+		`缓存读取：${number(usage.cacheRead)} token`,
+		`缓存写入：${number(usage.cacheWrite)} token`,
+	];
+	if (typeof usage.reasoning === "number") lines.push(`其中推理：${number(usage.reasoning)} token`);
+	lines.push(`合计：${number(usage.totalTokens)} token`);
+	if (typeof usage.cost?.total === "number") lines.push(`费用：$${usage.cost.total.toFixed(6)}`);
+	return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -845,7 +921,7 @@ function renderMarkdownInto(el, text, options = {}) {
 
 function appendToolBlock(toolCallId, toolName, args, status) {
 	const block = document.createElement("div");
-	block.className = "tool-block running";
+	block.className = `tool-block ${status === "running" ? "running" : "done"}`;
 	block.dataset.toolCallId = toolCallId;
 
 	const header = document.createElement("div");
@@ -1331,7 +1407,7 @@ async function togglePack(pack) {
 	const action = pack.mounted ? "unmount" : "mount";
 	try {
 		await api(`/api/packs/${pack.name}/${action}`, { method: "POST", body: "{}" });
-		showInfo(action === "mount" ? `已启用 ${pack.displayName}，下一轮生效` : `已停用 ${pack.displayName}`);
+		showInfo(action === "mount" ? `已启用 ${pack.displayName}，可用它开启新对话` : `已停用 ${pack.displayName}`);
 		await loadAssistants();
 		await loadContextPanel();
 		// 抽屉正展示这个助手：停用后顺手关上，启用后刷新详情
@@ -1437,7 +1513,10 @@ async function useAssistantInNewSession(pack) {
 			await api(`/api/packs/${pack.name}/mount`, { method: "POST", body: "{}" });
 			pack.mounted = true;
 		}
-		const result = await api("/api/sessions", { method: "POST", body: "{}" });
+		const result = await api("/api/sessions", {
+			method: "POST",
+			body: JSON.stringify({ assistants: [pack.name] }),
+		});
 		sessionId = result.sessionId;
 		localStorage.setItem(SESSION_KEY, sessionId);
 		clearMessages();
@@ -1466,7 +1545,7 @@ function openDrawer(packName) {
 
 	const meta = document.createElement("div");
 	meta.className = "drawer-meta";
-	meta.textContent = `v${pack.version} · ${pack.mounted ? "已启用" : "未启用"}`;
+	meta.textContent = `v${pack.version} · ${pack.mounted ? "已启用" : "未启用"}${pack.activation ? " · 按本轮加载" : ""}`;
 
 	const desc = document.createElement("div");
 	desc.className = "drawer-desc";
@@ -1480,7 +1559,8 @@ function openDrawer(packName) {
 	for (const tool of pack.tools) {
 		const chip = document.createElement("span");
 		chip.className = "tool-chip";
-		chip.textContent = tool;
+		chip.textContent =
+			typeof tool === "string" ? tool : `${tool.displayName || tool.name}${tool.displayName === tool.name ? "" : `（${tool.name}）`}`;
 		toolsWrap.appendChild(chip);
 	}
 
@@ -1518,12 +1598,20 @@ drawerCloseEl.addEventListener("click", closeDrawer);
 
 async function loadContextPanel() {
 	try {
-		await refreshPacks();
-		const mounted = packsCache.filter((p) => p.mounted);
-		contextInfoEl.textContent = mounted.length > 0 ? `${mounted.length} 个助手已启用` : "";
+		if (!sessionId) {
+			contextInfoEl.textContent = "";
+			return;
+		}
+		const info = await api(`/api/sessions/${sessionId}/context`);
+		renderSessionCapabilities(info.enabledCapabilities);
 	} catch {
 		/* 忽略 */
 	}
+}
+
+function renderSessionCapabilities(capabilities) {
+	const names = Array.isArray(capabilities) ? capabilities.map((item) => item.displayName) : [];
+	contextInfoEl.textContent = names.length > 0 ? `${names.join("、")} · 按本轮加载` : "原生 Pi";
 }
 
 // ---------------------------------------------------------------------------
