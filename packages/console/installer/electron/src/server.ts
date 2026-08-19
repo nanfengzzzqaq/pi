@@ -973,6 +973,28 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		case "GET context": {
 			const usage = cs.session.getContextUsage?.();
 			const model = cs.session.model;
+			// 缓存统计：汇总消息 usage 的 cacheRead/cacheWrite（无法统计时为 null）
+			let cacheRead = null;
+			let cacheWrite = null;
+			try {
+				let read = 0;
+				let write = 0;
+				let found = false;
+				for (const message of cs.session.messages) {
+					const u = (message as { usage?: { cacheRead?: number; cacheWrite?: number } }).usage;
+					if (u && (typeof u.cacheRead === "number" || typeof u.cacheWrite === "number")) {
+						found = true;
+						read += u.cacheRead ?? 0;
+						write += u.cacheWrite ?? 0;
+					}
+				}
+				if (found) {
+					cacheRead = read;
+					cacheWrite = write;
+				}
+			} catch {
+				/* 保持 null */
+			}
 			sendJson(res, 200, {
 				usage: usage ?? null,
 				model: model
@@ -980,6 +1002,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					: null,
 				messageCount: cs.session.messages.length,
 				thinkingLevel: cs.session.thinkingLevel,
+				cacheRead,
+				cacheWrite,
 			});
 			return;
 		}
