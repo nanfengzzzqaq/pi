@@ -27,6 +27,7 @@
 		},
 		"files": [
 			"main.js",
+			"preload.js",
 			"icon.png",
 			"src/**",
 			"web/**",

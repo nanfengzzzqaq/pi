@@ -9,7 +9,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join, resolve } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
 	ModelRuntime,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { extractFileReferences } from "./artifacts.ts";
 import * as fsExplorer from "./fs.ts";
 import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
@@ -39,6 +40,7 @@ import {
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
+import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import * as workspace from "./workspace.ts";
 
@@ -789,6 +791,28 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(JSON.stringify(body));
 }
 
+async function resolveRequestFile(path: string, sessionId?: string): Promise<fsExplorer.AllowedFileInfo> {
+	let cwd = workspace.getWorkspacePath() ?? DATA_DIR;
+	if (sessionId) {
+		const cs = await getOrRestoreSession(sessionId);
+		if (cs) cwd = cs.session.sessionManager.getCwd();
+	}
+	return fsExplorer.getAllowedFileInfo(resolve(cwd, path));
+}
+
+function sendFileDownload(res: ServerResponse, file: fsExplorer.AllowedFileInfo): void {
+	res.writeHead(200, {
+		"Content-Type": file.mimeType,
+		"Content-Length": file.size,
+		"Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+		"Cache-Control": "no-store",
+		"X-File-Name": encodeURIComponent(file.name),
+	});
+	const stream = createReadStream(file.path);
+	stream.on("error", () => res.destroy());
+	stream.pipe(res);
+}
+
 function readBodyJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
@@ -1116,7 +1140,30 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
-	// 本地资源管理器（受限浏览）
+	// Agent 数据目录：迁移完成后由桌面壳重启，下一次启动从新目录加载全部数据。
+	if (pathname === "/api/storage" && req.method === "GET") {
+		sendJson(res, 200, storage.getStorageInfo());
+		return;
+	}
+	if (pathname === "/api/storage/migrate" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { path?: unknown };
+		if (typeof body?.path !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"path": "..."}' });
+			return;
+		}
+		if ([...sessions.values()].some((item) => item.session.isStreaming)) {
+			sendJson(res, 409, { error: "Agent 正在执行任务，请等待本轮完成后再迁移" });
+			return;
+		}
+		try {
+			sendJson(res, 200, storage.migrateDataDirectory(body.path));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+
+	// 本地资源管理器（Windows 安装版可浏览本机磁盘）
 	if (pathname === "/api/fs/roots" && req.method === "GET") {
 		sendJson(res, 200, fsExplorer.listRoots());
 		return;
@@ -1124,7 +1171,41 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	if (pathname === "/api/fs/list" && req.method === "GET") {
 		const path = url.searchParams.get("path") ?? "";
 		try {
-			sendJson(res, 200, { entries: fsExplorer.listDir(path) });
+			sendJson(res, 200, { ...fsExplorer.getDirectoryInfo(path), entries: fsExplorer.listDir(path) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/copy" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { source?: unknown; destination?: unknown };
+		if (typeof body?.source !== "string" || typeof body?.destination !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"source": "...", "destination": "..."}' });
+			return;
+		}
+		try {
+			sendJson(res, 200, fsExplorer.copyFileIntoDirectory(body.source, body.destination));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/import" && req.method === "POST") {
+		const body = (await readBodyJson(req, MAX_TOTAL_FILE_BYTES * 2)) as {
+			name?: unknown;
+			dataBase64?: unknown;
+			destination?: unknown;
+		};
+		if (
+			typeof body?.name !== "string" ||
+			typeof body?.dataBase64 !== "string" ||
+			typeof body?.destination !== "string"
+		) {
+			sendJson(res, 400, { error: "请求体需含 name、dataBase64 与 destination" });
+			return;
+		}
+		try {
+			sendJson(res, 200, fsExplorer.importFileIntoDirectory(body.name, body.dataBase64, body.destination));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -1134,6 +1215,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const path = url.searchParams.get("path") ?? "";
 		try {
 			sendJson(res, 200, fsExplorer.readFileAsBase64(path));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/download" && req.method === "GET") {
+		const path = url.searchParams.get("path") ?? "";
+		const sessionId = url.searchParams.get("sessionId") ?? undefined;
+		if (!path) {
+			sendJson(res, 400, { error: "缺少文件路径" });
+			return;
+		}
+		try {
+			sendFileDownload(res, await resolveRequestFile(path, sessionId));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -1234,6 +1329,31 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					message: error instanceof Error ? error.message : String(error),
 				});
 			});
+			return;
+		}
+
+		// POST /api/sessions/:id/artifacts — 解析回复中的真实本地文件，供前端展示下载卡片
+		case "POST artifacts": {
+			const body = (await readBodyJson(req)) as { text?: unknown; paths?: unknown };
+			const text = typeof body?.text === "string" ? body.text : "";
+			const explicitPaths = Array.isArray(body?.paths)
+				? body.paths.filter((path): path is string => typeof path === "string").slice(0, 32)
+				: [];
+			const candidates = [...extractFileReferences(text), ...explicitPaths];
+			const files: Array<fsExplorer.AllowedFileInfo & { officePreview: boolean }> = [];
+			const seen = new Set<string>();
+			for (const candidate of candidates) {
+				try {
+					const info = fsExplorer.getAllowedFileInfo(resolve(cs.session.sessionManager.getCwd(), candidate));
+					const key = process.platform === "win32" ? info.path.toLocaleLowerCase("en-US") : info.path;
+					if (seen.has(key)) continue;
+					seen.add(key);
+					files.push({ ...info, officePreview: officePreview.isOfficePreviewPath(info.path) });
+				} catch {
+					// 模型回复可能含示例路径或网页域名，只展示当前确实存在且允许访问的文件。
+				}
+			}
+			sendJson(res, 200, { files });
 			return;
 		}
 

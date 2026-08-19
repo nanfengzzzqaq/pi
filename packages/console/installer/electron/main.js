@@ -4,14 +4,28 @@
  * 直接加载现有 TypeScript 后端（Node ≥22.18 原生 type-stripping），
  * 数据目录与旧版一致（%APPDATA%\pi-console\data），所有数据无缝继承。
  */
-import { app, BrowserWindow, dialog } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { createServer as createProbeServer } from "node:net";
 
-// 数据目录与旧版（vbs + Edge 模式）保持一致，升级不丢任何数据
-process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? join(app.getPath("appData"), "pi-console", "data");
+// 数据位置指针固定留在 AppData；实际数据目录可由用户在设置中整体迁移到其他磁盘。
+const storageConfigPath = join(app.getPath("appData"), "pi-console", "storage-location.json");
+const defaultDataPath = join(app.getPath("appData"), "pi-console", "data");
+
+function configuredDataPath() {
+	try {
+		const config = JSON.parse(readFileSync(storageConfigPath, "utf8"));
+		if (typeof config?.dataDir === "string" && config.dataDir.trim()) return resolve(config.dataDir);
+	} catch {
+		/* 首次启动或配置损坏时回到兼容旧版的默认目录。 */
+	}
+	return defaultDataPath;
+}
+
+process.env.PI_CONSOLE_STORAGE_CONFIG = storageConfigPath;
+process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? configuredDataPath();
 process.env.PORT = process.env.PORT ?? "3200";
 
 const APP_URL = "http://127.0.0.1:3200/";
@@ -81,12 +95,51 @@ function createWindow() {
 		icon: join(import.meta.dirname, "icon.png"),
 		autoHideMenuBar: true,
 		backgroundColor: "#0b1220",
+		webPreferences: {
+			preload: join(import.meta.dirname, "preload.js"),
+			contextIsolation: true,
+			nodeIntegration: false,
+		},
+	});
+	win.webContents.setWindowOpenHandler(({ url }) => {
+		if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+		return { action: "deny" };
+	});
+	win.webContents.on("will-navigate", (event, url) => {
+		if (url.startsWith(APP_URL)) return;
+		event.preventDefault();
+		if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
 	});
 	win.loadURL(APP_URL);
 	win.on("closed", () => {
 		win = null;
 	});
 }
+
+ipcMain.on("pi:file-drag-start", (event, path) => {
+	try {
+		const file = resolve(String(path));
+		if (!existsSync(file) || !statSync(file).isFile()) return;
+		const icon = nativeImage.createFromPath(join(import.meta.dirname, "icon.png")).resize({ width: 32, height: 32 });
+		event.sender.startDrag({ file, icon });
+	} catch {
+		/* 文件在拖动开始前被移动时忽略。 */
+	}
+});
+
+ipcMain.handle("pi:choose-directory", async () => {
+	const options = {
+		properties: ["openDirectory", "createDirectory"],
+		title: "选择保存位置",
+	};
+	const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
+	return result.canceled ? null : result.filePaths[0];
+});
+
+ipcMain.on("pi:relaunch", () => {
+	app.relaunch();
+	app.exit(0);
+});
 
 app.whenReady().then(async () => {
 	// 升级衔接：改写旧版启动器为 Electron 优先（需在旧服务可能启动前完成）

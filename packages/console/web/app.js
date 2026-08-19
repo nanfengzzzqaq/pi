@@ -47,6 +47,10 @@ const githubTokenClearBtnEl = $("github-token-clear-btn");
 const fsRootSelectEl = $("fs-root-select");
 const fsTreeEl = $("fs-tree");
 const fsRefreshBtnEl = $("fs-refresh");
+const fsUpBtnEl = $("fs-up");
+const fsPathInputEl = $("fs-path-input");
+const fsPathGoBtnEl = $("fs-path-go");
+const fsLocationStateEl = $("fs-location-state");
 const fsWorkspacePathEl = $("fs-workspace-path");
 const fsSetWorkspaceBtnEl = $("fs-set-workspace");
 const sessionsListEl = $("sessions-list");
@@ -55,8 +59,13 @@ const contextBtnEl = $("context-btn");
 const contextRingFgEl = $("context-ring-fg");
 const contextRingTextEl = $("context-ring-text");
 const workspaceInputEl = $("workspace-input");
+const workspaceBrowseBtnEl = $("workspace-browse-btn");
 const workspaceSaveBtnEl = $("workspace-save-btn");
 const workspaceCurrentEl = $("workspace-current");
+const storageInputEl = $("storage-input");
+const storageBrowseBtnEl = $("storage-browse-btn");
+const storageMigrateBtnEl = $("storage-migrate-btn");
+const storageCurrentEl = $("storage-current");
 const previewModalEl = $("preview-modal");
 const previewTitleEl = $("preview-title");
 const previewContentEl = $("preview-content");
@@ -107,6 +116,7 @@ const officeToolCalls = new Map();
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
 const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
+const DELIVERABLE_FILE_RE = /\.[A-Za-z0-9]{1,16}$/i;
 
 // ---------------------------------------------------------------------------
 // 基础请求
@@ -252,6 +262,25 @@ function maybePreviewOfficeTool(toolCall) {
 	if (path) void openOfficePreview(path, "tool");
 }
 
+function findDeliverableToolPath(value, preferredKeys = []) {
+	if (!value) return null;
+	if (typeof value === "string") {
+		const path = value.trim().replace(/^["']|["']$/g, "");
+		return !/^https?:\/\//i.test(path) && !/[\r\n]/.test(path) && DELIVERABLE_FILE_RE.test(path) ? path : null;
+	}
+	if (typeof value !== "object") return null;
+	for (const key of preferredKeys) {
+		const found = findDeliverableToolPath(value[key]);
+		if (found) return found;
+	}
+	for (const [key, child] of Object.entries(value)) {
+		if (preferredKeys.includes(key)) continue;
+		const found = findDeliverableToolPath(child);
+		if (found) return found;
+	}
+	return null;
+}
+
 officePreviewFrameEl.addEventListener("load", () => {
 	if (!officePreview || officePreviewFrameEl.src === "about:blank") return;
 	officePreviewLoadingEl.hidden = true;
@@ -342,21 +371,31 @@ function clearMessages() {
 function renderHistory(history) {
 	clearMessages();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
+	let latestAssistant = null;
 	for (const item of history.messages) {
 		if (item.role === "user") {
 			appendMessage("user", item.text);
 		} else if (item.role === "assistant") {
 			const container = appendMessage("assistant", item.text || "");
+			latestAssistant = container;
 			if (Array.isArray(item.toolCalls)) {
 				// 历史恢复：工具块直接挂消息体（无执行过程容器）
 				for (const call of item.toolCalls) {
 					container.el.appendChild(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
+					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
+					if (path) container.addArtifactPath(path);
 				}
 			}
+			void container.finalizeArtifacts();
 			if (item.errorMessage) showError(item.errorMessage);
 		} else if (item.role === "toolResult") {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(item.toolCallId)}"]`);
 			if (block) updateToolBlock(block, item.isError, item.text);
+			if (latestAssistant && !item.isError) {
+				const path = findDeliverableToolPath(item.text);
+				if (path) latestAssistant.addArtifactPath(path);
+				void latestAssistant.finalizeArtifacts();
+			}
 		}
 	}
 }
@@ -657,7 +696,11 @@ function handleEvent(event) {
 			if (block) updateToolBlock(block, event.isError, event.result);
 			const toolCall = officeToolCalls.get(event.toolCallId);
 			officeToolCalls.delete(event.toolCallId);
-			if (!event.isError) maybePreviewOfficeTool(toolCall);
+			if (!event.isError) {
+				maybePreviewOfficeTool(toolCall);
+				const path = findDeliverableToolPath(toolCall?.args, ["output", "file", "path", "target", "destination"]);
+				if (path) currentAssistant?.addArtifactPath(path);
+			}
 			break;
 		}
 		case "capability_selection": {
@@ -686,7 +729,10 @@ function handleEvent(event) {
 				updateToolBlock(block, false, formatModelUsage(event.usage));
 				currentAssistant.addTool(block);
 			}
-			if (currentAssistant) currentAssistant.foldProcess();
+			if (currentAssistant) {
+				currentAssistant.foldProcess();
+				void currentAssistant.finalizeArtifacts();
+			}
 			currentAssistant = null;
 			setIndicator(false);
 			break;
@@ -762,8 +808,80 @@ function formatModelUsage(usage) {
 // Claude 风格消息渲染
 // ---------------------------------------------------------------------------
 
+function artifactPresentation(file) {
+	const ext = file.name.split(".").pop()?.toLocaleLowerCase("en-US") || "";
+	if (ext === "docx") return { icon: "W", type: "Word 文档" };
+	if (ext === "xlsx") return { icon: "X", type: "Excel 工作簿" };
+	if (ext === "pptx") return { icon: "P", type: "PowerPoint 演示文稿" };
+	if (ext === "pdf") return { icon: "PDF", type: "PDF 文件" };
+	if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext)) return { icon: "图", type: "图片" };
+	if (["zip", "7z"].includes(ext)) return { icon: "压", type: "压缩文件" };
+	return { icon: "文", type: ext ? `${ext.toLocaleUpperCase("en-US")} 文件` : "文件" };
+}
+
+const LOCAL_FILE_DRAG_TYPE = "application/x-pi-local-file";
+
+function startPathDrag(event, path) {
+	if (!path || !event.dataTransfer) return;
+	event.dataTransfer.effectAllowed = "copy";
+	event.dataTransfer.setData(LOCAL_FILE_DRAG_TYPE, path);
+	event.dataTransfer.setData("text/plain", path);
+	// Electron 使用真实本地路径启动 Windows 原生拖放，因此可直接放到桌面或系统资源管理器。
+	if (window.piDesktop?.startFileDrag) {
+		event.preventDefault();
+		window.piDesktop.startFileDrag(path);
+	}
+}
+
+function renderArtifactCards(container, files) {
+	container.innerHTML = "";
+	container.hidden = !Array.isArray(files) || files.length === 0;
+	for (const file of files || []) {
+		const presentation = artifactPresentation(file);
+		const card = document.createElement("article");
+		card.className = "artifact-card";
+		card.draggable = true;
+		card.dataset.artifactPath = file.path;
+		const icon = document.createElement("span");
+		icon.className = "artifact-icon";
+		icon.textContent = presentation.icon;
+		const info = document.createElement("div");
+		info.className = "artifact-info";
+		const name = document.createElement("div");
+		name.className = "artifact-name";
+		name.textContent = file.name;
+		name.title = file.path;
+		const meta = document.createElement("div");
+		meta.className = "artifact-meta";
+		meta.textContent = `${presentation.type} · ${formatSize(file.size)}`;
+		info.append(name, meta);
+		const actions = document.createElement("div");
+		actions.className = "artifact-actions";
+		if (file.officePreview) {
+			const preview = document.createElement("button");
+			preview.type = "button";
+			preview.className = "artifact-action secondary";
+			preview.textContent = "实时预览";
+			preview.title = "实时预览（office_preview_watch）";
+			preview.dataset.previewPath = file.path;
+			actions.appendChild(preview);
+		}
+		const download = document.createElement("button");
+		download.type = "button";
+		download.className = "artifact-action primary";
+		download.textContent = "下载文件";
+		download.title = "下载文件（file_download）";
+		download.dataset.downloadPath = file.path;
+		download.dataset.downloadName = file.name;
+		actions.appendChild(download);
+		card.append(icon, info, actions);
+		container.appendChild(card);
+	}
+}
+
 function appendMessage(role, text) {
 	messagesEmptyEl.hidden = true;
+	const messageSessionId = sessionId;
 	const wrap = document.createElement("div");
 	wrap.className = `message ${role}`;
 
@@ -806,6 +924,10 @@ function appendMessage(role, text) {
 	textEl.className = "text";
 	if (text) renderMarkdownInto(textEl, text);
 	bubble.appendChild(textEl);
+	const artifactsEl = document.createElement("div");
+	artifactsEl.className = "message-artifacts";
+	artifactsEl.hidden = true;
+	if (role === "assistant") bubble.appendChild(artifactsEl);
 
 	wrap.appendChild(bubble);
 	messagesEl.appendChild(wrap);
@@ -816,6 +938,28 @@ function appendMessage(role, text) {
 		el: bubble,
 		thinkingEl: thinking,
 		textEl,
+		artifactsEl,
+		_textBuffer: text || "",
+		_artifactPaths: new Set(),
+		_artifactRequest: 0,
+		addArtifactPath(path) {
+			if (typeof path === "string" && path.trim()) this._artifactPaths.add(path.trim());
+		},
+		async finalizeArtifacts() {
+			if (role !== "assistant" || !messageSessionId) return;
+			const request = ++this._artifactRequest;
+			try {
+				const result = await api(`/api/sessions/${messageSessionId}/artifacts`, {
+					method: "POST",
+					body: JSON.stringify({ text: this._textBuffer || "", paths: [...this._artifactPaths] }),
+				});
+				if (request !== this._artifactRequest) return;
+				renderArtifactCards(this.artifactsEl, result.files);
+				scrollToBottom();
+			} catch {
+				// 文件可能已被移动或会话正在切换；不影响正文显示。
+			}
+		},
 		/** 挂载工具块到执行过程区 */
 		addTool(toolBlock) {
 			if (!processWrap) return;
@@ -937,13 +1081,48 @@ function escapeHtml(text) {
 	return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function escapeAttribute(text) {
+	return escapeHtml(text).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function isLocalFileReference(path) {
+	const value = path.trim();
+	return !/^https?:\/\//i.test(value) && /\.[A-Za-z0-9]{1,16}$/.test(value.replace(/[?#].*$/, ""));
+}
+
 function renderInline(text) {
-	// 行内：`code`、**bold**、*italic*、[text](url)
-	let html = escapeHtml(text);
-	html = html.replace(/`([^`]+)`/g, (m, code) => `<code>${code}</code>`);
+	// 先把代码、网页链接和文件链接替换为占位符，避免后续格式化破坏属性。
+	const fragments = [];
+	const hold = (html) => `\u0000${fragments.push(html) - 1}\u0000`;
+	let source = text;
+	source = source.replace(/`([^`]+)`/g, (_match, code) => hold(`<code>${escapeHtml(code)}</code>`));
+	source = source.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_match, label, url) =>
+		hold(
+			`<a class="external-link" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`,
+		),
+	);
+	source = source.replace(/\[([^\]]+)\]\(([^)\n]+)\)/g, (match, label, path) => {
+		if (!isLocalFileReference(path)) return match;
+		return hold(
+			`<button type="button" class="inline-file-link" data-download-path="${escapeAttribute(path.trim())}" data-download-name="${escapeAttribute(label)}" title="下载文件（file_download）">📎 ${escapeHtml(label)}</button>`,
+		);
+	});
+	source = source.replace(/https?:\/\/[^\s<\u0000]+/g, (matched) => {
+		let url = matched;
+		let trailing = "";
+		while (/[，。；：！？,;:!?)）\]}]$/u.test(url)) {
+			trailing = url.slice(-1) + trailing;
+			url = url.slice(0, -1);
+		}
+		return `${hold(
+			`<a class="external-link" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`,
+		)}${trailing}`;
+	});
+
+	let html = escapeHtml(source);
 	html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
 	html = html.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-	html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+	html = html.replace(/\u0000(\d+)\u0000/g, (_match, index) => fragments[Number(index)] || "");
 	return html;
 }
 
@@ -1158,13 +1337,13 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 	return block;
 }
 
-/** 结果文本里的文件路径渲染为可点击链接（点击加入对话/预览） */
+/** 结果文本里的文件路径渲染为可点击链接（点击下载/预览，Shift+点击加入对话） */
 function renderResultText(resultText) {
 	const escaped = escapeHtml(resultText);
 	// 常见路径形态：绝对路径 / 相对路径 + 常见文件扩展名
 	return escaped.replace(
-		/((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])[\w\-. \\/\\()（）【】\[\]]+\.(?:docx|xlsx|pptx|txt|md|json|js|ts|py|csv|png|jpg|jpeg|gif|webp|pdf|log))/g,
-		'<a class="file-link" data-path="$1" title="点击查看/添加到对话">📄 $1</a>',
+		/((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])[\w\-. \\/\\()（）【】\[\]]+\.[A-Za-z0-9]{1,16})/g,
+		'<a class="file-link" data-path="$1" title="点击下载或预览；Shift+点击加入对话">📄 $1</a>',
 	);
 }
 
@@ -1207,6 +1386,49 @@ function copyTextFrom(btn) {
 	if (!text) return false;
 	navigator.clipboard.writeText(text).then(() => showInfo(`已复制（${text.length} 字符）`)).catch(() => showError("复制失败"));
 	return true;
+}
+
+/** 下载智能体发出的本地文件。 */
+async function downloadPathLink(path, suggestedName) {
+	if (!sessionId || !path) return;
+	const query = new URLSearchParams({ path, sessionId });
+	const request = async () =>
+		await fetch(`/api/fs/download?${query}`, {
+			headers: authHeaders(),
+		});
+	try {
+		let response = await request();
+		if (response.status === 401) {
+			const token = window.prompt("此服务器需要访问令牌（PI_CONSOLE_TOKEN），请输入：");
+			if (token === null) throw new Error("未授权");
+			localStorage.setItem(TOKEN_KEY, token);
+			response = await request();
+		}
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `下载失败（HTTP ${response.status}）`);
+		}
+		const encodedName = response.headers.get("X-File-Name");
+		let fileName = suggestedName || path.split(/[\\/]/).pop() || "文件";
+		if (encodedName) {
+			try {
+				fileName = decodeURIComponent(encodedName);
+			} catch {
+				// 使用界面已有名称。
+			}
+		}
+		const blobUrl = URL.createObjectURL(await response.blob());
+		const anchor = document.createElement("a");
+		anchor.href = blobUrl;
+		anchor.download = fileName;
+		document.body.appendChild(anchor);
+		anchor.click();
+		anchor.remove();
+		setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+		showInfo(`已下载 ${fileName}（file_download）`);
+	} catch (error) {
+		showError(`下载文件失败：${error.message}`);
+	}
 }
 
 /** 点击文件链接：读文件加入对话附件 */
@@ -1325,16 +1547,35 @@ collapseBtnEl.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 messagesEl.addEventListener("click", (e) => {
-	// 文件链接：读取并加入对话附件
+	const previewLink = e.target.closest("[data-preview-path]");
+	if (previewLink) {
+		e.preventDefault();
+		void openOfficePreview(previewLink.dataset.previewPath, "artifact");
+		return;
+	}
+	const downloadLink = e.target.closest("[data-download-path]");
+	if (downloadLink) {
+		e.preventDefault();
+		if (e.shiftKey) attachPathLink(downloadLink.dataset.downloadPath);
+		else void downloadPathLink(downloadLink.dataset.downloadPath, downloadLink.dataset.downloadName);
+		return;
+	}
+	// 工具结果里的路径：Office 文件打开实时预览，其他文件直接下载；Shift+点击可重新加入对话。
 	const fileLink = e.target.closest("[data-path]");
 	if (fileLink) {
 		e.preventDefault();
 		if (isOfficeFilePath(fileLink.dataset.path)) void openOfficePreview(fileLink.dataset.path, "tool-result");
-		else attachPathLink(fileLink.dataset.path);
+		else if (e.shiftKey) attachPathLink(fileLink.dataset.path);
+		else void downloadPathLink(fileLink.dataset.path);
 		return;
 	}
 	const btn = e.target.closest("[data-copy]");
 	if (btn) copyTextFrom(btn);
+});
+
+messagesEl.addEventListener("dragstart", (event) => {
+	const card = event.target.closest("[data-artifact-path]");
+	if (card) startPathDrag(event, card.dataset.artifactPath);
 });
 
 // ---------------------------------------------------------------------------
@@ -1399,13 +1640,14 @@ fileInputEl.addEventListener("change", () => {
 
 let dragDepth = 0;
 window.addEventListener("dragenter", (e) => {
-	if (!e.dataTransfer?.types.includes("Files")) return;
+	if (![...(e.dataTransfer?.types ?? [])].some((type) => type === "Files" || type === LOCAL_FILE_DRAG_TYPE)) return;
+	if (fsTreeEl.contains(e.target)) return;
 	e.preventDefault();
 	dragDepth++;
 	dropOverlayEl.hidden = false;
 });
 window.addEventListener("dragover", (e) => {
-	if (!e.dataTransfer?.types.includes("Files")) return;
+	if (![...(e.dataTransfer?.types ?? [])].some((type) => type === "Files" || type === LOCAL_FILE_DRAG_TYPE)) return;
 	e.preventDefault();
 });
 window.addEventListener("dragleave", (e) => {
@@ -1414,10 +1656,17 @@ window.addEventListener("dragleave", (e) => {
 	if (dragDepth === 0) dropOverlayEl.hidden = true;
 });
 window.addEventListener("drop", (e) => {
+	if (fsTreeEl.contains(e.target)) return;
 	e.preventDefault();
 	dragDepth = 0;
 	dropOverlayEl.hidden = true;
-	for (const file of e.dataTransfer?.files ?? []) addAttachment(file);
+	const files = [...(e.dataTransfer?.files ?? [])];
+	if (files.length > 0) {
+		for (const file of files) addAttachment(file);
+		return;
+	}
+	const path = e.dataTransfer?.getData(LOCAL_FILE_DRAG_TYPE);
+	if (path) void attachPathLink(path);
 });
 window.addEventListener("paste", (e) => {
 	const files = e.clipboardData?.files;
@@ -1428,11 +1677,11 @@ window.addEventListener("paste", (e) => {
 
 async function sendMessage() {
 	const text = inputEl.value.trim();
-	if (!text || running || !sessionId) return;
+	if ((!text && pendingAttachments.length === 0) || running || !sessionId) return;
 	inputEl.value = "";
 	resizeComposerInput();
 	errorBarEl.hidden = true;
-	appendMessage("user", text);
+	appendMessage("user", text || `发送了 ${pendingAttachments.length} 个文件`);
 	setRunning(true);
 	setIndicator(true, "思考中…");
 
@@ -1987,19 +2236,22 @@ function renderSessionCapabilities(capabilities) {
 // ---------------------------------------------------------------------------
 
 let fsRoots = [];
-let currentFsPath = null; // 文件管理器当前浏览的目录
+let currentFsPath = null; // 内置 Windows 资源管理器当前浏览目录
+let currentFsParent = null;
 
-async function loadFsRoots() {
+async function loadFsRoots(preferredPath = currentFsPath) {
 	try {
 		fsRoots = await api("/api/fs/roots");
 		fsRootSelectEl.innerHTML = "";
 		for (const root of fsRoots) {
 			const option = document.createElement("option");
 			option.value = root.path;
-			option.textContent = root.path;
+			option.textContent = root.name;
+			option.title = root.path;
 			fsRootSelectEl.appendChild(option);
 		}
-		if (fsRoots.length > 0) await loadFsDir(fsRoots[0].path);
+		const target = preferredPath || fsRoots.find((root) => root.kind === "workspace")?.path || fsRoots[0]?.path;
+		if (target) await loadFsDir(target);
 		await loadWorkspaceState();
 	} catch (error) {
 		fsTreeEl.textContent = `加载失败：${error.message}`;
@@ -2076,95 +2328,195 @@ workspaceSaveBtnEl.addEventListener("click", async () => {
 	}
 });
 
+async function chooseDirectoryInto(input) {
+	if (!window.piDesktop?.chooseDirectory) {
+		input.focus();
+		showInfo("当前为网页模式，请直接输入文件夹完整路径");
+		return;
+	}
+	const path = await window.piDesktop.chooseDirectory();
+	if (path) input.value = path;
+}
+
+workspaceBrowseBtnEl.addEventListener("click", () => void chooseDirectoryInto(workspaceInputEl));
+
+async function loadStorageState() {
+	try {
+		const info = await api("/api/storage");
+		storageCurrentEl.textContent = `当前：${info.path}`;
+		storageCurrentEl.title = info.path;
+		storageInputEl.placeholder = info.path;
+	} catch (error) {
+		storageCurrentEl.textContent = `读取失败：${error.message}`;
+	}
+}
+
+storageBrowseBtnEl.addEventListener("click", () => void chooseDirectoryInto(storageInputEl));
+storageMigrateBtnEl.addEventListener("click", async () => {
+	const path = storageInputEl.value.trim();
+	if (!path) {
+		showError("请先选择新的 Agent 数据目录");
+		return;
+	}
+	if (!window.confirm(`把全部 Agent 数据复制到：\n${path}\n\n迁移完成后客户端会重启，旧目录将保留作备份。`)) return;
+	storageMigrateBtnEl.disabled = true;
+	storageMigrateBtnEl.textContent = "正在迁移…";
+	try {
+		const result = await api("/api/storage/migrate", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		});
+		storageInputEl.value = "";
+		storageCurrentEl.textContent = `新位置：${result.path}（已复制 ${result.copiedFiles} 个文件）`;
+		if (result.restartRequired && window.piDesktop?.relaunch) {
+			showInfo("Agent 数据迁移完成，正在重启客户端…");
+			setTimeout(() => window.piDesktop.relaunch(), 500);
+		} else if (result.restartRequired) {
+			showInfo("Agent 数据迁移完成，请重新启动客户端后生效");
+		} else {
+			showInfo("当前已经是这个数据目录");
+		}
+	} catch (error) {
+		showError(`迁移 Agent 数据失败：${error.message}`);
+	} finally {
+		storageMigrateBtnEl.disabled = false;
+		storageMigrateBtnEl.textContent = "迁移并重启";
+	}
+});
+
 async function loadFsDir(path) {
-	currentFsPath = path;
 	try {
 		const result = await api(`/api/fs/list?path=${encodeURIComponent(path)}`);
+		currentFsPath = result.path;
+		currentFsParent = result.parent;
+		fsPathInputEl.value = result.path;
+		fsUpBtnEl.disabled = !result.parent;
+		fsLocationStateEl.textContent = result.isWorkspace
+			? "当前位于 Agent 工作区 · 文件可拖入对话或拖到桌面"
+			: "本地文件 · 文件可拖入对话或拖到桌面";
+		fsLocationStateEl.classList.toggle("in-workspace", result.isWorkspace);
+		const matchingRoot = fsRoots
+			.filter((root) => result.path.toLocaleLowerCase().startsWith(root.path.toLocaleLowerCase()))
+			.sort((a, b) => b.path.length - a.path.length)[0];
+		if (matchingRoot) fsRootSelectEl.value = matchingRoot.path;
 		fsTreeEl.innerHTML = "";
 		if (result.entries.length === 0) {
 			fsTreeEl.textContent = "（空目录）";
 			return;
 		}
 		for (const entry of result.entries) {
-			const row = document.createElement("div");
-			row.className = "fs-row";
-			row.dataset.path = path.replace(/[\\/]+$/, "") + "/" + entry.name;
-			row.dataset.type = entry.type;
-			row.dataset.name = entry.name;
-			row.dataset.mime = "";
-			const icon = document.createElement("span");
-			icon.className = "fs-icon";
-			icon.textContent = entry.type === "dir" ? "📁" : "📄";
-			const name = document.createElement("span");
-			name.className = "fs-name";
-			name.textContent = entry.name;
-			row.appendChild(icon);
-			row.appendChild(name);
-			if (entry.type === "file" && entry.size !== null) {
-				const size = document.createElement("span");
-				size.className = "fs-size";
-				size.textContent = formatSize(entry.size);
-				row.appendChild(size);
-			}
-			if (entry.type === "dir") {
-				row.addEventListener("click", () => toggleFsDir(row));
-			} else {
-				row.addEventListener("click", () => previewFsFile(row));
-			}
-			fsTreeEl.appendChild(row);
+			fsTreeEl.appendChild(createFsRow(result.path, entry));
 		}
 	} catch (error) {
 		fsTreeEl.textContent = `加载失败：${error.message}`;
 	}
 }
 
-async function toggleFsDir(row) {
-	const childWrap = row.nextElementSibling;
-	if (childWrap && childWrap.classList.contains("fs-children")) {
-		childWrap.remove();
-		return;
+function createFsRow(directory, entry) {
+	const row = document.createElement("div");
+	row.className = `fs-row${entry.isWorkspace ? " workspace-item" : ""}`;
+	row.dataset.path = directory.replace(/[\\/]+$/, "") + "/" + entry.name;
+	row.dataset.type = entry.type;
+	row.dataset.name = entry.name;
+	row.draggable = entry.type === "file";
+	row.title = entry.type === "dir" ? "双击打开" : "双击预览；可拖入对话或拖到桌面";
+	const icon = document.createElement("span");
+	icon.className = "fs-icon";
+	icon.textContent = entry.type === "dir" ? "📁" : "📄";
+	const name = document.createElement("span");
+	name.className = "fs-name";
+	name.textContent = entry.name;
+	row.append(icon, name);
+	if (entry.type === "file" && entry.size !== null) {
+		const size = document.createElement("span");
+		size.className = "fs-size";
+		size.textContent = formatSize(entry.size);
+		row.appendChild(size);
 	}
-	// 展开：在该行后插入子容器
-	const children = document.createElement("div");
-	children.className = "fs-children";
-	row.after(children);
-	try {
-		const result = await api(`/api/fs/list?path=${encodeURIComponent(row.dataset.path)}`);
-		children.innerHTML = "";
-		for (const entry of result.entries) {
-			const child = document.createElement("div");
-			child.className = "fs-row fs-row-child";
-			child.dataset.path = row.dataset.path + "/" + entry.name;
-			child.dataset.type = entry.type;
-			child.dataset.name = entry.name;
-			const icon = document.createElement("span");
-			icon.className = "fs-icon";
-			icon.textContent = entry.type === "dir" ? "📁" : "📄";
-			const name = document.createElement("span");
-			name.className = "fs-name";
-			name.textContent = entry.name;
-			child.appendChild(icon);
-			child.appendChild(name);
-			if (entry.type === "file" && entry.size !== null) {
-				const size = document.createElement("span");
-				size.className = "fs-size";
-				size.textContent = formatSize(entry.size);
-				child.appendChild(size);
-			}
-			if (entry.type === "dir") child.addEventListener("click", () => toggleFsDir(child));
-			else child.addEventListener("click", () => previewFsFile(child));
-			children.appendChild(child);
-		}
-	} catch (error) {
-		children.textContent = `加载失败：${error.message}`;
-	}
+	row.addEventListener("click", () => {
+		for (const selected of fsTreeEl.querySelectorAll(".fs-row.selected")) selected.classList.remove("selected");
+		row.classList.add("selected");
+	});
+	row.addEventListener("dblclick", () => {
+		if (entry.type === "dir") void loadFsDir(row.dataset.path);
+		else void previewFsFile(row);
+	});
+	row.addEventListener("dragstart", (event) => startPathDrag(event, row.dataset.path));
+	return row;
 }
 
 fsRootSelectEl.addEventListener("change", () => {
 	if (fsRootSelectEl.value) loadFsDir(fsRootSelectEl.value);
 });
 fsRefreshBtnEl.addEventListener("click", () => {
-	if (fsRootSelectEl.value) loadFsDir(fsRootSelectEl.value);
+	if (currentFsPath) void loadFsDir(currentFsPath);
+});
+fsUpBtnEl.addEventListener("click", () => {
+	if (currentFsParent) void loadFsDir(currentFsParent);
+});
+fsPathGoBtnEl.addEventListener("click", () => {
+	if (fsPathInputEl.value.trim()) void loadFsDir(fsPathInputEl.value.trim());
+});
+fsPathInputEl.addEventListener("keydown", (event) => {
+	if (event.key === "Enter") {
+		event.preventDefault();
+		if (fsPathInputEl.value.trim()) void loadFsDir(fsPathInputEl.value.trim());
+	}
+});
+
+async function copyDroppedFilesToCurrentDirectory(dataTransfer) {
+	if (!currentFsPath) return;
+	const source = dataTransfer.getData(LOCAL_FILE_DRAG_TYPE);
+	try {
+		if (source) {
+			await api("/api/fs/copy", {
+				method: "POST",
+				body: JSON.stringify({ source, destination: currentFsPath }),
+			});
+		} else {
+			for (const file of dataTransfer.files ?? []) {
+				const localPath = window.piDesktop?.getFilePath?.(file) || "";
+				if (localPath) {
+					await api("/api/fs/copy", {
+						method: "POST",
+						body: JSON.stringify({ source: localPath, destination: currentFsPath }),
+					});
+				} else {
+					await api("/api/fs/import", {
+						method: "POST",
+						body: JSON.stringify({
+							name: file.name,
+							dataBase64: await fileToBase64(file),
+							destination: currentFsPath,
+						}),
+					});
+				}
+			}
+		}
+		await loadFsDir(currentFsPath);
+		showInfo("文件已复制到当前文件夹（file_copy）");
+	} catch (error) {
+		showError(`复制文件失败：${error.message}`);
+	}
+}
+
+fsTreeEl.addEventListener("dragover", (event) => {
+	if (!event.dataTransfer) return;
+	event.preventDefault();
+	event.stopPropagation();
+	event.dataTransfer.dropEffect = "copy";
+	fsTreeEl.classList.add("drag-target");
+});
+fsTreeEl.addEventListener("dragleave", (event) => {
+	if (!fsTreeEl.contains(event.relatedTarget)) fsTreeEl.classList.remove("drag-target");
+});
+fsTreeEl.addEventListener("drop", (event) => {
+	event.preventDefault();
+	event.stopPropagation();
+	fsTreeEl.classList.remove("drag-target");
+	dragDepth = 0;
+	dropOverlayEl.hidden = true;
+	if (event.dataTransfer) void copyDroppedFilesToCurrentDirectory(event.dataTransfer);
 });
 
 async function previewFsFile(row) {
@@ -2264,6 +2616,8 @@ settingsBtnEl.addEventListener("click", () => {
 	settingsModalEl.hidden = false;
 	loadKeysSection();
 	loadVersionSection();
+	loadWorkspaceState();
+	loadStorageState();
 });
 settingsCloseEl.addEventListener("click", () => {
 	settingsModalEl.hidden = true;
