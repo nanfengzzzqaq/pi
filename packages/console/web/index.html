@@ -80,9 +80,11 @@
 			<footer class="composer">
 				<div class="attachments" id="attachments" hidden></div>
 				<div class="composer-row">
-					<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
-					<input type="file" id="file-input" multiple hidden>
-					<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+					<div class="composer-input-box">
+						<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
+						<input type="file" id="file-input" multiple hidden>
+						<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+					</div>
 					<div class="composer-buttons">
 						<button id="send-btn" disabled>发送</button>
 						<button id="stop-btn" hidden>停止</button>
@@ -103,8 +105,6 @@
 						<option value="xhigh">xhigh</option>
 						<option value="max">max</option>
 					</select>
-					<span class="composer-spacer"></span>
-					<span id="context-info" class="context-info" title="已启用能力"></span>
 					<button id="context-btn" class="context-ring-btn" title="上下文使用量">
 						<svg viewBox="0 0 36 36" class="context-ring">
 							<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
@@ -112,6 +112,8 @@
 						</svg>
 						<span id="context-ring-text" class="context-ring-text">–</span>
 					</button>
+					<span class="composer-spacer"></span>
+					<span id="context-info" class="context-info" title="已启用能力"></span>
 				</div>
 			</footer>
 		</main>

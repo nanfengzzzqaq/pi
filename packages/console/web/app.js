@@ -239,18 +239,13 @@ async function loadSessions() {
 			const meta = document.createElement("div");
 			meta.className = "session-meta";
 			meta.textContent = `${new Date(session.updatedAt).toLocaleDateString("zh-CN")} ${session.active ? "· 当前" : ""}`;
-			const delBtn = document.createElement("button");
-			delBtn.className = "session-delete";
-			delBtn.textContent = "×";
-			delBtn.title = "删除此对话（工作区文件保留）";
-			delBtn.addEventListener("click", (e) => {
-				e.stopPropagation();
-				deleteSession(session.id);
-			});
 			row.appendChild(title);
 			row.appendChild(meta);
-			row.appendChild(delBtn);
 			row.addEventListener("click", () => switchSession(session.id));
+			row.addEventListener("contextmenu", (e) => {
+				e.preventDefault();
+				showSessionContextMenu(e.clientX, e.clientY, session.id);
+			});
 			sessionsListEl.appendChild(row);
 		}
 	} catch (error) {
@@ -276,17 +271,30 @@ async function switchSession(id) {
 }
 
 /** 删除会话：记录与对话内容删除，工作区文件保留；若删除的是当前会话则新建 */
+let sessionContextMenuEl = null;
+
+/** 删除会话：记录与对话内容删除，工作区文件保留；删除当前会话后跳转到列表第一个会话 */
 async function deleteSession(id) {
 	if (!window.confirm("删除此对话？\n（对话记录将被删除，工作区里的文件会保留）")) return;
 	try {
 		await api(`/api/sessions/${id}`, { method: "DELETE" });
 		if (id === sessionId) {
+			const list = await api("/api/sessions").catch(() => []);
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
 			clearMessages();
 			lastSeq = -1;
-			await ensureSession();
-			connectSSE();
+			if (list.length > 0) {
+				// 跳转到会话栏第一个会话
+				await switchSession(list[0].id);
+			} else {
+				// 没有会话了：保持空状态，页面显示空（用户可点 ＋ 新对话）
+				if (es) {
+					es.close();
+					es = null;
+				}
+				connStateEl.textContent = "空闲";
+			}
 		}
 		await loadSessions();
 		showInfo("对话已删除");
@@ -294,6 +302,35 @@ async function deleteSession(id) {
 		showError(`删除对话失败：${error.message}`);
 	}
 }
+
+/** 右键菜单：删除当前会话 */
+function showSessionContextMenu(x, y, id) {
+	hideSessionContextMenu();
+	const menu = document.createElement("div");
+	menu.className = "session-context-menu";
+	const item = document.createElement("div");
+	item.className = "session-context-item danger";
+	item.textContent = "删除当前会话";
+	item.addEventListener("click", async () => {
+		hideSessionContextMenu();
+		await deleteSession(id);
+	});
+	menu.appendChild(item);
+	menu.style.left = `${x}px`;
+	menu.style.top = `${y}px`;
+	document.body.appendChild(menu);
+	sessionContextMenuEl = menu;
+}
+
+function hideSessionContextMenu() {
+	if (sessionContextMenuEl) {
+		sessionContextMenuEl.remove();
+		sessionContextMenuEl = null;
+	}
+}
+
+document.addEventListener("click", hideSessionContextMenu);
+document.addEventListener("contextmenu", hideSessionContextMenu);
 
 sessionNewBtnEl.addEventListener("click", async () => {
 	try {
@@ -316,30 +353,42 @@ sessionNewBtnEl.addEventListener("click", async () => {
 // ---------------------------------------------------------------------------
 
 /** 更新圆环：percent 0-100；usage 为 null（未知）时显示 – */
-function renderContextRing(percent, tokens, contextWindow) {
+function renderContextRing(info) {
+	const usage = info?.usage ?? {};
+	const percent = usage.percent ?? null;
+	const tokens = usage.tokens ?? null;
+	const contextWindow = usage.contextWindow ?? null;
 	const p = percent === null || percent === undefined ? null : Math.max(0, Math.min(100, percent));
 	const r = 15.5;
 	const circumference = 2 * Math.PI * r;
 	if (p === null) {
 		contextRingFgEl.style.strokeDasharray = "0 999";
 		contextRingTextEl.textContent = "–";
-		contextBtnEl.title = "上下文使用量未知（等待下一轮回复后统计）";
-		return;
+	} else {
+		const dash = (p / 100) * circumference;
+		contextRingFgEl.style.strokeDasharray = `${dash} ${circumference}`;
+		contextRingFgEl.style.stroke = p >= 80 ? "#e5484d" : p >= 60 ? "#f5a524" : "#3b6ef5";
+		contextRingTextEl.textContent = p < 10 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
 	}
-	const dash = (p / 100) * circumference;
-	contextRingFgEl.style.strokeDasharray = `${dash} ${circumference}`;
-	contextRingFgEl.style.stroke = p >= 80 ? "#e5484d" : p >= 60 ? "#f5a524" : "#3b6ef5";
-	contextRingTextEl.textContent = p < 10 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
-	const mb = tokens !== null && tokens !== undefined ? (tokens / 1000).toFixed(1) : "?";
-	contextBtnEl.title = `上下文使用量：${p.toFixed(2)}% （约 ${mb}k tokens / ${(contextWindow / 1000).toFixed(0)}k 窗口）\n超过 80% 建议新开对话`;
+	// hover 完整信息（无法统计的字段显示空）
+	const fmtTokens = (v) => (v === null || v === undefined ? "" : `${(v / 1000).toFixed(1)}k`);
+	const rows = [
+		`模型：${info?.model ? info.model.name : ""}`,
+		`上下文窗口：${contextWindow ? `${(contextWindow / 1000).toFixed(0)}k tokens` : ""}`,
+		`已用：${p !== null ? `${p.toFixed(2)}%（${fmtTokens(tokens)} tokens）` : ""}`,
+		`缓存命中：${fmtTokens(info?.cacheRead)} tokens`,
+		`缓存写入：${fmtTokens(info?.cacheWrite)} tokens`,
+		`消息数：${info?.messageCount ?? ""}`,
+		`思考等级：${info?.thinkingLevel ?? ""}`,
+	];
+	contextBtnEl.title = rows.map((row) => row.replace(/^[^：]+：/, "") ? row : "").filter(Boolean).join("\n") || "上下文使用量";
 }
 
 async function pollContext() {
 	if (!sessionId) return;
 	try {
 		const info = await api(`/api/sessions/${sessionId}/context`);
-		const usage = info.usage;
-		renderContextRing(usage?.percent ?? null, usage?.tokens ?? null, usage?.contextWindow ?? null);
+		renderContextRing(info);
 	} catch {
 		/* 静默：会话可能刚切换 */
 	}
@@ -350,10 +399,13 @@ contextBtnEl.addEventListener("click", async () => {
 	try {
 		const info = await api(`/api/sessions/${sessionId}/context`);
 		const usage = info.usage ?? {};
+		const fmt = (v) => (v === null || v === undefined ? "（暂无统计）" : `${(v / 1000).toFixed(1)}k`);
 		const lines = [
 			`模型：${info.model ? `${info.model.name}（${info.model.provider}/${info.model.modelId}）` : "未配置"}`,
 			`上下文窗口：${usage.contextWindow ? (usage.contextWindow / 1000).toFixed(0) + "k tokens" : "未知"}`,
-			`已用：${usage.tokens !== null && usage.tokens !== undefined ? `${(usage.tokens / 1000).toFixed(1)}k tokens（${(usage.percent ?? 0).toFixed(2)}%）` : "未知"}`,
+			`已用：${usage.tokens !== null && usage.tokens !== undefined ? `${(usage.tokens / 1000).toFixed(1)}k tokens（${(usage.percent ?? 0).toFixed(2)}%）` : "（暂无统计）"}`,
+			`缓存命中：${fmt(info.cacheRead)} tokens`,
+			`缓存写入：${fmt(info.cacheWrite)} tokens`,
 			`消息数：${info.messageCount}`,
 			`思考等级：${info.thinkingLevel}`,
 			"",
