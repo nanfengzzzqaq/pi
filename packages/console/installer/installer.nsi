@@ -47,16 +47,24 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" ""
 Section "Install"
   SetOutPath "$INSTDIR"
 
-  ; staging 内容：node\、app\、两个启动器（vbs 用 ASCII 文件名，更新链 cmd 调用时不受代码页影响）
+  ; staging 内容：node\、app\、启动器（vbs 用 ASCII 文件名，更新链 cmd 调用时不受代码页影响）
   File /r "${STAGING}\node"
   File /r "${STAGING}\app"
   File "${STAGING}\Pi控制台.bat"
   File "${STAGING}\launcher.vbs"
+  ; 删除旧版本残留的浏览器模式 vbs，改为同内容（Edge App 模式）的新文件
+  Delete "$INSTDIR\Pi控制台.vbs"
+  File "${STAGING}\Pi控制台.vbs"
 
   ; 开始菜单 + 桌面快捷方式（指向 launcher.vbs：隐藏窗口并自动开客户端窗口）
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\卸载 ${APPNAME}.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
+  ; 旧桌面/开始菜单快捷方式若指向旧的 Pi控制台.vbs，重建为 launcher.vbs
+  Delete "$DESKTOP\${APPNAME}.lnk"
+  Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"
+  CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
   CreateShortcut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\launcher.vbs" "" "$INSTDIR\launcher.vbs"
 
   ; 注册卸载信息（当前用户）

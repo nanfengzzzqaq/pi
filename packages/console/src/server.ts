@@ -48,6 +48,10 @@ const PACKAGE_ROOT = join(import.meta.dirname, ".."); // packages/console
 const WEB_DIR = join(PACKAGE_ROOT, "web");
 /** 会话工作区根目录（DATA_DIR 可通过 PI_CONSOLE_DATA 外置，安装版指向用户目录） */
 const WORKSPACES_DIR = join(DATA_DIR, "workspaces");
+/** 会话文件目录（Pi 文件会话后端，重启可恢复） */
+const SESSION_DIR = join(DATA_DIR, "sessions");
+/** 会话索引：ourSessionId → { cwd, title, createdAt, updatedAt } */
+const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
 /**
  * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
@@ -87,6 +91,57 @@ interface ConsoleSession {
 }
 
 const sessions = new Map<string, ConsoleSession>();
+
+// ---------------------------------------------------------------------------
+// 会话索引（持久化：sessionId → cwd/title，支持列表与重启恢复）
+// ---------------------------------------------------------------------------
+
+interface SessionIndexEntry {
+	cwd: string;
+	/** Pi 会话文件路径（恢复消息用） */
+	sessionFile?: string;
+	title: string;
+	createdAt: number;
+	updatedAt: number;
+}
+
+function readSessionIndex(): Record<string, SessionIndexEntry> {
+	try {
+		const raw = JSON.parse(readFileSync(SESSION_INDEX_FILE, "utf8"));
+		if (typeof raw === "object" && raw !== null) return raw as Record<string, SessionIndexEntry>;
+	} catch {
+		/* 不存在或损坏 */
+	}
+	return {};
+}
+
+function writeSessionIndex(index: Record<string, SessionIndexEntry>): void {
+	mkdirSync(DATA_DIR, { recursive: true });
+	writeFileSync(SESSION_INDEX_FILE, `${JSON.stringify(index, null, "\t")}\n`, "utf8");
+}
+
+function touchSessionIndex(sessionId: string, cwd: string, sessionFile?: string): void {
+	const index = readSessionIndex();
+	const existing = index[sessionId];
+	index[sessionId] = {
+		cwd,
+		sessionFile: sessionFile ?? existing?.sessionFile,
+		title: existing?.title ?? "",
+		createdAt: existing?.createdAt ?? Date.now(),
+		updatedAt: Date.now(),
+	};
+	writeSessionIndex(index);
+}
+
+/** 首条 user 消息作为会话标题 */
+function updateSessionTitle(sessionId: string, text: string): void {
+	const index = readSessionIndex();
+	const entry = index[sessionId];
+	if (!entry || entry.title) return;
+	entry.title = text.replace(/\s+/g, " ").slice(0, 40);
+	entry.updatedAt = Date.now();
+	writeSessionIndex(index);
+}
 
 /** API Key 存储文件（控制台专属，与 agent settings 同目录；格式 Record<provider, {type:"api_key",key}>） */
 const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
@@ -213,15 +268,26 @@ function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [ke
 	}
 }
 
-async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
-	const sessionId = randomUUID();
-	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
-	const workspacePath = workspace.getWorkspacePath();
-	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
+/**
+ * 用给定 cwd 构建 AgentSession（新建或恢复共用）。
+ * sessionFile 存在时用 SessionManager.open 打开该会话文件（恢复消息），否则新建。
+ * 返回 { session, sessionFile, modelFallbackMessage }
+ */
+async function buildSession(
+	cwd: string,
+	modelOverride?: SessionModel,
+	sessionFile?: string,
+): Promise<{
+	session: AgentSession;
+	sessionFile: string | undefined;
+	modelFallbackMessage?: string;
+}> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
 
-	const sessionManager = SessionManager.inMemory(cwd);
+	const sessionManager = sessionFile
+		? SessionManager.open(sessionFile, SESSION_DIR, cwd)
+		: SessionManager.create(cwd, SESSION_DIR);
 	const options: {
 		cwd: string;
 		modelRuntime: ModelRuntime;
@@ -236,9 +302,10 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 		agentDir: CONSOLE_AGENT_DIR,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
 		customTools: instantiatePackTools({ getWorkspaceRoot: () => cwd }),
+		model: modelOverride,
 	};
 
-	if (MODEL_SPEC) {
+	if (!modelOverride && MODEL_SPEC) {
 		const slash = MODEL_SPEC.indexOf("/");
 		const provider = slash > 0 ? MODEL_SPEC.slice(0, slash) : "";
 		const modelId = slash > 0 ? MODEL_SPEC.slice(slash + 1) : "";
@@ -259,6 +326,15 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 
 	// 挂载语义：内置 4 个工具 + 已挂载包的工具；未挂载任何包 = 纯净原生 Pi
 	session.setActiveToolsByName(activeToolNames());
+	return { session, sessionFile: session.sessionFile, modelFallbackMessage };
+}
+
+async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
+	const sessionId = randomUUID();
+	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
+	const workspacePath = workspace.getWorkspacePath();
+	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
+	const { session, sessionFile, modelFallbackMessage } = await buildSession(cwd);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -268,6 +344,7 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 		sseClients: new Set(),
 	};
 	sessions.set(sessionId, cs);
+	touchSessionIndex(sessionId, cwd, sessionFile);
 
 	session.subscribe((ev) => {
 		const clientEvent = toClientEvent(ev);
@@ -280,6 +357,40 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 	}
 
 	return { sessionId, warning: modelFallbackMessage };
+}
+
+/** 按索引恢复历史会话（服务重启后内存 Map 为空时） */
+async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession | null> {
+	const index = readSessionIndex();
+	const entry = index[sessionId];
+	if (!entry) return null;
+	try {
+		const { session, modelFallbackMessage } = await buildSession(entry.cwd, undefined, entry.sessionFile);
+		const cs: ConsoleSession = {
+			sessionId,
+			session,
+			events: [],
+			nextSeq: 0,
+			sseClients: new Set(),
+		};
+		sessions.set(sessionId, cs);
+		session.subscribe((ev) => {
+			const clientEvent = toClientEvent(ev);
+			if (clientEvent) bufferAndBroadcast(cs, clientEvent);
+		});
+		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
+		return cs;
+	} catch (error) {
+		console.warn(`会话 ${sessionId} 恢复失败：${error instanceof Error ? error.message : String(error)}`);
+		return null;
+	}
+}
+
+/** 获取会话（内存 Map 优先，缺则尝试从磁盘恢复） */
+async function getOrRestoreSession(sessionId: string): Promise<ConsoleSession | null> {
+	const cs = sessions.get(sessionId);
+	if (cs) return cs;
+	return restoreConsoleSession(sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +697,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 }
 
 async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pathname: string): Promise<void> {
+	// GET /api/sessions — 历史会话列表（左侧"对话"栏）
+	if (req.method === "GET" && pathname === "/api/sessions") {
+		const index = readSessionIndex();
+		const list = Object.entries(index)
+			.map(([id, entry]) => ({
+				id,
+				title: entry.title || "新对话",
+				createdAt: entry.createdAt,
+				updatedAt: entry.updatedAt,
+				cwd: entry.cwd,
+				active: sessions.has(id),
+			}))
+			.sort((a, b) => b.updatedAt - a.updatedAt);
+		sendJson(res, 200, list);
+		return;
+	}
+
 	// POST /api/sessions — 创建会话
 	if (req.method === "POST" && pathname === "/api/sessions") {
 		const result = await createConsoleSession();
@@ -769,7 +897,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	}
 	const sessionId = match[1];
 	const action = match[2] ?? "";
-	const cs = sessions.get(sessionId);
+	const cs = await getOrRestoreSession(sessionId);
 	if (!cs) {
 		sendJson(res, 404, { error: "会话不存在，请刷新页面重新创建" });
 		return;
@@ -801,12 +929,44 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			}
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
+			updateSessionTitle(cs.sessionId, text);
 			cs.session.prompt(text, { images }).catch((error) => {
 				bufferAndBroadcast(cs, {
 					type: "error",
 					message: error instanceof Error ? error.message : String(error),
 				});
 			});
+			return;
+		}
+
+		// GET /api/sessions/:id/context — 上下文使用统计（本地估算，零 token 消耗）
+		case "GET context": {
+			const usage = cs.session.getContextUsage?.();
+			const model = cs.session.model;
+			sendJson(res, 200, {
+				usage: usage ?? null,
+				model: model
+					? { provider: model.provider, modelId: model.id, name: model.name, contextWindow: model.contextWindow }
+					: null,
+				messageCount: cs.session.messages.length,
+				thinkingLevel: cs.session.thinkingLevel,
+			});
+			return;
+		}
+
+		// POST /api/sessions/:id/attach-from-path — 把工作区/数据目录内的文件加入对话附件
+		case "POST attach-from-path": {
+			const body = (await readBodyJson(req)) as { path?: unknown };
+			if (typeof body?.path !== "string" || !body.path) {
+				sendJson(res, 400, { error: '请求体需为 {"path": "..."}' });
+				return;
+			}
+			try {
+				const file = fsExplorer.readFileAsBase64(body.path);
+				sendJson(res, 200, { ...file, name: body.path.split(/[\\/]/).pop() });
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+			}
 			return;
 		}
 

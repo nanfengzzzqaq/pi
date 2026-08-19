@@ -48,6 +48,11 @@ const fsTreeEl = $("fs-tree");
 const fsRefreshBtnEl = $("fs-refresh");
 const fsWorkspacePathEl = $("fs-workspace-path");
 const fsSetWorkspaceBtnEl = $("fs-set-workspace");
+const sessionsListEl = $("sessions-list");
+const sessionNewBtnEl = $("session-new-btn");
+const contextBtnEl = $("context-btn");
+const contextRingFgEl = $("context-ring-fg");
+const contextRingTextEl = $("context-ring-text");
 const workspaceInputEl = $("workspace-input");
 const workspaceSaveBtnEl = $("workspace-save-btn");
 const workspaceCurrentEl = $("workspace-current");
@@ -148,8 +153,9 @@ function renderHistory(history) {
 		} else if (item.role === "assistant") {
 			const container = appendMessage("assistant", item.text || "");
 			if (Array.isArray(item.toolCalls)) {
+				// 历史恢复：工具块直接挂消息体（无执行过程容器）
 				for (const call of item.toolCalls) {
-					appendToolBlock(container.el, call.id, call.name, call.args, "done");
+					container.el.appendChild(appendToolBlock(call.id, call.name, call.args, "done"));
 				}
 			}
 			if (item.errorMessage) showError(item.errorMessage);
@@ -211,6 +217,128 @@ async function refreshFromHistory() {
 }
 
 // ---------------------------------------------------------------------------
+// 左栏：对话列表（历史会话，点击切换）
+// ---------------------------------------------------------------------------
+
+async function loadSessions() {
+	try {
+		const list = await api("/api/sessions");
+		sessionsListEl.innerHTML = "";
+		if (list.length === 0) {
+			sessionsListEl.innerHTML = '<div class="skills-empty">暂无历史对话</div>';
+			return;
+		}
+		for (const session of list) {
+			const row = document.createElement("div");
+			row.className = `session-row${session.id === sessionId ? " active" : ""}`;
+			row.dataset.sid = session.id;
+			const title = document.createElement("div");
+			title.className = "session-title";
+			title.textContent = session.title;
+			const meta = document.createElement("div");
+			meta.className = "session-meta";
+			meta.textContent = `${new Date(session.updatedAt).toLocaleDateString("zh-CN")} ${session.active ? "· 当前" : ""}`;
+			row.appendChild(title);
+			row.appendChild(meta);
+			row.addEventListener("click", () => switchSession(session.id));
+			sessionsListEl.appendChild(row);
+		}
+	} catch (error) {
+		sessionsListEl.textContent = `加载失败：${error.message}`;
+	}
+}
+
+/** 切换到历史会话（服务端从磁盘恢复，消息与 SSE 随之切换） */
+async function switchSession(id) {
+	if (id === sessionId) return;
+	sessionId = id;
+	localStorage.setItem(SESSION_KEY, id);
+	clearMessages();
+	lastSeq = -1;
+	try {
+		await ensureSession();
+		connectSSE();
+		await loadSessions();
+		await pollContext();
+	} catch (error) {
+		showError(`切换对话失败：${error.message}`);
+	}
+}
+
+sessionNewBtnEl.addEventListener("click", async () => {
+	try {
+		const result = await api("/api/sessions", { method: "POST", body: "{}" });
+		sessionId = result.sessionId;
+		localStorage.setItem(SESSION_KEY, sessionId);
+		clearMessages();
+		lastSeq = -1;
+		await ensureSession();
+		connectSSE();
+		await loadSessions();
+		await pollContext();
+	} catch (error) {
+		showError(`新建对话失败：${error.message}`);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// 上下文使用量圆环（本地估算，零 token 消耗）
+// ---------------------------------------------------------------------------
+
+/** 更新圆环：percent 0-100；usage 为 null（未知）时显示 – */
+function renderContextRing(percent, tokens, contextWindow) {
+	const p = percent === null || percent === undefined ? null : Math.max(0, Math.min(100, percent));
+	const r = 15.5;
+	const circumference = 2 * Math.PI * r;
+	if (p === null) {
+		contextRingFgEl.style.strokeDasharray = "0 999";
+		contextRingTextEl.textContent = "–";
+		contextBtnEl.title = "上下文使用量未知（等待下一轮回复后统计）";
+		return;
+	}
+	const dash = (p / 100) * circumference;
+	contextRingFgEl.style.strokeDasharray = `${dash} ${circumference}`;
+	contextRingFgEl.style.stroke = p >= 80 ? "#e5484d" : p >= 60 ? "#f5a524" : "#3b6ef5";
+	contextRingTextEl.textContent = p < 10 ? `${p.toFixed(1)}%` : `${Math.round(p)}%`;
+	const mb = tokens !== null && tokens !== undefined ? (tokens / 1000).toFixed(1) : "?";
+	contextBtnEl.title = `上下文使用量：${p.toFixed(2)}% （约 ${mb}k tokens / ${(contextWindow / 1000).toFixed(0)}k 窗口）\n超过 80% 建议新开对话`;
+}
+
+async function pollContext() {
+	if (!sessionId) return;
+	try {
+		const info = await api(`/api/sessions/${sessionId}/context`);
+		const usage = info.usage;
+		renderContextRing(usage?.percent ?? null, usage?.tokens ?? null, usage?.contextWindow ?? null);
+	} catch {
+		/* 静默：会话可能刚切换 */
+	}
+}
+
+contextBtnEl.addEventListener("click", async () => {
+	if (!sessionId) return;
+	try {
+		const info = await api(`/api/sessions/${sessionId}/context`);
+		const usage = info.usage ?? {};
+		const lines = [
+			`模型：${info.model ? `${info.model.name}（${info.model.provider}/${info.model.modelId}）` : "未配置"}`,
+			`上下文窗口：${usage.contextWindow ? (usage.contextWindow / 1000).toFixed(0) + "k tokens" : "未知"}`,
+			`已用：${usage.tokens !== null && usage.tokens !== undefined ? `${(usage.tokens / 1000).toFixed(1)}k tokens（${(usage.percent ?? 0).toFixed(2)}%）` : "未知"}`,
+			`消息数：${info.messageCount}`,
+			`思考等级：${info.thinkingLevel}`,
+			"",
+			"统计为本地估算（按消息内容推算 token 数），不产生任何 API 请求、不额外消耗 token。",
+		];
+		showInfo(lines.join("\n"));
+	} catch (error) {
+		showError(`获取上下文统计失败：${error.message}`);
+	}
+});
+
+// 每 5 秒刷新一次上下文圆环
+setInterval(pollContext, 5000);
+
+// ---------------------------------------------------------------------------
 // 事件处理
 // ---------------------------------------------------------------------------
 
@@ -226,7 +354,8 @@ function handleEvent(event) {
 			break;
 		case "tool_execution_start":
 			setIndicator(false);
-			appendToolBlock(ensureAssistant().el, event.toolCallId, event.toolName, event.args, "running");
+			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
+			ensureAssistant().addTool(appendToolBlock(event.toolCallId, event.toolName, event.args, "running"));
 			break;
 		case "tool_execution_end": {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(event.toolCallId)}"]`);
@@ -235,10 +364,12 @@ function handleEvent(event) {
 		}
 		case "turn_end":
 			if (event.stopReason === "error") showError(event.errorMessage || "模型返回错误");
+			if (currentAssistant) currentAssistant.foldProcess();
 			currentAssistant = null;
 			setIndicator(false);
 			break;
 		case "agent_settled":
+			if (currentAssistant) currentAssistant.foldProcess();
 			setRunning(false);
 			setIndicator(false);
 			break;
@@ -296,6 +427,17 @@ function appendMessage(role, text) {
 	thinking.hidden = true;
 	if (role === "assistant") bubble.appendChild(thinking);
 
+	// 执行过程区（assistant 专用：一轮里的全部工具调用，运行中展开、完成折叠）
+	let processWrap = null;
+	let processBody = null;
+	let processCount = 0;
+	if (role === "assistant") {
+		processWrap = document.createElement("div");
+		processWrap.className = "process-block";
+		processWrap.hidden = true;
+		bubble.appendChild(processWrap);
+	}
+
 	// 正文
 	const textEl = document.createElement("div");
 	textEl.className = "text";
@@ -311,6 +453,59 @@ function appendMessage(role, text) {
 		el: bubble,
 		thinkingEl: thinking,
 		textEl,
+		/** 挂载工具块到执行过程区 */
+		addTool(toolBlock) {
+			if (!processWrap) return;
+			processCount++;
+			// 首个工具：构建容器头（运行中展开）
+			if (processCount === 1) {
+				processWrap.innerHTML = "";
+				const head = document.createElement("div");
+				head.className = "process-head";
+				const chevron = document.createElement("span");
+				chevron.className = "tool-chevron";
+				chevron.textContent = "▾";
+				const label = document.createElement("span");
+				label.className = "process-label";
+				label.textContent = "⚙ 执行过程";
+				const countEl = document.createElement("span");
+				countEl.className = "process-count";
+				countEl.textContent = "1 步";
+				const copyAll = document.createElement("button");
+				copyAll.className = "copy-btn";
+				copyAll.textContent = "⧉";
+				copyAll.title = "复制全部执行过程";
+				copyAll.dataset.copy = "process";
+				head.appendChild(chevron);
+				head.appendChild(label);
+				head.appendChild(countEl);
+				head.appendChild(copyAll);
+				head.addEventListener("click", () => {
+					processBody.hidden = !processBody.hidden;
+					chevron.textContent = processBody.hidden ? "▸" : "▾";
+				});
+				processWrap.appendChild(head);
+				processBody = document.createElement("div");
+				processBody.className = "process-body";
+				processWrap.appendChild(processBody);
+				processWrap.hidden = false;
+			} else {
+				const countEl = processWrap.querySelector(".process-count");
+				if (countEl) countEl.textContent = `${processCount} 步`;
+			}
+			processBody.appendChild(toolBlock);
+			scrollToBottom();
+		},
+		/** 一轮结束：执行过程默认折叠（用户可点开） */
+		foldProcess() {
+			if (!processWrap || processWrap.hidden) return;
+			const body = processWrap.querySelector(".process-body");
+			const chevron = processWrap.querySelector(".tool-chevron");
+			if (body && !body.hidden) {
+				body.hidden = true;
+				if (chevron) chevron.textContent = "▸";
+			}
+		},
 		_appendThinking(delta) {
 			if (!this._thinkingOpen) {
 				this._thinkingOpen = true;
@@ -541,7 +736,7 @@ function renderMarkdownInto(el, text, options = {}) {
 // 工具调用块（可折叠）
 // ---------------------------------------------------------------------------
 
-function appendToolBlock(bubble, toolCallId, toolName, args, status) {
+function appendToolBlock(toolCallId, toolName, args, status) {
 	const block = document.createElement("div");
 	block.className = "tool-block running";
 	block.dataset.toolCallId = toolCallId;
@@ -550,20 +745,28 @@ function appendToolBlock(bubble, toolCallId, toolName, args, status) {
 	header.className = "tool-header";
 	const chevron = document.createElement("span");
 	chevron.className = "tool-chevron";
-	chevron.textContent = "▾";
+	chevron.textContent = "▸";
 	const nameEl = document.createElement("span");
 	nameEl.className = "tool-name";
 	nameEl.textContent = `⚙ ${toolName}`;
 	const statusEl = document.createElement("span");
 	statusEl.className = "tool-status";
 	statusEl.textContent = status === "running" ? "运行中…" : "已结束";
+	const copyBtn = document.createElement("button");
+	copyBtn.className = "copy-btn";
+	copyBtn.textContent = "⧉";
+	copyBtn.title = "复制该执行步骤（命令与结果）";
+	copyBtn.dataset.copy = "tool";
 	header.appendChild(chevron);
 	header.appendChild(nameEl);
 	header.appendChild(statusEl);
+	header.appendChild(copyBtn);
 	block.appendChild(header);
 
 	const body = document.createElement("div");
 	body.className = "tool-body";
+	// 默认折叠：只显示状态行，点开看参数与结果
+	body.hidden = true;
 
 	const argsEl = document.createElement("div");
 	argsEl.className = "tool-args";
@@ -576,14 +779,23 @@ function appendToolBlock(bubble, toolCallId, toolName, args, status) {
 	body.appendChild(resultEl);
 
 	block.appendChild(body);
-	header.addEventListener("click", () => {
+	header.addEventListener("click", (e) => {
+		if (e.target.closest(".copy-btn")) return;
 		body.hidden = !body.hidden;
 		chevron.textContent = body.hidden ? "▸" : "▾";
 	});
 
-	bubble.appendChild(block);
-	scrollToBottom();
 	return block;
+}
+
+/** 结果文本里的文件路径渲染为可点击链接（点击加入对话/预览） */
+function renderResultText(resultText) {
+	const escaped = escapeHtml(resultText);
+	// 常见路径形态：绝对路径 / 相对路径 + 常见文件扩展名
+	return escaped.replace(
+		/((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])[\w\-. \\/\\()（）【】\[\]]+\.(?:docx|xlsx|pptx|txt|md|json|js|ts|py|csv|png|jpg|jpeg|gif|webp|pdf|log))/g,
+		'<a class="file-link" data-path="$1" title="点击查看/添加到对话">📄 $1</a>',
+	);
 }
 
 function updateToolBlock(block, isError, resultText) {
@@ -593,8 +805,59 @@ function updateToolBlock(block, isError, resultText) {
 	if (statusEl) statusEl.textContent = isError ? "失败" : "成功";
 	const resultEl = block.querySelector(".tool-result");
 	if (resultEl && resultText) {
-		resultEl.textContent = resultText;
+		resultEl.innerHTML = renderResultText(resultText);
 		resultEl.hidden = false;
+	}
+}
+
+/** 复制：消息 / 代码块 / 工具步骤 / 整个执行过程 */
+function copyTextFrom(btn) {
+	let text = "";
+	const mode = btn.dataset.copy;
+	if (mode === "msg") {
+		const textEl = btn.closest(".bubble")?.querySelector(".text");
+		text = textEl ? textEl.innerText : "";
+	} else if (mode === "code") {
+		const codeEl = btn.closest("pre")?.querySelector("code");
+		text = codeEl ? codeEl.innerText : "";
+	} else if (mode === "tool") {
+		const block = btn.closest(".tool-block");
+		if (block) {
+			const args = block.querySelector(".tool-args")?.textContent ?? "";
+			const result = block.querySelector(".tool-result")?.innerText ?? "";
+			const name = block.querySelector(".tool-name")?.textContent ?? "";
+			text = `${name}\n命令/参数：${args}\n${result ? `结果：\n${result}` : ""}`;
+		}
+	} else if (mode === "process") {
+		const body = btn.closest(".process-block")?.querySelector(".process-body");
+		if (body) {
+			text = body.innerText;
+		}
+	}
+	if (!text) return false;
+	navigator.clipboard.writeText(text).then(() => showInfo(`已复制（${text.length} 字符）`)).catch(() => showError("复制失败"));
+	return true;
+}
+
+/** 点击文件链接：读文件加入对话附件 */
+async function attachPathLink(path) {
+	if (!sessionId) return;
+	try {
+		const file = await api(`/api/sessions/${sessionId}/attach-from-path`, {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		});
+		pendingAttachments.push({
+			name: file.name,
+			mimeType: file.mimeType,
+			dataBase64: file.dataBase64,
+			size: file.size,
+			isImage: IMAGE_MIME.has(file.mimeType),
+		});
+		renderAttachments();
+		showInfo(`已将 ${file.name} 添加到对话附件`);
+	} catch (error) {
+		showError(`读取文件失败：${error.message}`);
 	}
 }
 
@@ -692,22 +955,15 @@ collapseBtnEl.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 messagesEl.addEventListener("click", (e) => {
-	const btn = e.target.closest("[data-copy]");
-	if (!btn) return;
-	let text = "";
-	if (btn.dataset.copy === "msg") {
-		const bubble = btn.closest(".bubble");
-		const textEl = bubble?.querySelector(".text");
-		text = textEl ? textEl.innerText : "";
-	} else if (btn.dataset.copy === "code") {
-		const codeEl = btn.closest("pre")?.querySelector("code");
-		text = codeEl ? codeEl.innerText : "";
+	// 文件链接：读取并加入对话附件
+	const fileLink = e.target.closest("[data-path]");
+	if (fileLink) {
+		e.preventDefault();
+		attachPathLink(fileLink.dataset.path);
+		return;
 	}
-	if (!text) return;
-	navigator.clipboard
-		.writeText(text)
-		.then(() => showInfo(`已复制（${text.length} 字符）`))
-		.catch(() => showError("复制失败"));
+	const btn = e.target.closest("[data-copy]");
+	if (btn) copyTextFrom(btn);
 });
 
 // ---------------------------------------------------------------------------
@@ -829,6 +1085,7 @@ async function sendMessage() {
 			method: "POST",
 			body: JSON.stringify({ text: text + attachmentLine, images }),
 		});
+		loadSessions(); // 首条消息后标题更新，刷新左侧对话列表
 	} catch (error) {
 		showError(error.message);
 		setRunning(false);
@@ -1040,22 +1297,20 @@ function openAssistantsModal() {
 			actions.className = "pack-option-actions";
 			const useBtn = document.createElement("button");
 			useBtn.className = pack.mounted ? "secondary-btn small" : "primary-btn small";
-			useBtn.textContent = pack.mounted ? "停用" : "启用";
+			useBtn.textContent = pack.mounted ? "以此助手开新对话" : "启用并开新对话";
+			useBtn.title = "挂载该助手并新建一个会话（历史对话保留在左侧）";
 			useBtn.addEventListener("click", async () => {
-				await togglePack(pack);
-				openAssistantsModal(); // 重新渲染弹窗列表
+				await useAssistantInNewSession(pack);
 			});
 			actions.appendChild(useBtn);
-			if (pack.mounted) {
-				const detailBtn = document.createElement("button");
-				detailBtn.className = "secondary-btn small";
-				detailBtn.textContent = "能力详情";
-				detailBtn.addEventListener("click", () => {
-					closeAssistantsModal();
-					openDrawer(pack.name);
-				});
-				actions.appendChild(detailBtn);
-			}
+			const detailBtn = document.createElement("button");
+			detailBtn.className = "secondary-btn small";
+			detailBtn.textContent = "能力详情";
+			detailBtn.addEventListener("click", () => {
+				closeAssistantsModal();
+				openDrawer(pack.name);
+			});
+			actions.appendChild(detailBtn);
 
 			item.appendChild(main);
 			item.appendChild(actions);
@@ -1063,6 +1318,28 @@ function openAssistantsModal() {
 		}
 	}
 	assistantsModalEl.hidden = false;
+}
+
+/** "添加助手" = 挂载助手并新建一个会话，在新会话里与助手沟通 */
+async function useAssistantInNewSession(pack) {
+	try {
+		if (!pack.mounted) {
+			await api(`/api/packs/${pack.name}/mount`, { method: "POST", body: "{}" });
+			pack.mounted = true;
+		}
+		const result = await api("/api/sessions", { method: "POST", body: "{}" });
+		sessionId = result.sessionId;
+		localStorage.setItem(SESSION_KEY, sessionId);
+		clearMessages();
+		lastSeq = -1;
+		await ensureSession();
+		connectSSE();
+		closeAssistantsModal();
+		showInfo(`已用「${pack.displayName}」开启新对话`);
+		await Promise.all([loadSessions(), loadAssistants(), loadContextPanel()]);
+	} catch (error) {
+		showError(`开启新对话失败：${error.message}`);
+	}
 }
 
 function closeAssistantsModal() {
@@ -1597,13 +1874,14 @@ updateRunBtnEl.addEventListener("click", async () => {
 
 (async function init() {
 	try {
-		await Promise.all([loadModels(), loadAssistants(), loadFsRoots(), loadContextPanel()]);
+		await Promise.all([loadModels(), loadAssistants(), loadFsRoots(), loadContextPanel(), loadSessions()]);
 		await ensureSession();
 		connectSSE();
 		inputEl.disabled = false;
 		sendBtn.disabled = false;
 		modelSelectEl.disabled = false;
 		thinkingSelectEl.disabled = false;
+		pollContext();
 		inputEl.focus();
 	} catch (error) {
 		showError(`初始化失败：${error.message}`);
