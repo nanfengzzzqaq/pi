@@ -46,6 +46,11 @@ const assistantsListEl = $("assistants-list");
 const fsRootSelectEl = $("fs-root-select");
 const fsTreeEl = $("fs-tree");
 const fsRefreshBtnEl = $("fs-refresh");
+const fsWorkspacePathEl = $("fs-workspace-path");
+const fsSetWorkspaceBtnEl = $("fs-set-workspace");
+const workspaceInputEl = $("workspace-input");
+const workspaceSaveBtnEl = $("workspace-save-btn");
+const workspaceCurrentEl = $("workspace-current");
 const previewModalEl = $("preview-modal");
 const previewTitleEl = $("preview-title");
 const previewContentEl = $("preview-content");
@@ -1065,6 +1070,7 @@ async function loadContextPanel() {
 // ---------------------------------------------------------------------------
 
 let fsRoots = [];
+let currentFsPath = null; // 文件管理器当前浏览的目录
 
 async function loadFsRoots() {
 	try {
@@ -1077,12 +1083,69 @@ async function loadFsRoots() {
 			fsRootSelectEl.appendChild(option);
 		}
 		if (fsRoots.length > 0) await loadFsDir(fsRoots[0].path);
+		await loadWorkspaceState();
 	} catch (error) {
 		fsTreeEl.textContent = `加载失败：${error.message}`;
 	}
 }
 
+/** 工作区状态（文件面板行 + 设置弹窗） */
+async function loadWorkspaceState() {
+	try {
+		const info = await api("/api/workspace");
+		const path = info.path;
+		if (path) {
+			fsWorkspacePathEl.textContent = path;
+			fsWorkspacePathEl.title = path;
+			workspaceCurrentEl.textContent = `当前：${path}`;
+			workspaceInputEl.placeholder = path;
+		} else {
+			fsWorkspacePathEl.textContent = "（未设置）";
+			workspaceCurrentEl.textContent = "当前：未设置（默认工作区）";
+			workspaceInputEl.placeholder = "例如 D:\\projects\\myapp（留空并保存 = 清除工作区）";
+		}
+	} catch {
+		/* 忽略 */
+	}
+}
+
+/** 把当前浏览目录设为工作区 */
+fsSetWorkspaceBtnEl.addEventListener("click", async () => {
+	if (!currentFsPath) {
+		showError("请先在文件面板浏览到一个目录");
+		return;
+	}
+	try {
+		const result = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: currentFsPath }) });
+		showInfo(`工作区已设为 ${result.path}，新会话将在此目录工作`);
+		await loadWorkspaceState();
+		await loadFsRoots();
+	} catch (error) {
+		showError(`设置工作区失败：${error.message}`);
+	}
+});
+
+/** 设置弹窗：保存工作区 */
+workspaceSaveBtnEl.addEventListener("click", async () => {
+	workspaceSaveBtnEl.disabled = true;
+	try {
+		const result = await api("/api/workspace", {
+			method: "POST",
+			body: JSON.stringify({ path: workspaceInputEl.value.trim() }),
+		});
+		workspaceInputEl.value = "";
+		showInfo(result.path ? `工作区已设为 ${result.path}` : "已清除工作区（使用默认）");
+		await loadWorkspaceState();
+		await loadFsRoots();
+	} catch (error) {
+		showError(`保存工作区失败：${error.message}`);
+	} finally {
+		workspaceSaveBtnEl.disabled = false;
+	}
+});
+
 async function loadFsDir(path) {
+	currentFsPath = path;
 	try {
 		const result = await api(`/api/fs/list?path=${encodeURIComponent(path)}`);
 		fsTreeEl.innerHTML = "";

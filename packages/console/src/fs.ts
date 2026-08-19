@@ -9,6 +9,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve, sep } from "node:path";
 import { DATA_DIR } from "./paths.ts";
+import { getWorkspacePath } from "./workspace.ts";
 
 const MAX_READ_BYTES = 10 * 1024 * 1024;
 
@@ -17,14 +18,20 @@ function configuredRoots(): string[] {
 	return extra ? [resolve(extra)] : [];
 }
 
-/** 可浏览的根目录列表 */
+/** 工作区（用户自定义）作为第一浏览根 */
+function workspaceRoots(): string[] {
+	const path = getWorkspacePath();
+	return path ? [path] : [];
+}
+
+/** 可浏览的根目录列表（工作区优先，其次数据目录与配置根） */
 export function listRoots(): Array<{ path: string; name: string }> {
-	const roots = [DATA_DIR, ...configuredRoots()];
+	const roots = [...workspaceRoots(), DATA_DIR, ...configuredRoots()];
 	return roots.map((path) => ({ path, name: basename(path) || path }));
 }
 
 function withinRoots(absPath: string): string | null {
-	const roots = [DATA_DIR, ...configuredRoots()];
+	const roots = [...workspaceRoots(), DATA_DIR, ...configuredRoots()];
 	for (const root of roots) {
 		if (absPath === root || absPath.startsWith(root + sep)) return root;
 	}
