@@ -2721,8 +2721,16 @@ async function loadVersionSection() {
 	}
 	try {
 		const tokenInfo = await api("/api/app/github-token");
-		githubTokenClearBtnEl.hidden = !tokenInfo.configured;
-		if (tokenInfo.configured) githubTokenInputEl.placeholder = "已保存 GitHub Token（输入可替换）";
+		githubTokenClearBtnEl.hidden = !tokenInfo.saved;
+		if (tokenInfo.source === "gh-cli") {
+			githubTokenInputEl.placeholder = "已使用本机 GitHub 登录";
+		} else if (tokenInfo.source === "environment") {
+			githubTokenInputEl.placeholder = "已使用系统中的 GitHub 登录";
+		} else if (tokenInfo.source === "saved") {
+			githubTokenInputEl.placeholder = "已保存 GitHub Token（输入可替换）";
+		} else {
+			githubTokenInputEl.placeholder = "GitHub Token（备用，可选）";
+		}
 	} catch {
 		/* 忽略 */
 	}
@@ -2748,7 +2756,7 @@ githubTokenClearBtnEl.addEventListener("click", async () => {
 	try {
 		await api("/api/app/github-token", { method: "DELETE" });
 		showInfo("已清除 GitHub Token");
-		githubTokenInputEl.placeholder = "GitHub Token（ghp_…，可选）";
+		githubTokenInputEl.placeholder = "GitHub Token（备用，可选）";
 		await loadVersionSection();
 	} catch (error) {
 		showError(`清除失败：${error.message}`);
@@ -2762,7 +2770,13 @@ updateCheckBtnEl.addEventListener("click", async () => {
 	try {
 		const info = await api("/api/app/update-check");
 		if (info.latest === null) {
-			updateStatusEl.textContent = "无法连接 GitHub 检查更新（网络问题或限流），请稍后再试";
+			if (info.error === "authentication") {
+				updateStatusEl.textContent = "GitHub 登录无效或没有此仓库的读取权限";
+			} else if (info.error === "network") {
+				updateStatusEl.textContent = "无法连接 GitHub；请确认系统代理正在运行后重试";
+			} else {
+				updateStatusEl.textContent = `GitHub 暂时无法完成更新检查${info.httpStatus ? `（HTTP ${info.httpStatus}）` : ""}`;
+			}
 		} else if (info.updateAvailable) {
 			updateStatusEl.textContent = `发现新版本 v${info.latest}（当前 v${info.current}）`;
 			updateRunBtnEl.hidden = false;

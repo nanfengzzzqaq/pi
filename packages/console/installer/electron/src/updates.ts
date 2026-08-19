@@ -6,7 +6,7 @@
  * （等 2 秒让本进程退出释放 node.exe → 运行 Setup /S → 重启 vbs 启动器）
  * → 本进程 exit。
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
@@ -43,6 +43,8 @@ export interface UpdateInfo {
 	assetName: string | null;
 	assetSize: number | null;
 	notes: string | null;
+	error: "authentication" | "network" | "github" | null;
+	httpStatus: number | null;
 }
 
 /**
@@ -51,7 +53,20 @@ export interface UpdateInfo {
  */
 const TOKEN_FILE = join(DATA_DIR, "agent", "github-token.txt");
 
-export function githubToken(): string | null {
+export type GithubAuthSource = "saved" | "environment" | "gh-cli";
+
+export interface GithubCredential {
+	token: string;
+	source: GithubAuthSource;
+}
+
+interface GithubCredentialOptions {
+	readSavedToken?: () => string | null;
+	environment?: NodeJS.ProcessEnv;
+	readCliToken?: () => string | null;
+}
+
+function readSavedGithubToken(): string | null {
 	try {
 		const token = readFileSync(TOKEN_FILE, "utf8").trim();
 		return token || null;
@@ -60,9 +75,50 @@ export function githubToken(): string | null {
 	}
 }
 
+function readGithubCliToken(): string | null {
+	try {
+		const token = execFileSync("gh", ["auth", "token", "--hostname", "github.com"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 3000,
+			windowsHide: true,
+		}).trim();
+		return token || null;
+	} catch {
+		return null;
+	}
+}
+
+/** Resolve GitHub authentication without exposing the token to the browser. */
+export function resolveGithubCredential(options: GithubCredentialOptions = {}): GithubCredential | null {
+	const readSavedToken = options.readSavedToken ?? readSavedGithubToken;
+	const environment = options.environment ?? process.env;
+	const readCliToken = options.readCliToken ?? readGithubCliToken;
+
+	const saved = readSavedToken()?.trim();
+	if (saved) return { token: saved, source: "saved" };
+	const environmentToken = (environment.GH_TOKEN ?? environment.GITHUB_TOKEN)?.trim();
+	if (environmentToken) return { token: environmentToken, source: "environment" };
+	const cli = readCliToken()?.trim();
+	return cli ? { token: cli, source: "gh-cli" } : null;
+}
+
+export function githubToken(): string | null {
+	return resolveGithubCredential()?.token ?? null;
+}
+
+export function githubAuthStatus(): { configured: boolean; source: GithubAuthSource | null; saved: boolean } {
+	const credential = resolveGithubCredential();
+	return {
+		configured: credential !== null,
+		source: credential?.source ?? null,
+		saved: readSavedGithubToken() !== null,
+	};
+}
+
 export function setGithubToken(token: string): void {
 	mkdirSync(join(DATA_DIR, "agent"), { recursive: true });
-	writeFileSync(TOKEN_FILE, token, "utf8");
+	writeFileSync(TOKEN_FILE, token, { encoding: "utf8", mode: 0o600 });
 }
 
 export function clearGithubToken(): boolean {
@@ -72,18 +128,20 @@ export function clearGithubToken(): boolean {
 }
 
 /** GitHub 请求公共头（带可选令牌） */
-function githubHeaders(): Record<string, string> {
+function githubHeaders(credential: GithubCredential | null = resolveGithubCredential()): Record<string, string> {
 	const headers: Record<string, string> = { "User-Agent": "pi-console" };
-	const token = githubToken();
-	if (token) headers.Authorization = `Bearer ${token}`;
+	if (credential) headers.Authorization = `Bearer ${credential.token}`;
 	return headers;
 }
 
 /** 通过 302 跳转拿最新 tag（GitHub API 匿名限流时的降级路径） */
-async function latestTagViaRedirect(): Promise<string | null> {
+async function latestTagViaRedirect(
+	fetchImpl: typeof fetch,
+	credential: GithubCredential | null,
+): Promise<string | null> {
 	try {
-		const res = await fetch(`https://github.com/${REPO}/releases/latest`, {
-			headers: githubHeaders(),
+		const res = await fetchImpl(`https://github.com/${REPO}/releases/latest`, {
+			headers: githubHeaders(credential),
 			redirect: "manual",
 			signal: AbortSignal.timeout(15000),
 		});
@@ -105,7 +163,14 @@ function compareVersions(a: string, b: string): number {
 	return 0;
 }
 
-export async function checkUpdate(): Promise<UpdateInfo> {
+interface CheckUpdateOptions {
+	fetch?: typeof fetch;
+	credential?: GithubCredential | null;
+}
+
+export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<UpdateInfo> {
+	const fetchImpl = options.fetch ?? fetch;
+	const credential = options.credential === undefined ? resolveGithubCredential() : options.credential;
 	const info: UpdateInfo = {
 		current: APP_VERSION,
 		latest: null,
@@ -115,15 +180,19 @@ export async function checkUpdate(): Promise<UpdateInfo> {
 		assetName: null,
 		assetSize: null,
 		notes: null,
+		error: null,
+		httpStatus: null,
 	};
 
 	let tag: string | null = null;
 	let assets: ReleaseAsset[] = [];
+	let networkFailed = false;
 	try {
-		const res = await fetch(GITHUB_LATEST_API, {
-			headers: { ...githubHeaders(), Accept: "application/vnd.github+json" },
+		const res = await fetchImpl(GITHUB_LATEST_API, {
+			headers: { ...githubHeaders(credential), Accept: "application/vnd.github+json" },
 			signal: AbortSignal.timeout(15000),
 		});
+		info.httpStatus = res.status;
 		if (res.ok) {
 			const release = (await res.json()) as { tag_name?: string; assets?: ReleaseAsset[]; body?: string };
 			tag = release.tag_name ?? null;
@@ -131,11 +200,20 @@ export async function checkUpdate(): Promise<UpdateInfo> {
 			info.notes = release.body ?? null;
 		}
 	} catch {
-		/* 走降级 */
+		networkFailed = true;
 	}
-	if (!tag) tag = await latestTagViaRedirect();
+	if (!tag) tag = await latestTagViaRedirect(fetchImpl, credential);
 
-	if (!tag) return info; // 网络不可达：latest 为 null，不确定
+	if (!tag) {
+		if (info.httpStatus === 401 || info.httpStatus === 403 || (info.httpStatus === 404 && !credential)) {
+			info.error = "authentication";
+		} else if (networkFailed || info.httpStatus === null) {
+			info.error = "network";
+		} else {
+			info.error = "github";
+		}
+		return info;
+	}
 	info.latest = tag.replace(/^v/, "");
 
 	const asset = assets.find((a) => /Setup-.*\.exe$/i.test(a.name));
@@ -176,7 +254,8 @@ export async function runUpdate(): Promise<void> {
 	if (progress.running) return;
 	progress = { running: true, receivedBytes: 0, totalBytes: null, error: null, phase: "downloading" };
 	try {
-		const info = await checkUpdate();
+		const credential = resolveGithubCredential();
+		const info = await checkUpdate({ credential });
 		if (!info.assetUrl) throw new Error("无法获得更新包下载地址（GitHub 不可达或 Release 缺少 Setup 资产）");
 		if (info.updateAvailable === false) throw new Error(`当前已是最新版 v${APP_VERSION}`);
 
@@ -186,8 +265,8 @@ export async function runUpdate(): Promise<void> {
 
 		// 带 token 时优先走 Assets API（私有仓库 browser_download_url 直链会 404）；
 		// 无 token（公开仓库）用 browser_download_url 直链
-		const downloadUrl = githubToken() && info.assetApiUrl ? info.assetApiUrl : info.assetUrl;
-		const downloadHeaders = githubHeaders();
+		const downloadUrl = credential && info.assetApiUrl ? info.assetApiUrl : info.assetUrl;
+		const downloadHeaders = githubHeaders(credential);
 		if (downloadUrl === info.assetApiUrl) downloadHeaders.Accept = "application/octet-stream";
 
 		const res = await fetch(downloadUrl, {

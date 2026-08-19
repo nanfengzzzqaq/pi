@@ -40,12 +40,12 @@ export default function definePack(ctx: PackContext) {
 
 	const tools: ToolDefinition[] = [
 		{
-			// 元工具（触发式加载）：挂载后上下文里只有它，模型处理文档任务时调用一次，
-			// 才激活下面 13 个完整工具——日常闲聊不付工具 schema 的 token。
+			// 兼容旧能力包协议的元工具。当前版本由 pack.json 的 activation/toolGroups
+			// 在每轮请求前完成本地筛选；新会话不会把这个工具送给模型。
 			name: "office_enable",
-			label: "启用 Office 文档能力",
+			label: "兼容启用 Office 文档能力",
 			description:
-				"当用户要求创建、查看或编辑 Word/Excel/PowerPoint 文档（docx/xlsx/pptx）时，先调用本工具一次以启用完整 Office 工具组。纯聊天或与文档无关的请求不要调用。",
+				"兼容旧会话的 Office 能力启用入口。新会话由能力清单自动选择最小工具组，不需要调用本工具。",
 			parameters: Type.Object({}),
 			execute: async () => {
 				ctx.activatePack?.("office-assistant");

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as undici from "undici";
 
@@ -15,6 +16,74 @@ export const HTTP_IDLE_TIMEOUT_CHOICES = [
 
 const originalGlobalFetch = globalThis.fetch;
 let installedGlobalFetch: typeof globalThis.fetch | undefined;
+
+export interface SystemHttpProxySettings {
+	httpProxy?: string;
+	httpsProxy?: string;
+}
+
+const WINDOWS_INTERNET_SETTINGS_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+const LOOPBACK_NO_PROXY_HOSTS = ["localhost", "127.0.0.1", "::1"] as const;
+
+function normalizeProxyUrl(value: string | undefined): string | undefined {
+	const proxy = value?.trim();
+	if (!proxy) return undefined;
+	return /^[a-z][a-z\d+.-]*:\/\//iu.test(proxy) ? proxy : `http://${proxy}`;
+}
+
+/** Parse the WinINET proxy values emitted by `reg.exe query`. */
+export function parseWindowsSystemProxy(output: string): SystemHttpProxySettings | undefined {
+	const enabledMatch = output.match(/^\s*ProxyEnable\s+REG_DWORD\s+(\S+)\s*$/imu);
+	if (!enabledMatch || Number(enabledMatch[1] ?? 0) !== 1) return undefined;
+	const server = output.match(/^\s*ProxyServer\s+REG_SZ\s+(.+?)\s*$/imu)?.[1]?.trim();
+	if (!server) return undefined;
+
+	if (!server.includes("=")) {
+		const proxy = normalizeProxyUrl(server);
+		return proxy ? { httpProxy: proxy, httpsProxy: proxy } : undefined;
+	}
+
+	const entries = new Map(
+		server
+			.split(";")
+			.map((entry) => entry.split("=", 2).map((part) => part.trim()))
+			.filter((entry): entry is [string, string] => entry.length === 2 && Boolean(entry[0]) && Boolean(entry[1]))
+			.map(([protocol, address]) => [protocol.toLowerCase(), address] as const),
+	);
+	const httpProxy = normalizeProxyUrl(entries.get("http"));
+	const httpsProxy = normalizeProxyUrl(entries.get("https"));
+	return httpProxy || httpsProxy ? { httpProxy, httpsProxy } : undefined;
+}
+
+function readWindowsSystemProxy(): SystemHttpProxySettings | undefined {
+	if (process.platform !== "win32") return undefined;
+	try {
+		const output = execFileSync("reg.exe", ["query", WINDOWS_INTERNET_SETTINGS_KEY], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			windowsHide: true,
+		});
+		return parseWindowsSystemProxy(output);
+	} catch {
+		return undefined;
+	}
+}
+
+function addLoopbackProxyBypass(): void {
+	const keys = ["NO_PROXY", "no_proxy"] as const;
+	const configuredKeys = keys.filter((key) => process.env[key] !== undefined);
+	for (const key of configuredKeys.length > 0 ? configuredKeys : ["NO_PROXY" as const]) {
+		const entries = (process.env[key] ?? "")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+		const normalized = new Set(entries.map((entry) => entry.toLowerCase()));
+		for (const host of LOOPBACK_NO_PROXY_HOSTS) {
+			if (!normalized.has(host)) entries.push(host);
+		}
+		process.env[key] = entries.join(",");
+	}
+}
 
 export function parseHttpIdleTimeoutMs(value: unknown): number | undefined {
 	if (typeof value === "string") {
@@ -42,11 +111,27 @@ export function formatHttpIdleTimeoutMs(timeoutMs: number): string {
 	return `${timeoutMs / 1000} sec`;
 }
 
-export function applyHttpProxySettings(httpProxy: string | undefined): void {
-	const proxy = httpProxy?.trim();
-	if (!proxy) return;
-	process.env.HTTP_PROXY ??= proxy;
-	process.env.HTTPS_PROXY ??= proxy;
+export function applyHttpProxySettings(
+	httpProxy: string | undefined,
+	readSystemProxy: () => SystemHttpProxySettings | undefined = readWindowsSystemProxy,
+): void {
+	const proxy = normalizeProxyUrl(httpProxy);
+	const hasEnvironmentProxy = Boolean(
+		process.env.HTTP_PROXY ?? process.env.http_proxy ?? process.env.HTTPS_PROXY ?? process.env.https_proxy,
+	);
+	const systemProxy = proxy || hasEnvironmentProxy ? undefined : readSystemProxy();
+	if (proxy) {
+		if (process.env.HTTP_PROXY === undefined && process.env.http_proxy === undefined) process.env.HTTP_PROXY = proxy;
+		if (process.env.HTTPS_PROXY === undefined && process.env.https_proxy === undefined)
+			process.env.HTTPS_PROXY = proxy;
+	} else if (systemProxy) {
+		if (systemProxy.httpProxy) process.env.HTTP_PROXY ??= systemProxy.httpProxy;
+		if (systemProxy.httpsProxy) process.env.HTTPS_PROXY ??= systemProxy.httpsProxy;
+	}
+
+	if (process.env.HTTP_PROXY ?? process.env.http_proxy ?? process.env.HTTPS_PROXY ?? process.env.https_proxy) {
+		addLoopbackProxyBypass();
+	}
 }
 
 const ignoreUndiciDispatcherError = (_error: unknown): void => {};

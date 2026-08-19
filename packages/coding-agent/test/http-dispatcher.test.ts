@@ -2,10 +2,14 @@ import net from "node:net";
 import tls from "node:tls";
 import * as undici from "undici";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { applyHttpProxySettings, configureHttpDispatcher } from "../src/core/http-dispatcher.ts";
+import {
+	applyHttpProxySettings,
+	configureHttpDispatcher,
+	parseWindowsSystemProxy,
+} from "../src/core/http-dispatcher.ts";
 
-const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY"] as const;
-const DISPATCHER_PROXY_ENV_KEYS = [...PROXY_ENV_KEYS, "http_proxy", "https_proxy"] as const;
+const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"] as const;
+const DISPATCHER_PROXY_ENV_KEYS = PROXY_ENV_KEYS;
 
 describe("http proxy settings", () => {
 	let savedEnv: Record<(typeof PROXY_ENV_KEYS)[number], string | undefined>;
@@ -32,7 +36,15 @@ describe("http proxy settings", () => {
 	});
 
 	it("applies httpProxy to HTTP_PROXY and HTTPS_PROXY", () => {
-		applyHttpProxySettings("http://127.0.0.1:7890");
+		applyHttpProxySettings("http://127.0.0.1:7890", () => undefined);
+
+		expect(process.env.HTTP_PROXY).toBe("http://127.0.0.1:7890");
+		expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:7890");
+		expect(process.env.NO_PROXY).toBe("localhost,127.0.0.1,::1");
+	});
+
+	it("normalizes proxy addresses without a URL scheme", () => {
+		applyHttpProxySettings("127.0.0.1:7890", () => undefined);
 
 		expect(process.env.HTTP_PROXY).toBe("http://127.0.0.1:7890");
 		expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:7890");
@@ -42,17 +54,65 @@ describe("http proxy settings", () => {
 		process.env.HTTP_PROXY = "http://env-http:8080";
 		process.env.HTTPS_PROXY = "http://env-https:8080";
 
-		applyHttpProxySettings("http://settings:7890");
+		applyHttpProxySettings("http://settings:7890", () => undefined);
 
 		expect(process.env.HTTP_PROXY).toBe("http://env-http:8080");
 		expect(process.env.HTTPS_PROXY).toBe("http://env-https:8080");
 	});
 
 	it("ignores empty values", () => {
-		applyHttpProxySettings("   ");
+		applyHttpProxySettings("   ", () => undefined);
 
 		expect(process.env.HTTP_PROXY).toBeUndefined();
 		expect(process.env.HTTPS_PROXY).toBeUndefined();
+	});
+
+	it("falls back to the Windows system proxy", () => {
+		applyHttpProxySettings(undefined, () => ({
+			httpProxy: "http://127.0.0.1:7897",
+			httpsProxy: "http://127.0.0.1:7897",
+		}));
+
+		expect(process.env.HTTP_PROXY).toBe("http://127.0.0.1:7897");
+		expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:7897");
+	});
+
+	it("preserves existing NO_PROXY entries while adding local model endpoints", () => {
+		process.env.NO_PROXY = "example.test,localhost";
+
+		applyHttpProxySettings("http://127.0.0.1:7890", () => undefined);
+
+		expect(process.env.NO_PROXY).toBe("example.test,localhost,127.0.0.1,::1");
+	});
+
+	it("parses simple and per-protocol WinINET proxy settings", () => {
+		expect(
+			parseWindowsSystemProxy(`
+ProxyEnable    REG_DWORD    0x1
+ProxyServer    REG_SZ    127.0.0.1:7897
+`),
+		).toEqual({
+			httpProxy: "http://127.0.0.1:7897",
+			httpsProxy: "http://127.0.0.1:7897",
+		});
+		expect(
+			parseWindowsSystemProxy(`
+ProxyEnable    REG_DWORD    0x1
+ProxyServer    REG_SZ    http=proxy.test:8080;https=secure.test:8443
+`),
+		).toEqual({
+			httpProxy: "http://proxy.test:8080",
+			httpsProxy: "http://secure.test:8443",
+		});
+	});
+
+	it("ignores disabled WinINET proxy settings", () => {
+		expect(
+			parseWindowsSystemProxy(`
+ProxyEnable    REG_DWORD    0x0
+ProxyServer    REG_SZ    127.0.0.1:7897
+`),
+		).toBeUndefined();
 	});
 });
 
