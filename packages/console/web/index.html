@@ -31,6 +31,16 @@
 					<div class="skills-empty">技能将在这里列出，可选用作对话能力（即将支持）。</div>
 				</div>
 			</section>
+			<section class="side-section">
+				<div class="side-header" data-panel="sessions-panel">对话 <span class="chevron">▾</span></div>
+				<div id="sessions-panel" class="side-body">
+					<div class="sessions-toolbar">
+						<span class="sessions-label">历史对话</span>
+						<button id="session-new-btn" class="secondary-btn small" title="新建对话">＋ 新对话</button>
+					</div>
+					<div id="sessions-list" class="sessions-list">加载中…</div>
+				</div>
+			</section>
 				<section class="side-section side-section-grow">
 					<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
 					<div id="files-panel" class="side-body side-body-grow">
@@ -89,6 +99,13 @@
 					</select>
 					<span class="composer-spacer"></span>
 					<span id="context-info" class="context-info" title="已启用能力"></span>
+					<button id="context-btn" class="context-ring-btn" title="上下文使用量">
+						<svg viewBox="0 0 36 36" class="context-ring">
+							<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
+							<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
+						</svg>
+						<span id="context-ring-text" class="context-ring-text">–</span>
+					</button>
 				</div>
 			</footer>
 		</main>

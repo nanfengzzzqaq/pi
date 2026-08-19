@@ -248,8 +248,11 @@ Else
   OpenAppWindow
 End If
 '@
+# 两个 vbs 内容一致（均为 Edge App 独立窗口模式）：
+# launcher.vbs 供新快捷方式使用；Pi控制台.vbs 兼容旧版本安装留下的快捷方式
 Set-Content -Path (Join-Path $Staging "launcher.vbs") -Value $Vbs -Encoding ASCII
-Write-Host "已生成启动器（Pi控制台.bat / launcher.vbs）"
+Set-Content -Path (Join-Path $Staging "Pi控制台.vbs") -Value $Vbs -Encoding ASCII
+Write-Host "已生成启动器（Pi控制台.bat / launcher.vbs / Pi控制台.vbs 兼容旧版）"
 
 # ---------------------------------------------------------------------------
 # 6. NSIS 便携版
