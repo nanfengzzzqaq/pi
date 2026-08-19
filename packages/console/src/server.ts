@@ -21,7 +21,8 @@ import {
 import * as fsExplorer from "./fs.ts";
 import * as officecli from "./officecli.ts";
 import {
-	activeToolNames,
+	baseToolNames,
+	fullPackToolNames,
 	instantiatePackTools,
 	listPacks,
 	loadPacks,
@@ -88,9 +89,22 @@ interface ConsoleSession {
 	events: BufferedEvent[];
 	nextSeq: number;
 	sseClients: Set<ServerResponse>;
+	/** 触发式加载：本会话已被元工具激活的 deferred 包 */
+	activatedPacks: Set<string>;
 }
 
 const sessions = new Map<string, ConsoleSession>();
+
+/** 会话当前应生效的工具名单 = 基础名单（含元工具） + 已激活 deferred 包的完整工具 */
+function effectiveToolNames(activatedPacks: Set<string>): string[] {
+	const names = baseToolNames();
+	for (const packName of activatedPacks) {
+		for (const toolName of fullPackToolNames(packName)) {
+			if (!names.includes(toolName)) names.push(toolName);
+		}
+	}
+	return names;
+}
 
 // ---------------------------------------------------------------------------
 // 会话索引（持久化：sessionId → cwd/title，支持列表与重启恢复）
@@ -281,6 +295,7 @@ async function buildSession(
 	session: AgentSession;
 	sessionFile: string | undefined;
 	modelFallbackMessage?: string;
+	activatedPacks: Set<string>;
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -288,6 +303,9 @@ async function buildSession(
 	const sessionManager = sessionFile
 		? SessionManager.open(sessionFile, SESSION_DIR, cwd)
 		: SessionManager.create(cwd, SESSION_DIR);
+	const activatedPacks = new Set<string>();
+	// 元工具（office_enable 等）触发时回调：为本会话激活对应包的完整工具组
+	let sessionRef: AgentSession | null = null;
 	const options: {
 		cwd: string;
 		modelRuntime: ModelRuntime;
@@ -301,7 +319,13 @@ async function buildSession(
 		sessionManager,
 		agentDir: CONSOLE_AGENT_DIR,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
-		customTools: instantiatePackTools({ getWorkspaceRoot: () => cwd }),
+		customTools: instantiatePackTools({
+			getWorkspaceRoot: () => cwd,
+			activatePack: (packName) => {
+				activatedPacks.add(packName);
+				sessionRef?.setActiveToolsByName(effectiveToolNames(activatedPacks));
+			},
+		}),
 		model: modelOverride,
 	};
 
@@ -323,10 +347,11 @@ async function buildSession(
 	}
 
 	const { session, modelFallbackMessage } = await createAgentSession(options);
+	sessionRef = session;
 
-	// 挂载语义：内置 4 个工具 + 已挂载包的工具；未挂载任何包 = 纯净原生 Pi
-	session.setActiveToolsByName(activeToolNames());
-	return { session, sessionFile: session.sessionFile, modelFallbackMessage };
+	// 挂载语义：内置 4 个工具 + 已挂载包（deferred 包只放元工具，触发后才激活完整工具组）
+	session.setActiveToolsByName(effectiveToolNames(activatedPacks));
+	return { session, sessionFile: session.sessionFile, modelFallbackMessage, activatedPacks };
 }
 
 async function createConsoleSession(): Promise<{ sessionId: string; warning?: string }> {
@@ -334,7 +359,7 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const { session, sessionFile, modelFallbackMessage } = await buildSession(cwd);
+	const { session, sessionFile, modelFallbackMessage, activatedPacks } = await buildSession(cwd);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -342,6 +367,7 @@ async function createConsoleSession(): Promise<{ sessionId: string; warning?: st
 		events: [],
 		nextSeq: 0,
 		sseClients: new Set(),
+		activatedPacks,
 	};
 	sessions.set(sessionId, cs);
 	touchSessionIndex(sessionId, cwd, sessionFile);
@@ -365,13 +391,18 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	const entry = index[sessionId];
 	if (!entry) return null;
 	try {
-		const { session, modelFallbackMessage } = await buildSession(entry.cwd, undefined, entry.sessionFile);
+		const { session, modelFallbackMessage, activatedPacks } = await buildSession(
+			entry.cwd,
+			undefined,
+			entry.sessionFile,
+		);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
 			events: [],
 			nextSeq: 0,
 			sseClients: new Set(),
+			activatedPacks,
 		};
 		sessions.set(sessionId, cs);
 		session.subscribe((ev) => {
@@ -734,10 +765,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
 			return;
 		}
-		// 对全部存活会话立即生效（下一轮起用，不丢历史）
-		const names = activeToolNames();
+		// 对全部存活会话立即生效（下一轮起用，不丢历史；已激活的 deferred 包保持完整工具组）
 		for (const cs of sessions.values()) {
-			cs.session.setActiveToolsByName(names);
+			cs.session.setActiveToolsByName(effectiveToolNames(cs.activatedPacks));
 		}
 		sendJson(res, 200, { ok: true, mounted: action === "mount" });
 		return;
