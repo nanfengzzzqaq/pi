@@ -9,6 +9,10 @@
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+# Electron's installer download runs in a child Node process. Node fetch only
+# honors HTTP(S)_PROXY when this switch is present at process startup.
+if (-not $env:NODE_USE_ENV_PROXY) { $env:NODE_USE_ENV_PROXY = "1" }
+
 $ElectronDir = Join-Path $PSScriptRoot "electron"
 $ConsoleDir = Split-Path $PSScriptRoot -Parent
 

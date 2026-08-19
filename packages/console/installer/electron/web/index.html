@@ -22,21 +22,18 @@
 	</header>
 
 	<div class="layout">
-		<!-- 左栏：助手 / 技能 / 文件 -->
+		<!-- 左栏：工具 / 技能 / 对话 / 文件 -->
 		<aside class="sidebar">
-			<section class="side-section">
-				<div class="side-header" data-panel="assistants-panel">助手 <span class="chevron">▾</span></div>
-				<div id="assistants-panel" class="side-body">
-					<div id="assistants-list" class="assistants-list">加载中…</div>
-					<button id="assistant-add-btn" class="add-assistant-btn">＋ 添加助手</button>
-				</div>
-			</section>
-			<section class="side-section">
-				<div class="side-header" data-panel="skills-panel">技能 <span class="chevron">▾</span></div>
-				<div id="skills-panel" class="side-body">
-					<div class="skills-empty">技能将在这里列出，可选用作对话能力（即将支持）。</div>
-				</div>
-			</section>
+			<nav class="sidebar-primary-nav" aria-label="能力目录">
+				<button id="tools-nav-btn" class="catalog-nav-btn" type="button">
+					<span class="catalog-nav-icon">▦</span>
+					<span>工具</span>
+				</button>
+				<button id="skills-nav-btn" class="catalog-nav-btn" type="button">
+					<span class="catalog-nav-icon">◇</span>
+					<span>技能</span>
+				</button>
+			</nav>
 			<section class="side-section">
 				<div class="side-header" data-panel="sessions-panel">对话 <span class="chevron">▾</span></div>
 				<div id="sessions-panel" class="side-body">
@@ -51,14 +48,20 @@
 					<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
 					<div id="files-panel" class="side-body side-body-grow">
 						<div class="files-toolbar">
-							<select id="fs-root-select" title="浏览根目录"></select>
+							<button id="fs-up" class="icon-btn small" title="返回上一级" disabled>↑</button>
+							<select id="fs-root-select" title="快速位置"></select>
 							<button id="fs-refresh" class="icon-btn small" title="刷新">⟳</button>
+						</div>
+						<div class="files-address-row">
+							<input id="fs-path-input" type="text" aria-label="本地路径" placeholder="输入 Windows 文件夹路径" autocomplete="off">
+							<button id="fs-path-go" class="secondary-btn small" type="button">转到</button>
 						</div>
 						<div class="files-workspace-line" id="files-workspace-line" title="当前工作区（会话工作目录）">
 							<span class="files-workspace-label">工作区</span>
 							<span id="fs-workspace-path" class="files-workspace-path">（未设置）</span>
 							<button id="fs-set-workspace" class="secondary-btn small" title="把当前浏览目录设为工作区">设为工作区</button>
 						</div>
+						<div id="fs-location-state" class="files-location-state">本地文件 · 可拖入对话或拖到桌面</div>
 						<div id="fs-tree" class="fs-tree"></div>
 					</div>
 				</section>
@@ -66,62 +69,115 @@
 
 		<!-- 中间：聊天区 -->
 		<main class="content">
-			<div id="error-bar" class="error-bar" hidden></div>
-
-			<main id="messages" class="messages">
-				<div class="messages-toolbar" id="messages-toolbar" hidden>
-					<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
-					<span id="collapse-hint" class="collapse-hint"></span>
-				</div>
-			</main>
-
-			<div id="indicator" class="indicator" hidden>思考中…</div>
-
-			<footer class="composer">
-				<div class="attachments" id="attachments" hidden></div>
-				<div class="composer-row">
-					<div class="composer-input-box">
-						<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
-						<input type="file" id="file-input" multiple hidden>
-						<textarea id="input" rows="3" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+			<section id="catalog-view" class="catalog-view" hidden>
+				<div class="catalog-shell">
+					<div class="catalog-heading-row">
+						<div>
+							<h1 id="catalog-title">工具</h1>
+							<p id="catalog-subtitle">按需安装本地能力，未命中任务时不会把工具定义放入模型上下文。</p>
+						</div>
+						<button id="catalog-close-btn" class="secondary-btn" type="button">返回对话</button>
 					</div>
-					<div class="composer-buttons">
-						<button id="send-btn" disabled>发送</button>
-						<button id="stop-btn" hidden>停止</button>
+					<div class="catalog-toolbar">
+						<div class="catalog-tabs" role="tablist">
+							<button id="catalog-tools-tab" class="catalog-tab active" type="button">工具</button>
+							<button id="catalog-skills-tab" class="catalog-tab" type="button">技能</button>
+						</div>
+						<label class="catalog-search">
+							<span>⌕</span>
+							<input id="catalog-search-input" type="search" placeholder="搜索工具" autocomplete="off">
+						</label>
 					</div>
+					<div id="catalog-filters" class="catalog-filters"></div>
+					<div id="catalog-content" class="catalog-content">加载中…</div>
 				</div>
-				<div class="composer-bottom">
-					<span class="composer-model-label">模型</span>
-					<select id="model-select" title="模型" disabled>
-						<option value="">加载中…</option>
-					</select>
-					<span class="composer-model-label">思考</span>
-					<select id="thinking-select" title="思考等级" disabled>
-						<option value="off">off</option>
-						<option value="minimal">minimal</option>
-						<option value="low">low</option>
-						<option value="medium">medium</option>
-						<option value="high">high</option>
-						<option value="xhigh">xhigh</option>
-						<option value="max">max</option>
-					</select>
-					<button id="context-btn" class="context-ring-btn" title="上下文使用量">
-						<svg viewBox="0 0 36 36" class="context-ring">
-							<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
-							<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
-						</svg>
-						<span id="context-ring-text" class="context-ring-text">–</span>
-					</button>
-					<span class="composer-spacer"></span>
-					<span id="context-info" class="context-info" title="已启用能力"></span>
-				</div>
-			</footer>
+			</section>
+
+			<div id="conversation-workbench" class="conversation-workbench">
+				<section id="chat-pane" class="chat-pane">
+					<div id="error-bar" class="error-bar" hidden></div>
+
+					<main id="messages" class="messages">
+						<div class="messages-toolbar" id="messages-toolbar" hidden>
+							<button id="collapse-btn" class="collapse-btn" title="折叠/展开较早的消息">▴ 折叠历史消息</button>
+							<span id="collapse-hint" class="collapse-hint"></span>
+						</div>
+						<div id="messages-empty" class="messages-empty">
+							<div class="messages-empty-mark">π</div>
+							<div class="messages-empty-title">有什么需要处理？</div>
+							<div class="messages-empty-hint">直接开始对话，或从左侧选择文件、工具和技能。</div>
+						</div>
+					</main>
+
+					<div id="indicator" class="indicator" hidden>思考中…</div>
+
+					<footer class="composer">
+						<div class="attachments" id="attachments" hidden></div>
+						<div class="composer-row">
+							<div class="composer-input-box">
+								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
+								<input type="file" id="file-input" multiple hidden>
+								<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+							</div>
+							<div class="composer-buttons">
+								<button id="send-btn" disabled>发送</button>
+								<button id="stop-btn" hidden>停止</button>
+							</div>
+						</div>
+						<div class="composer-bottom">
+							<span class="composer-model-label">模型</span>
+							<select id="model-select" title="模型" disabled>
+								<option value="">加载中…</option>
+							</select>
+							<span class="composer-model-label">思考</span>
+							<select id="thinking-select" title="思考等级" disabled>
+								<option value="off">off</option>
+								<option value="minimal">minimal</option>
+								<option value="low">low</option>
+								<option value="medium">medium</option>
+								<option value="high">high</option>
+								<option value="xhigh">xhigh</option>
+								<option value="max">max</option>
+							</select>
+							<button id="context-btn" class="context-ring-btn" title="上下文使用量">
+								<svg viewBox="0 0 36 36" class="context-ring">
+									<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
+									<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
+								</svg>
+								<span id="context-ring-text" class="context-ring-text">–</span>
+							</button>
+							<span class="composer-spacer"></span>
+							<span id="context-info" class="context-info" title="已启用能力"></span>
+						</div>
+					</footer>
+				</section>
+
+				<div id="office-preview-resizer" class="office-preview-resizer" title="拖动调整预览宽度" hidden></div>
+				<section id="office-preview-pane" class="office-preview-pane" hidden>
+					<header class="office-preview-header">
+						<div class="office-preview-heading">
+							<span class="office-preview-kicker">实时渲染（office_preview_watch）</span>
+							<strong id="office-preview-title" class="office-preview-title">Office 文档</strong>
+							<span id="office-preview-status" class="office-preview-status">准备预览</span>
+						</div>
+						<div class="office-preview-actions">
+							<button id="office-preview-refresh" class="icon-btn small" type="button" title="重新加载实时预览（office_preview_refresh）">⟳</button>
+							<button id="office-preview-external" class="icon-btn small" type="button" title="在浏览器中打开">↗</button>
+							<button id="office-preview-close" class="icon-btn small" type="button" title="关闭实时预览（office_preview_stop）">×</button>
+						</div>
+					</header>
+					<div class="office-preview-stage">
+						<div id="office-preview-loading" class="office-preview-loading">正在启动 OfficeCLI 实时渲染…</div>
+						<iframe id="office-preview-frame" class="office-preview-frame" title="OfficeCLI 实时渲染画面"></iframe>
+					</div>
+				</section>
+			</div>
 		</main>
 
-		<!-- 右侧抽屉：助手能力详情（默认隐藏，点击左侧助手才展开） -->
+		<!-- 右侧抽屉：工具或技能详情 -->
 		<aside id="drawer" class="drawer" hidden>
 			<div class="drawer-header">
-				<span id="drawer-title" class="drawer-title">能力详情</span>
+				<span id="drawer-title" class="drawer-title">详情</span>
 				<button id="drawer-close" class="icon-btn" title="关闭">×</button>
 			</div>
 			<div id="drawer-content" class="drawer-content"></div>
@@ -146,18 +202,6 @@
 		</div>
 	</div>
 
-	<!-- 添加助手弹层 -->
-	<div id="assistants-modal" class="modal" hidden>
-		<div class="modal-body">
-			<div class="modal-header">
-				<span class="modal-title">添加助手</span>
-				<button id="assistants-modal-close" class="icon-btn" title="关闭">×</button>
-			</div>
-			<p class="modal-hint">选择助手挂载到当前对话，挂载后模型即可调用它的工具；随时可以停用。</p>
-			<div id="assistants-modal-list" class="assistants-modal-list"></div>
-		</div>
-	</div>
-
 	<div id="settings-modal" class="modal" hidden>
 		<div class="modal-body">
 			<div class="modal-header">
@@ -170,9 +214,21 @@
 				<p class="modal-hint">会话的工作目录：Pi 读写文件、运行命令都在这里进行。设置后新会话直接在此目录工作；留空则使用默认工作区。也可在左侧「文件」面板浏览到目标目录后点「设为工作区」。</p>
 				<div class="key-add-row">
 					<input type="text" id="workspace-input" placeholder="例如 D:\projects\myapp（留空并保存 = 清除工作区）" autocomplete="off">
+					<button id="workspace-browse-btn" class="secondary-btn" type="button">选择位置</button>
 					<button id="workspace-save-btn">保存</button>
 				</div>
 				<div class="workspace-current" id="workspace-current">当前：未设置（默认工作区）</div>
+			</section>
+
+			<section class="modal-section">
+				<h3>Agent 数据位置</h3>
+				<p class="modal-hint">保存对话、模型设置、能力包、技能和已安装工具。迁移会完整复制到新目录并重启客户端；旧目录保留作备份，不影响你单独设置的工作区。</p>
+				<div class="key-add-row">
+					<input type="text" id="storage-input" placeholder="例如 D:\PiData" autocomplete="off">
+					<button id="storage-browse-btn" class="secondary-btn" type="button">选择位置</button>
+					<button id="storage-migrate-btn" type="button">迁移并重启</button>
+				</div>
+				<div class="workspace-current" id="storage-current">当前：读取中…</div>
 			</section>
 
 			<section class="modal-section">
@@ -203,9 +259,9 @@
 				<div class="download-bar-wrap" id="update-progress" hidden>
 					<div class="download-bar" id="update-progress-bar"></div>
 				</div>
-				<p class="modal-hint" id="github-token-hint">更新源是 GitHub 上的私有仓库时，需要填写有读取权限的 Personal Access Token（公开仓库无需填写）。</p>
+				<p class="modal-hint" id="github-token-hint">会自动使用本机已有的 GitHub 登录；只有尚未登录时才需要填写有仓库读取权限的 Token。</p>
 				<div class="key-add-row">
-					<input type="password" id="github-token-input" placeholder="GitHub Token（ghp_…，可选）" autocomplete="off">
+					<input type="password" id="github-token-input" placeholder="GitHub Token（备用，可选）" autocomplete="off">
 					<button id="github-token-save-btn">保存</button>
 					<button id="github-token-clear-btn" hidden>清除</button>
 				</div>

@@ -133,6 +133,7 @@ $appPackageJson = @{
     dependencies = @{
         "@earendil-works/pi-coding-agent" = $SdkVersion
         "typebox"                         = $TypeboxVersion
+        "undici"                          = "8.9.0"
     }
 } | ConvertTo-Json
 # 无 BOM 写入（仓库的 check:pinned-deps 会全树扫描 package.json，BOM 会导致 JSON.parse 失败）
