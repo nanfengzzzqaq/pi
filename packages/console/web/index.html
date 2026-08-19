@@ -48,14 +48,20 @@
 					<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
 					<div id="files-panel" class="side-body side-body-grow">
 						<div class="files-toolbar">
-							<select id="fs-root-select" title="浏览根目录"></select>
+							<button id="fs-up" class="icon-btn small" title="返回上一级" disabled>↑</button>
+							<select id="fs-root-select" title="快速位置"></select>
 							<button id="fs-refresh" class="icon-btn small" title="刷新">⟳</button>
+						</div>
+						<div class="files-address-row">
+							<input id="fs-path-input" type="text" aria-label="本地路径" placeholder="输入 Windows 文件夹路径" autocomplete="off">
+							<button id="fs-path-go" class="secondary-btn small" type="button">转到</button>
 						</div>
 						<div class="files-workspace-line" id="files-workspace-line" title="当前工作区（会话工作目录）">
 							<span class="files-workspace-label">工作区</span>
 							<span id="fs-workspace-path" class="files-workspace-path">（未设置）</span>
 							<button id="fs-set-workspace" class="secondary-btn small" title="把当前浏览目录设为工作区">设为工作区</button>
 						</div>
+						<div id="fs-location-state" class="files-location-state">本地文件 · 可拖入对话或拖到桌面</div>
 						<div id="fs-tree" class="fs-tree"></div>
 					</div>
 				</section>
@@ -208,9 +214,21 @@
 				<p class="modal-hint">会话的工作目录：Pi 读写文件、运行命令都在这里进行。设置后新会话直接在此目录工作；留空则使用默认工作区。也可在左侧「文件」面板浏览到目标目录后点「设为工作区」。</p>
 				<div class="key-add-row">
 					<input type="text" id="workspace-input" placeholder="例如 D:\projects\myapp（留空并保存 = 清除工作区）" autocomplete="off">
+					<button id="workspace-browse-btn" class="secondary-btn" type="button">选择位置</button>
 					<button id="workspace-save-btn">保存</button>
 				</div>
 				<div class="workspace-current" id="workspace-current">当前：未设置（默认工作区）</div>
+			</section>
+
+			<section class="modal-section">
+				<h3>Agent 数据位置</h3>
+				<p class="modal-hint">保存对话、模型设置、能力包、技能和已安装工具。迁移会完整复制到新目录并重启客户端；旧目录保留作备份，不影响你单独设置的工作区。</p>
+				<div class="key-add-row">
+					<input type="text" id="storage-input" placeholder="例如 D:\PiData" autocomplete="off">
+					<button id="storage-browse-btn" class="secondary-btn" type="button">选择位置</button>
+					<button id="storage-migrate-btn" type="button">迁移并重启</button>
+				</div>
+				<div class="workspace-current" id="storage-current">当前：读取中…</div>
 			</section>
 
 			<section class="modal-section">
