@@ -546,7 +546,7 @@ function renderHistory(history) {
 			if (item.text) container.appendHistoryText(item.text);
 			if (Array.isArray(item.toolCalls)) {
 				for (const call of item.toolCalls) {
-					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"), call.name, call.args);
+					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
 					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
 					if (path) container.addArtifactPath(path);
 				}
@@ -582,7 +582,7 @@ function addCapabilitySelectionStep(container, event) {
 		"done",
 	);
 	updateToolBlock(block, false, formatCapabilitySelection(event));
-	container.addTool(block, "capability_search", event);
+	container.addTool(block);
 }
 
 function addModelUsageStep(container, usage, id) {
@@ -593,7 +593,7 @@ function addModelUsageStep(container, usage, id) {
 		"done",
 	);
 	updateToolBlock(block, false, formatModelUsage(usage));
-	container.addTool(block, "model_usage", usage);
+	container.addTool(block);
 }
 
 // ---------------------------------------------------------------------------
@@ -939,8 +939,6 @@ function handleEvent(event) {
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
 			ensureAssistant().addTool(
 				appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running"),
-				event.toolName,
-				event.args,
 			);
 			break;
 		case "tool_execution_end": {
@@ -1039,45 +1037,6 @@ function formatModelUsage(usage) {
 	lines.push(`合计：${number(usage.totalTokens)} token`);
 	if (typeof usage.cost?.total === "number") lines.push(`费用：$${usage.cost.total.toFixed(6)}`);
 	return lines.join("\n");
-}
-
-/**
- * 本地把工具步骤归入可理解的执行阶段。规则只读取工具名和参数，不调用模型，
- * 因此复杂任务的阶段导航不会增加 token。
- */
-function executionStageFor(toolName, args) {
-	const name = String(toolName || "").toLocaleLowerCase("en-US");
-	const serializedArgs = (() => {
-		try {
-			return JSON.stringify(args ?? {}).toLocaleLowerCase("en-US");
-		} catch {
-			return String(args ?? "").toLocaleLowerCase("en-US");
-		}
-	})();
-	if (name === "capability_search") return { key: "prepare", label: "准备与能力选择" };
-	if (name === "model_usage") return { key: "finish", label: "完成与用量" };
-	if (
-		["read", "find", "grep", "ls", "browser_snapshot", "browser_extract", "office_view", "office_get", "office_query", "office_help", "archive_list"].includes(name)
-	) {
-		return { key: "inspect", label: "调查与读取" };
-	}
-	if (
-		name === "archive_test" ||
-		name === "browser_screenshot" ||
-		((name === "bash" || name === "powershell") &&
-			/\b(test|check|verify|build|lint|vitest|pytest|npm run check|git diff|status)\b/.test(serializedArgs))
-	) {
-		return { key: "verify", label: "验证结果" };
-	}
-	if (name.startsWith("browser_")) return { key: "browser", label: "浏览器操作" };
-	if (
-		["edit", "write", "bash", "powershell"].includes(name) ||
-		name.startsWith("office_") ||
-		name.startsWith("archive_")
-	) {
-		return { key: "act", label: "执行操作" };
-	}
-	return { key: "act", label: "执行操作" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,9 +1174,6 @@ function appendMessage(role, text, attachmentPaths = []) {
 	let processWrap = null;
 	let processBody = null;
 	let processCount = 0;
-	let processStage = null;
-	let processStageCount = 0;
-	let processCurrentEl = null;
 	if (role === "assistant") {
 		processWrap = document.createElement("div");
 		processWrap.className = "process-block";
@@ -1284,10 +1240,9 @@ function appendMessage(role, text, attachmentPaths = []) {
 			}
 		},
 		/** 挂载工具块到执行过程区 */
-		addTool(toolBlock, toolName, args) {
+		addTool(toolBlock) {
 			if (!processWrap) return;
 			processCount++;
-			const stage = executionStageFor(toolName, args);
 			// 首个工具：构建容器头（运行中展开）
 			if (processCount === 1) {
 				processWrap.innerHTML = "";
@@ -1301,10 +1256,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 				label.textContent = "⚙ 执行过程";
 				const countEl = document.createElement("span");
 				countEl.className = "process-count";
-				countEl.textContent = "1 步 · 1 阶段";
-				processCurrentEl = document.createElement("span");
-				processCurrentEl.className = "process-current";
-				processCurrentEl.textContent = stage.label;
+				countEl.textContent = "1 步";
 				const copyAll = document.createElement("button");
 				copyAll.className = "copy-btn";
 				copyAll.textContent = "⧉";
@@ -1313,7 +1265,6 @@ function appendMessage(role, text, attachmentPaths = []) {
 				head.appendChild(chevron);
 				head.appendChild(label);
 				head.appendChild(countEl);
-				head.appendChild(processCurrentEl);
 				head.appendChild(copyAll);
 				head.addEventListener("click", () => {
 					processBody.hidden = !processBody.hidden;
@@ -1324,50 +1275,11 @@ function appendMessage(role, text, attachmentPaths = []) {
 				processBody.className = "process-body";
 				processWrap.appendChild(processBody);
 				processWrap.hidden = false;
-			}
-
-			if (!processStage || processStage.dataset.stageKey !== stage.key) {
-				if (processStage) {
-					processStage.querySelector(".process-stage-body").hidden = true;
-					processStage.querySelector(".process-stage-chevron").textContent = "▸";
-					processStage.querySelector(".process-stage-status").textContent = "已完成";
-				}
-				processStageCount++;
-				processStage = document.createElement("section");
-				processStage.className = "process-stage";
-				processStage.dataset.stageKey = stage.key;
-				const stageHead = document.createElement("div");
-				stageHead.className = "process-stage-head";
-				const stageChevron = document.createElement("span");
-				stageChevron.className = "process-stage-chevron";
-				stageChevron.textContent = "▾";
-				const stageLabel = document.createElement("span");
-				stageLabel.className = "process-stage-label";
-				stageLabel.textContent = `阶段 ${processStageCount} · ${stage.label}`;
-				const stageCount = document.createElement("span");
-				stageCount.className = "process-stage-count";
-				stageCount.textContent = "1 步";
-				const stageStatus = document.createElement("span");
-				stageStatus.className = "process-stage-status";
-				stageStatus.textContent = "进行中";
-				const stageBody = document.createElement("div");
-				stageBody.className = "process-stage-body";
-				stageHead.append(stageChevron, stageLabel, stageCount, stageStatus);
-				stageHead.addEventListener("click", () => {
-					stageBody.hidden = !stageBody.hidden;
-					stageChevron.textContent = stageBody.hidden ? "▸" : "▾";
-				});
-				processStage.append(stageHead, stageBody);
-				processBody.appendChild(processStage);
 			} else {
-				const stageCount = processStage.querySelector(".process-stage-count");
-				const count = processStage.querySelectorAll(".tool-block").length + 1;
-				if (stageCount) stageCount.textContent = `${count} 步`;
+				const countEl = processWrap.querySelector(".process-count");
+				if (countEl) countEl.textContent = `${processCount} 步`;
 			}
-			processStage.querySelector(".process-stage-body").appendChild(toolBlock);
-			const countEl = processWrap.querySelector(".process-count");
-			if (countEl) countEl.textContent = `${processCount} 步 · ${processStageCount} 阶段`;
-			if (processCurrentEl) processCurrentEl.textContent = stage.label;
+			processBody.appendChild(toolBlock);
 			scrollToBottom();
 		},
 		/** 一轮结束：执行过程默认折叠（用户可点开），思考块从"思考中"落定 */
@@ -1376,15 +1288,6 @@ function appendMessage(role, text, attachmentPaths = []) {
 			const thinkingLabel = thinking.querySelector(".thinking-label");
 			if (thinkingLabel) thinkingLabel.textContent = "思考过程";
 			if (!processWrap || processWrap.hidden) return;
-			for (const stage of processWrap.querySelectorAll(".process-stage")) {
-				const stageBody = stage.querySelector(".process-stage-body");
-				const stageChevron = stage.querySelector(".process-stage-chevron");
-				const stageStatus = stage.querySelector(".process-stage-status");
-				if (stageBody) stageBody.hidden = true;
-				if (stageChevron) stageChevron.textContent = "▸";
-				if (stageStatus) stageStatus.textContent = "已完成";
-			}
-			if (processCurrentEl) processCurrentEl.textContent = "已完成";
 			const body = processWrap.querySelector(".process-body");
 			const chevron = processWrap.querySelector(".tool-chevron");
 			if (body && !body.hidden) {
@@ -1753,13 +1656,6 @@ function updateToolBlock(block, isError, resultText) {
 	if (resultEl && resultText) {
 		resultEl.innerHTML = renderResultText(resultText);
 		resultEl.hidden = false;
-	}
-	const stage = block.closest(".process-stage");
-	if (stage) {
-		const stageStatus = stage.querySelector(".process-stage-status");
-		const hasRunning = stage.querySelector(".tool-block.running");
-		const hasError = stage.querySelector(".tool-block.error");
-		if (stageStatus) stageStatus.textContent = hasRunning ? "进行中" : hasError ? "含失败步骤" : "已完成";
 	}
 }
 

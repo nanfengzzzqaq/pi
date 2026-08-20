@@ -2307,15 +2307,6 @@ body {
 	font-size: 11px;
 }
 
-.process-current {
-	max-width: 180px;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	color: var(--accent);
-	font-size: 11px;
-}
-
 .process-body {
 	margin: 8px 0 0 10px;
 	padding: 0 0 0 14px;
@@ -2326,60 +2317,6 @@ body {
 }
 
 .process-body[hidden] {
-	display: none;
-}
-
-.process-stage {
-	display: flex;
-	flex-direction: column;
-	gap: 6px;
-}
-
-.process-stage-head {
-	display: flex;
-	align-items: center;
-	gap: 7px;
-	min-height: 30px;
-	padding: 4px 8px;
-	border-radius: 8px;
-	color: var(--muted);
-	cursor: pointer;
-	user-select: none;
-}
-
-.process-stage-head:hover {
-	background: color-mix(in srgb, var(--panel-2) 76%, transparent);
-}
-
-.process-stage-chevron {
-	color: var(--faint);
-	font-size: 10px;
-}
-
-.process-stage-label {
-	color: var(--text);
-	font-size: 12px;
-	font-weight: 600;
-}
-
-.process-stage-count,
-.process-stage-status {
-	color: var(--faint);
-	font-size: 10.5px;
-}
-
-.process-stage-status {
-	margin-left: auto;
-}
-
-.process-stage-body {
-	display: flex;
-	flex-direction: column;
-	gap: 6px;
-	padding-left: 12px;
-}
-
-.process-stage-body[hidden] {
 	display: none;
 }
 
