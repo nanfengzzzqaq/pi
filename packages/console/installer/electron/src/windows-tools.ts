@@ -21,7 +21,6 @@ import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 const MAX_OUTPUT_CHARS = 16_000;
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_TIMEOUT_SECONDS = 2_147_000;
-const BUNDLED_MINGIT_DIR = join(PACKAGE_ROOT, "data", "runtime", "mingit");
 const PRIVATE_MINGIT_DIR = join(DATA_DIR, "runtime", "mingit");
 
 export interface WindowsToolContext {
@@ -47,6 +46,26 @@ interface CommandResult {
 
 type AnyToolDefinition = ToolDefinition<any, any, any>;
 
+/**
+ * Electron 会把标记为 asarUnpack 的可执行文件实际放进 app.asar.unpacked。
+ * 读取单个文件时 Electron 会透明重定向，但 Node 的 cpSync 不能从虚拟 asar
+ * 目录递归复制，因此安装版必须优先使用对应的物理目录。
+ */
+export function bundledWindowsRuntimeCandidates(packageRoot = PACKAGE_ROOT): string[] {
+	const roots = packageRoot.toLocaleLowerCase("en-US").endsWith(".asar")
+		? [`${packageRoot}.unpacked`, packageRoot]
+		: [packageRoot];
+	return roots.map((root) => join(root, "data", "runtime", "mingit"));
+}
+
+function getBundledWindowsRuntimeDir(): string | null {
+	return (
+		bundledWindowsRuntimeCandidates().find((candidate) =>
+			existsSync(join(candidate, "mingw64", "bin", "busybox.exe")),
+		) ?? null
+	);
+}
+
 function systemPowerShellCandidates(): string[] {
 	const root = process.env.SystemRoot ?? process.env.WINDIR;
 	if (!root) return [];
@@ -71,18 +90,18 @@ export function isWindowsPowerShellAvailable(): boolean {
  * 复制仅发生在 Pi 私有目录，不执行安装器，也不修改系统环境。
  */
 export function seedBundledWindowsRuntime(): boolean {
-	if (process.platform !== "win32" || !existsSync(join(BUNDLED_MINGIT_DIR, "mingw64", "bin", "busybox.exe"))) {
-		return false;
-	}
-	if (resolve(BUNDLED_MINGIT_DIR) === resolve(PRIVATE_MINGIT_DIR)) return false;
+	if (process.platform !== "win32") return false;
+	const bundledMinGitDir = getBundledWindowsRuntimeDir();
+	if (!bundledMinGitDir) return false;
+	if (resolve(bundledMinGitDir) === resolve(PRIVATE_MINGIT_DIR)) return false;
 	const destination = join(PRIVATE_MINGIT_DIR, "mingw64", "bin", "busybox.exe");
-	const bundledRecord = readRuntimeRecord(join(BUNDLED_MINGIT_DIR, "pi-runtime.json"));
+	const bundledRecord = readRuntimeRecord(join(bundledMinGitDir, "pi-runtime.json"));
 	const privateRecord = readRuntimeRecord(join(PRIVATE_MINGIT_DIR, "pi-runtime.json"));
 	if (existsSync(destination) && bundledRecord.sha256 && privateRecord.sha256 === bundledRecord.sha256) {
 		return false;
 	}
 	mkdirSync(PRIVATE_MINGIT_DIR, { recursive: true });
-	cpSync(BUNDLED_MINGIT_DIR, PRIVATE_MINGIT_DIR, { recursive: true, force: true });
+	cpSync(bundledMinGitDir, PRIVATE_MINGIT_DIR, { recursive: true, force: true });
 	return true;
 }
 
