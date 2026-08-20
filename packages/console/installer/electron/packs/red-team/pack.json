@@ -1,0 +1,8 @@
+{
+	"name": "red-team",
+	"displayName": "红队演练",
+	"description": "基于 promptfoo 的 AI 红队测试与评估：自动生成攻击样本、扫描 LLM 应用漏洞、运行 eval 与模型对比",
+	"version": "0.1.0",
+	"deferred": true,
+	"metaTool": "redteam_enable"
+}
