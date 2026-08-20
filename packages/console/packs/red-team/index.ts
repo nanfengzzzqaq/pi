@@ -17,7 +17,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import type { PackContext } from "../../src/packs.ts";
 import { DATA_DIR } from "../../src/paths.ts";
@@ -51,7 +51,8 @@ const SAFE_SPEC = /^[@\w.\-/]+$/;
 interface ExecResult {
 	stdout: string;
 	stderr: string;
-	code: number | null;
+	code: number | string | null;
+	errorMessage: string;
 }
 
 function exec(
@@ -79,11 +80,42 @@ function exec(
 				resolve({
 					stdout: String(stdout ?? ""),
 					stderr: String(stderr ?? ""),
-					code: error ? ((error as { code?: number | null }).code ?? null) : 0,
+					code: error ? ((error as { code?: number | string | null }).code ?? null) : 0,
+					errorMessage: error?.message ?? "",
 				});
 			},
 		);
 	});
+}
+
+function commandFailure(command: string, result: ExecResult): TextResult | null {
+	if (result.code === 0) return null;
+	const detail = truncate(result.stderr || result.stdout || result.errorMessage || "没有返回错误详情");
+	return fail(new Error(`${command} 失败（exit ${result.code ?? "未知"}）：\n${detail}`));
+}
+
+/** promptfoo 0.122 从 generate --help 展示策略，不再提供 redteam strategies 子命令。 */
+export function parseStrategyIds(help: string): string[] {
+	const block = help.match(/--strategies <strategies>([\s\S]*?)(?=\n\s+-n, --num-tests)/u)?.[1] ?? "";
+	const defaults = block.match(/Defaults to:\s*-\s*default \(includes:\s*([^)]+)\)/u)?.[1] ?? "";
+	const optional = block.match(/Optional:\s*-\s*([\s\S]*)/u)?.[1] ?? "";
+	const ids = ["default", ...defaults.split(","), ...optional.split(",")]
+		.map((value) => value.trim().replace(/\s+/gu, ""))
+		.filter((value) => /^[a-z][a-z0-9:-]*$/u.test(value));
+	return [...new Set(ids)];
+}
+
+function workspaceOutputPath(workspaceRoot: string, filename: string): string {
+	const output = resolve(workspaceRoot, filename);
+	const relativePath = relative(resolve(workspaceRoot), output);
+	if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+		throw new Error("配置文件必须位于当前工作区内");
+	}
+	return output;
+}
+
+function yamlScalar(value: string): string {
+	return JSON.stringify(value);
 }
 
 function npmCommand(): string {
@@ -148,7 +180,7 @@ export default function definePack(ctx: PackContext) {
 					Type.String({ description: "install 时指定版本号，默认 0.122.0；update 忽略此参数" }),
 				),
 			}),
-			execute: async ({ action, version }) => {
+			execute: async (_toolCallId, { action, version }) => {
 				if (action === "status") {
 					const bin = promptfooBin();
 					const ver = installedVersion();
@@ -193,18 +225,24 @@ export default function definePack(ctx: PackContext) {
 					}),
 				),
 			}),
-			execute: async ({ kind }) => {
+			execute: async (_toolCallId, { kind }) => {
 				const want = kind ?? "all";
 				const sections: string[] = [];
 				if (want === "plugins" || want === "all") {
-					const r = await runPromptfoo(["redteam", "plugins"], { cwd: root(), timeoutMs: 60_000 });
+					const r = await runPromptfoo(["redteam", "plugins", "--ids-only"], { cwd: root(), timeoutMs: 60_000 });
 					if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
+					const failure = commandFailure("读取攻击插件", r);
+					if (failure) return failure;
 					sections.push(`【攻击插件】\n${r.stdout.trim()}`);
 				}
 				if (want === "strategies" || want === "all") {
-					const r = await runPromptfoo(["redteam", "strategies"], { cwd: root(), timeoutMs: 60_000 });
+					const r = await runPromptfoo(["redteam", "generate", "--help"], { cwd: root(), timeoutMs: 60_000 });
 					if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
-					sections.push(`【投递策略】\n${r.stdout.trim()}`);
+					const failure = commandFailure("读取投递策略", r);
+					if (failure) return failure;
+					const strategies = parseStrategyIds(r.stdout);
+					if (strategies.length === 0) return fail(new Error("未能从 promptfoo 帮助信息解析投递策略"));
+					sections.push(`【投递策略】\n${strategies.join("\n")}`);
 				}
 				return ok(truncate(sections.join("\n\n")));
 			},
@@ -213,7 +251,7 @@ export default function definePack(ctx: PackContext) {
 			name: "redteam_init",
 			label: "生成红队配置",
 			description:
-				"在工作区生成 promptfooconfig.yaml 红队配置。需要描述被测系统（purpose）、指定攻击模型、插件和策略。被测目标可以是任意 HTTP API 或模型 provider。",
+				"在工作区生成 promptfooconfig.yaml 红队配置。需要描述被测系统（purpose）、指定攻击模型、插件和策略。被测目标可以是任意 HTTP API 或模型 provider。默认策略与 promptfoo 0.122 保持一致。",
 			parameters: Type.Object({
 				target: Type.String({
 					description:
@@ -226,7 +264,9 @@ export default function definePack(ctx: PackContext) {
 					description: "攻击插件 id 列表，如 ['harmful:hate','shell-injection','prompt-extraction']",
 				}),
 				strategies: Type.Optional(
-					Type.Array(Type.String(), { description: "投递策略，默认 ['basic','jailbreak']" }),
+					Type.Array(Type.String(), {
+						description: "投递策略，默认 ['basic','jailbreak:composite','jailbreak:meta']",
+					}),
 				),
 				attackModel: Type.Optional(
 					Type.String({ description: "攻击生成+评分模型，默认 deepseek:deepseek-v4-flash" }),
@@ -235,32 +275,35 @@ export default function definePack(ctx: PackContext) {
 				language: Type.Optional(Type.String({ description: "攻击样本语言，默认 Chinese" })),
 				filename: Type.Optional(Type.String({ description: "配置文件名，默认 promptfooconfig.yaml" })),
 			}),
-			execute: async ({ target, purpose, plugins, strategies, attackModel, numTests, language, filename }) => {
-				if (!SAFE_SPEC.test(target) && !target.startsWith("http") && !target.startsWith("file://")) {
-					return fail(new Error("target 格式不支持"));
-				}
+			execute: async (
+				_toolCallId,
+				{ target, purpose, plugins, strategies, attackModel, numTests, language, filename },
+			) => {
 				const name = filename || "promptfooconfig.yaml";
-				const list = (arr: string[], indent: string) => arr.map((p) => `${indent}- ${p}`).join("\n");
+				const list = (arr: string[], indent: string) => arr.map((value) => `${indent}- ${yamlScalar(value)}`).join("\n");
+				const selectedStrategies = strategies ?? ["basic", "jailbreak:composite", "jailbreak:meta"];
 				const yaml = `description: Pi 控制台红队演练
 
 targets:
-  - id: ${target}
+  - id: ${yamlScalar(target)}
 
 redteam:
   provider:
-    id: ${attackModel || "deepseek:deepseek-v4-flash"}
+    id: ${yamlScalar(attackModel || "deepseek:deepseek-v4-flash")}
   purpose: |
-${purpose.split("\n").map((l) => `    ${l}`).join("\n")}
-  language: ${language || "Chinese"}
+${purpose.split("\n").map((line: string) => `    ${line}`).join("\n")}
+  language: ${yamlScalar(language || "Chinese")}
   numTests: ${numTests ?? 4}
   plugins:
 ${list(plugins, "    ")}
   strategies:
-${list(strategies ?? ["basic", "jailbreak"], "    ")}
+${list(selectedStrategies, "    ")}
 `;
 				try {
-					writeFileSync(join(root(), name), yaml, "utf8");
-					return ok(`配置已写入 ${join(root(), name)}\n\n${yaml}`);
+					const outputPath = workspaceOutputPath(root(), name);
+					mkdirSync(dirname(outputPath), { recursive: true });
+					writeFileSync(outputPath, yaml, "utf8");
+					return ok(`配置已写入 ${outputPath}\n\n${yaml}`);
 				} catch (e) {
 					return fail(e);
 				}
@@ -277,13 +320,15 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 				),
 				env: ENV_PARAM,
 			}),
-			execute: async ({ config, disableRemoteGeneration, env }) => {
+			execute: async (_toolCallId, { config, disableRemoteGeneration, env }) => {
 				const envVars = { ...env };
 				if (disableRemoteGeneration ?? true) envVars.PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = "true";
 				const args = ["redteam", "generate"];
 				if (config) args.push("-c", config);
 				const r = await runPromptfoo(args, { cwd: root(), timeoutMs: 20 * 60 * 1000, env: envVars });
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
+				const failure = commandFailure("生成攻击样本", r);
+				if (failure) return failure;
 				return ok(truncate([r.stdout, r.stderr].filter(Boolean).join("\n")) || `exit ${r.code}`);
 			},
 		},
@@ -301,7 +346,10 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 				timeoutMinutes: Type.Optional(Type.Number({ description: "超时分钟数，默认 60" })),
 				env: ENV_PARAM,
 			}),
-			execute: async ({ config, maxConcurrency, disableRemoteGeneration, timeoutMinutes, env }) => {
+			execute: async (
+				_toolCallId,
+				{ config, maxConcurrency, disableRemoteGeneration, timeoutMinutes, env },
+			) => {
 				const envVars = { ...env };
 				if (disableRemoteGeneration ?? true) envVars.PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = "true";
 				const args = ["redteam", "run"];
@@ -313,6 +361,8 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 					env: envVars,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
+				const failure = commandFailure("执行红队扫描", r);
+				if (failure) return failure;
 				const out = truncate([r.stdout, r.stderr].filter(Boolean).join("\n"));
 				return ok(`${out}\n\n（完整报告：在工作区运行 promptfoo redteam report 可打开可视化报告；历史结果用 redteam_results 查看）`);
 			},
@@ -325,13 +375,15 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 				limit: Type.Optional(Type.Number({ description: "显示最近几条，默认 10" })),
 				env: ENV_PARAM,
 			}),
-			execute: async ({ limit, env }) => {
-				const r = await runPromptfoo(["list", "evals", "--limit", String(limit ?? 10)], {
+			execute: async (_toolCallId, { limit, env }) => {
+				const r = await runPromptfoo(["list", "evals", "-n", String(limit ?? 10)], {
 					cwd: root(),
 					timeoutMs: 60_000,
 					env,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
+				const failure = commandFailure("读取历史评估结果", r);
+				if (failure) return failure;
 				return ok(truncate(r.stdout || r.stderr));
 			},
 		},
@@ -348,7 +400,7 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 				timeoutMinutes: Type.Optional(Type.Number({ description: "超时分钟数，默认 30" })),
 				env: ENV_PARAM,
 			}),
-			execute: async ({ config, output, noCache, maxConcurrency, timeoutMinutes, env }) => {
+			execute: async (_toolCallId, { config, output, noCache, maxConcurrency, timeoutMinutes, env }) => {
 				const args = ["eval", "-c", config];
 				if (output) args.push("-o", output);
 				if (noCache) args.push("--no-cache");
@@ -359,6 +411,8 @@ ${list(strategies ?? ["basic", "jailbreak"], "    ")}
 					env,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
+				const failure = commandFailure("运行模型评估", r);
+				if (failure) return failure;
 				const note = output ? `\n\n结果已写入 ${join(root(), output)}（可用 read 工具读取分析）` : "";
 				return ok(`${truncate([r.stdout, r.stderr].filter(Boolean).join("\n"))}${note}`);
 			},
