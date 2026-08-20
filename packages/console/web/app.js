@@ -109,7 +109,8 @@ let previewFile = null; // 预览中的文件 {name, mimeType, dataBase64, size}
 let catalogCache = null;
 let catalogMode = "tools";
 let catalogFilter = "全部";
-let catalogDownloadTimer = null;
+let officeInstallTimer = null;
+let redTeamInstallTimer = null;
 let officePreview = null;
 let officePreviewRequest = 0;
 const officeToolCalls = new Map();
@@ -1842,6 +1843,12 @@ document.querySelectorAll(".side-header").forEach((header) => {
 async function refreshCatalog() {
 	catalogCache = await api("/api/catalog");
 	renderCatalog();
+	if (catalogCache.download?.running && !officeInstallTimer) {
+		officeInstallTimer = setInterval(() => void pollOfficeCliInstall(), 700);
+	}
+	if (catalogCache.redteamDownload?.running && !redTeamInstallTimer) {
+		redTeamInstallTimer = setInterval(() => void pollRedTeamInstall(), 1500);
+	}
 }
 
 async function openCatalog(mode) {
@@ -1937,16 +1944,18 @@ function createCard(item, options) {
 	const actions = document.createElement("div");
 	actions.className = "catalog-card-actions";
 	const status = document.createElement("span");
-	status.className = `catalog-status${item.installed ? " installed" : ""}`;
-	status.textContent = item.installed ? "已安装" : "未安装";
+	status.className = `catalog-status${item.installed ? " installed" : options.installing ? " installing" : ""}`;
+	status.textContent = item.installed ? "已安装" : options.installing ? "安装中" : "未安装";
 	actions.appendChild(status);
 	if (!item.installed) {
 		const install = document.createElement("button");
 		install.type = "button";
 		install.className = "primary-btn small";
-		install.textContent = "安装";
-		install.disabled = options.installDisabled === true;
-		if (options.installDisabled) install.title = "请先安装所属工具";
+		install.dataset.installToolId = item.id;
+		install.textContent = options.installText || "安装";
+		install.disabled = options.installDisabled === true || options.installing === true;
+		if (options.installing) install.title = options.installTitle || "正在安装，请稍候";
+		else if (options.installDisabled) install.title = "请先安装所属工具";
 		install.addEventListener("click", async (event) => {
 			event.stopPropagation();
 			await options.onInstall(install);
@@ -1962,6 +1971,33 @@ function installDispatcher(tool) {
 	return tool.id === "redteam" ? installRedTeam : installOfficeCli;
 }
 
+function installDuration(elapsedMs) {
+	const seconds = Math.max(0, Math.floor((elapsedMs || 0) / 1000));
+	const minutes = Math.floor(seconds / 60);
+	return minutes > 0 ? `${minutes}分${seconds % 60}秒` : `${seconds}秒`;
+}
+
+function installUi(tool) {
+	const progress = tool.id === "redteam" ? catalogCache?.redteamDownload : catalogCache?.download;
+	if (!progress?.running) return { installing: false, installText: "安装", installTitle: "" };
+	if (tool.id === "redteam") {
+		const elapsed = installDuration(progress.elapsedMs);
+		return {
+			installing: true,
+			installText: `安装中 ${elapsed}`,
+			installTitle: `${progress.log || "正在安装 promptfoo"}（已用时 ${elapsed}）`,
+		};
+	}
+	const percent = progress.totalBytes
+		? Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100))
+		: null;
+	return {
+		installing: true,
+		installText: percent === null ? "下载中…" : `下载中 ${percent}%`,
+		installTitle: "正在下载并校验 OfficeCLI",
+	};
+}
+
 function renderTools(query) {
 	const tools = (catalogCache?.tools || []).filter((tool) => {
 		if (catalogFilter === "已安装" && !tool.installed) return false;
@@ -1972,12 +2008,14 @@ function renderTools(query) {
 	const grid = document.createElement("div");
 	grid.className = "catalog-grid";
 	for (const tool of tools) {
+		const installState = installUi(tool);
 		grid.appendChild(
 			createCard(tool, {
 				kind: "tool",
 				icon: tool.icon,
 				onOpen: () => openToolDetail(tool),
 				onInstall: installDispatcher(tool),
+				...installState,
 			}),
 		);
 	}
@@ -2055,8 +2093,8 @@ async function installOfficeCli(button) {
 	try {
 		await api("/api/tools/officecli/install", { method: "POST", body: "{}" });
 		showInfo("OfficeCLI 正在从官方来源下载并校验");
-		clearInterval(catalogDownloadTimer);
-		catalogDownloadTimer = setInterval(pollOfficeCliInstall, 700);
+		clearInterval(officeInstallTimer);
+		officeInstallTimer = setInterval(() => void pollOfficeCliInstall(), 700);
 		await pollOfficeCliInstall();
 	} catch (error) {
 		button.disabled = false;
@@ -2066,17 +2104,28 @@ async function installOfficeCli(button) {
 }
 
 async function pollOfficeCliInstall() {
-	const progress = await api("/api/officecli/progress");
-	if (progress.running) return;
-	clearInterval(catalogDownloadTimer);
-	catalogDownloadTimer = null;
-	if (progress.error) {
-		showError(`OfficeCLI 安装失败：${progress.error}`);
+	try {
+		const progress = await api("/api/officecli/progress");
+		if (catalogCache) catalogCache.download = progress;
+		if (progress.running) {
+			renderCatalog();
+			return;
+		}
+		clearInterval(officeInstallTimer);
+		officeInstallTimer = null;
+		if (progress.error) {
+			showError(`OfficeCLI 安装失败：${progress.error}`);
+			await refreshCatalog();
+			return;
+		}
+		closeDrawer();
 		await refreshCatalog();
-		return;
+		showInfo(`OfficeCLI 已安装${progress.version ? `，版本 ${progress.version}` : ""}`);
+	} catch (error) {
+		clearInterval(officeInstallTimer);
+		officeInstallTimer = null;
+		showError(`读取 OfficeCLI 安装进度失败：${error.message}`);
 	}
-	await refreshCatalog();
-	showInfo(`OfficeCLI 已安装${progress.version ? `，版本 ${progress.version}` : ""}`);
 }
 
 async function installRedTeam(button) {
@@ -2084,9 +2133,9 @@ async function installRedTeam(button) {
 	button.textContent = "准备安装…";
 	try {
 		await api("/api/tools/redteam/install", { method: "POST", body: "{}" });
-		showInfo("promptfoo 正在从 npm 官方源安装");
-		clearInterval(catalogDownloadTimer);
-		catalogDownloadTimer = setInterval(pollRedTeamInstall, 1500);
+		showInfo("红队引擎正在从 npm 官方源安装，首次安装通常需要几分钟");
+		clearInterval(redTeamInstallTimer);
+		redTeamInstallTimer = setInterval(() => void pollRedTeamInstall(), 1500);
 		await pollRedTeamInstall();
 	} catch (error) {
 		button.disabled = false;
@@ -2096,17 +2145,30 @@ async function installRedTeam(button) {
 }
 
 async function pollRedTeamInstall() {
-	const progress = await api("/api/tools/redteam/progress");
-	if (progress.running) return;
-	clearInterval(catalogDownloadTimer);
-	catalogDownloadTimer = null;
-	if (progress.error) {
-		showError(`promptfoo 安装失败：${progress.error}`);
+	try {
+		const progress = await api("/api/tools/redteam/progress");
+		if (catalogCache) catalogCache.redteamDownload = progress;
+		if (progress.running) {
+			renderCatalog();
+			return;
+		}
+		clearInterval(redTeamInstallTimer);
+		redTeamInstallTimer = null;
+		if (progress.error) {
+			showError(`红队引擎安装失败：${progress.error}`);
+			await refreshCatalog();
+			return;
+		}
+		closeDrawer();
 		await refreshCatalog();
-		return;
+		showInfo(
+			`红队引擎已安装${progress.version ? `，promptfoo ${progress.version}` : ""}（用时 ${installDuration(progress.elapsedMs)}）`,
+		);
+	} catch (error) {
+		clearInterval(redTeamInstallTimer);
+		redTeamInstallTimer = null;
+		showError(`读取红队引擎安装进度失败：${error.message}`);
 	}
-	await refreshCatalog();
-	showInfo(`红队引擎已安装${progress.version ? `，promptfoo ${progress.version}` : ""}`);
 }
 
 async function installOfficeCliSkill(skill, button) {
@@ -2192,7 +2254,15 @@ function openToolDetail(tool) {
 		actions.className = "drawer-actions";
 		const install = document.createElement("button");
 		install.className = "primary-btn";
-		install.textContent = tool.id === "redteam" ? "安装红队引擎" : "安装 OfficeCLI";
+		install.dataset.installToolId = tool.id;
+		const installState = installUi(tool);
+		install.textContent = installState.installing
+			? installState.installText
+			: tool.id === "redteam"
+				? "安装红队引擎"
+				: "安装 OfficeCLI";
+		install.disabled = installState.installing;
+		install.title = installState.installTitle;
 		install.addEventListener("click", () => installDispatcher(tool)(install));
 		actions.appendChild(install);
 		drawerContentEl.appendChild(actions);

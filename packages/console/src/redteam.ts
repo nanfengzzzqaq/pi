@@ -30,12 +30,26 @@ export interface InstallProgress {
 	error: string | null;
 	version: string | null;
 	log: string;
+	phase: "idle" | "checking" | "installing" | "verifying" | "complete" | "failed";
+	startedAt: number | null;
+	elapsedMs: number;
 }
 
-let progress: InstallProgress = { running: false, error: null, version: null, log: "" };
+let progress: InstallProgress = {
+	running: false,
+	error: null,
+	version: null,
+	log: "",
+	phase: "idle",
+	startedAt: null,
+	elapsedMs: 0,
+};
 
 export function getInstallProgress(): InstallProgress {
-	return progress;
+	return {
+		...progress,
+		elapsedMs: progress.running && progress.startedAt ? Date.now() - progress.startedAt : progress.elapsedMs,
+	};
 }
 
 /** 定位已安装的 promptfoo CLI 入口（package.json bin 指向的 js 文件） */
@@ -76,7 +90,7 @@ function run(
 	file: string,
 	args: string[],
 	options: { timeoutMs: number; shell?: boolean },
-): Promise<{ stdout: string; stderr: string; code: number | null }> {
+): Promise<{ stdout: string; stderr: string; code: number | string | null; errorMessage: string }> {
 	const shell = options.shell ?? false;
 	return new Promise((resolve) => {
 		execFile(
@@ -93,7 +107,8 @@ function run(
 				resolve({
 					stdout: String(stdout ?? ""),
 					stderr: String(stderr ?? ""),
-					code: error ? ((error as { code?: number | null }).code ?? null) : 0,
+					code: error ? ((error as { code?: number | string | null }).code ?? null) : 0,
+					errorMessage: error?.message ?? "",
 				});
 			},
 		);
@@ -131,7 +146,16 @@ async function probeVersion(): Promise<string | null> {
  */
 export function startInstall(update: boolean): boolean {
 	if (progress.running) return false;
-	progress = { running: true, error: null, version: null, log: "" };
+	const startedAt = Date.now();
+	progress = {
+		running: true,
+		error: null,
+		version: null,
+		log: "正在检查 Node.js 与 npm 环境…",
+		phase: "checking",
+		startedAt,
+		elapsedMs: 0,
+	};
 	void (async () => {
 		try {
 			if (!(await npmAvailable())) {
@@ -140,26 +164,40 @@ export function startInstall(update: boolean): boolean {
 			const spec = update ? "promptfoo@latest" : `promptfoo@${DEFAULT_VERSION}`;
 			if (!SAFE_SPEC.test(spec)) throw new Error("版本规格包含非法字符");
 			mkdirSync(INSTALL_DIR, { recursive: true });
-			progress.log = `正在安装 ${spec} …`;
+			progress = { ...progress, phase: "installing", log: `正在从 npm 官方源安装 ${spec}…` };
 			const r = await run(npmCommand(), ["install", "--prefix", INSTALL_DIR, spec, "--no-fund", "--no-audit"], {
 				timeoutMs: 15 * 60 * 1000,
 				shell: process.platform === "win32",
 			});
 			if (r.code !== 0 || !promptfooBin()) {
-				throw new Error(`npm install 失败（exit ${r.code}）：${(r.stderr || r.stdout).slice(-1500)}`);
+				const detail = (r.stderr || r.stdout || r.errorMessage || "没有返回错误详情").slice(-1500);
+				throw new Error(`npm install 失败（exit ${r.code ?? "未知"}）：${detail}`);
 			}
+			progress = { ...progress, phase: "verifying", log: "文件下载完成，正在验证 promptfoo…" };
 			const version = (await probeVersion()) ?? "unknown";
+			if (version === "unknown") throw new Error("promptfoo 文件已下载，但命令行入口无法启动");
 			writeFileSync(
 				VERSION_RECORD,
 				JSON.stringify({ version, spec, installedAt: new Date().toISOString() }, null, 2),
 			);
-			progress = { running: false, error: null, version, log: `安装完成：${version}` };
+			progress = {
+				running: false,
+				error: null,
+				version,
+				log: `安装完成：${version}`,
+				phase: "complete",
+				startedAt,
+				elapsedMs: Date.now() - startedAt,
+			};
 		} catch (error) {
 			progress = {
 				running: false,
 				error: error instanceof Error ? error.message : String(error),
 				version: null,
-				log: "",
+				log: "安装失败",
+				phase: "failed",
+				startedAt,
+				elapsedMs: Date.now() - startedAt,
 			};
 		}
 	})();
