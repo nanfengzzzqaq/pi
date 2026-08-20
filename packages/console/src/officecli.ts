@@ -21,6 +21,9 @@ const VERSION_TIMEOUT_MS = 5000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 const BIN_DIR = join(DATA_DIR, "bin");
+const RECORD_FILE = join(BIN_DIR, "officecli.json");
+/** 用户主动卸载后阻止安装包在下次启动时重新预置。 */
+const DISABLED_FILE = join(BIN_DIR, "officecli.disabled");
 
 /**
  * 首启引导：安装版把 OfficeCLI 预置在 app/data/bin（随程序分发），
@@ -31,6 +34,7 @@ export function seedBundledBinary(): boolean {
 	const bundled = join(PACKAGE_ROOT, "data", "bin", exeName);
 	const target = join(BIN_DIR, exeName);
 	try {
+		if (existsSync(DISABLED_FILE)) return false;
 		if (!existsSync(target) && existsSync(bundled)) {
 			mkdirSync(BIN_DIR, { recursive: true });
 			copyFileSync(bundled, target);
@@ -45,7 +49,6 @@ export function seedBundledBinary(): boolean {
 	}
 	return false;
 }
-const RECORD_FILE = join(BIN_DIR, "officecli.json");
 
 /** Windows x64: officecli-win-x64.exe；其他平台按官方资产命名 */
 function assetName(): string {
@@ -305,6 +308,7 @@ export async function downloadLatest(): Promise<void> {
 		const version = (release.tag_name || "").replace(/^v/, "");
 		const record: VersionRecord = { version, downloadedAt: new Date().toISOString(), sha256: expected };
 		writeFileSync(RECORD_FILE, `${JSON.stringify(record, null, "\t")}\n`, "utf8");
+		if (existsSync(DISABLED_FILE)) unlinkSync(DISABLED_FILE);
 
 		progress = {
 			running: false,
@@ -324,6 +328,36 @@ export async function downloadLatest(): Promise<void> {
 			version: null,
 		};
 	}
+}
+
+export interface OfficeCliUninstallResult {
+	removedFiles: number;
+	disabledMarker: string;
+}
+
+/**
+ * 删除客户端拥有的 OfficeCLI 文件，并写入停用标记。
+ * 标记用于区分“首次安装尚未预置”和“用户明确卸载”，避免下次启动自动装回。
+ */
+export function uninstall(): OfficeCliUninstallResult {
+	if (progress.running) throw new Error("OfficeCLI 正在安装，暂时不能卸载");
+	let removedFiles = 0;
+	for (const path of [binaryPath(), RECORD_FILE, `${binaryPath()}.bak`, `${binaryPath()}.download`]) {
+		if (!existsSync(path)) continue;
+		unlinkSync(path);
+		removedFiles += 1;
+	}
+	mkdirSync(BIN_DIR, { recursive: true });
+	writeFileSync(DISABLED_FILE, `${JSON.stringify({ disabledAt: new Date().toISOString() }, null, "\t")}\n`, "utf8");
+	progress = {
+		running: false,
+		phase: "idle",
+		receivedBytes: 0,
+		totalBytes: null,
+		error: null,
+		version: null,
+	};
+	return { removedFiles, disabledMarker: DISABLED_FILE };
 }
 
 /** 二进制是否存在且能跑（供包工具在调用前给出明确错误） */

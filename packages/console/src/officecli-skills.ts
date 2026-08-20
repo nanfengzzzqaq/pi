@@ -5,7 +5,7 @@
  *   <agentDir>/skills/officecli/<catalogId>/SKILL.md
  * Pi 会递归发现这些标准技能；界面也用同一份目录展示归属关系。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadOfficialSkill } from "./officecli.ts";
 
@@ -215,4 +215,12 @@ export function readInstalledOfficeCliSkill(agentDir: string, id: string): strin
 	} catch {
 		return null;
 	}
+}
+
+/** 删除客户端按 OfficeCLI 工具分组安装的全部官方技能，不触碰其他技能。 */
+export function uninstallAllOfficeCliSkills(agentDir: string): boolean {
+	const directory = join(agentDir, "skills", "officecli");
+	if (!existsSync(directory)) return false;
+	rmSync(directory, { recursive: true, force: true });
+	return true;
 }

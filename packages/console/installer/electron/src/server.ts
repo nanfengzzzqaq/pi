@@ -24,7 +24,12 @@ import * as fsExplorer from "./fs.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
-import { installAllOfficeCliSkills, installOfficeCliSkill, listOfficeCliSkills } from "./officecli-skills.ts";
+import {
+	installAllOfficeCliSkills,
+	installOfficeCliSkill,
+	listOfficeCliSkills,
+	uninstallAllOfficeCliSkills,
+} from "./officecli-skills.ts";
 import {
 	baseToolNames,
 	type CapabilityMatch,
@@ -214,6 +219,22 @@ function activatePackForAllSessions(packName: string): void {
 
 function activateOfficeCliForAllSessions(): void {
 	activatePackForAllSessions(OFFICECLI_PACK_NAME);
+}
+
+/** 从全部内存会话和持久化索引解除工具包；不会删除工具文件。 */
+function deactivatePackForAllSessions(packName: string): boolean {
+	const changed = unmountPack(packName);
+	for (const cs of sessions.values()) {
+		cs.enabledPacks.delete(packName);
+		cs.activePackTools.delete(packName);
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	}
+	const index = readSessionIndex();
+	for (const entry of Object.values(index)) {
+		entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
+	}
+	writeSessionIndex(index);
+	return changed;
 }
 
 async function reloadInstalledSkillsInSessions(): Promise<number> {
@@ -1039,6 +1060,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				cwd: entry.cwd,
 				assistants: packSummaries(entry.enabledPacks ?? []),
 				active: sessions.has(id),
+				streaming: sessions.get(id)?.session.isStreaming ?? false,
 			}))
 			.sort((a, b) => b.updatedAt - a.updatedAt);
 		sendJson(res, 200, list);
@@ -1098,23 +1120,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	const packMatch = pathname.match(/^\/api\/packs\/([^/]+)\/(mount|unmount)$/);
 	if (packMatch && req.method === "POST") {
 		const [, packName, action] = packMatch;
-		const changed = action === "mount" ? mountPack(packName) : unmountPack(packName);
+		const changed = action === "mount" ? mountPack(packName) : deactivatePackForAllSessions(packName);
 		if (!changed) {
 			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
 			return;
-		}
-		// 全局启用只改变助手目录；停用时从已绑定会话移除，避免继续暴露其工具。
-		if (action === "unmount") {
-			for (const cs of sessions.values()) {
-				cs.enabledPacks.delete(packName);
-				cs.activePackTools.delete(packName);
-				cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
-			}
-			const index = readSessionIndex();
-			for (const entry of Object.values(index)) {
-				entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
-			}
-			writeSessionIndex(index);
 		}
 		sendJson(res, 200, { ok: true, mounted: action === "mount" });
 		return;
@@ -1172,6 +1181,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	}
 	if (pathname === "/api/tools/redteam/progress" && req.method === "GET") {
 		sendJson(res, 200, redteam.getInstallProgress());
+		return;
+	}
+	const toolUninstallMatch = pathname.match(/^\/api\/tools\/(officecli|redteam)$/);
+	if (toolUninstallMatch && req.method === "DELETE") {
+		const runningSessionIds = [...sessions.values()].filter((cs) => cs.session.isStreaming).map((cs) => cs.sessionId);
+		if (runningSessionIds.length > 0) {
+			sendJson(res, 409, { error: "仍有会话正在运行，请等待任务完成或停止后再卸载工具" });
+			return;
+		}
+		if (toolUninstallMatch[1] === "officecli") {
+			await officePreview.stopAllOfficePreviews();
+			const removedSkills = uninstallAllOfficeCliSkills(CONSOLE_AGENT_DIR);
+			const result = officecli.uninstall();
+			deactivatePackForAllSessions(OFFICECLI_PACK_NAME);
+			const reloadedSessions = removedSkills ? await reloadInstalledSkillsInSessions() : 0;
+			sendJson(res, 200, { ok: true, ...result, removedSkills, reloadedSessions });
+			return;
+		}
+		const removed = redteam.uninstall();
+		deactivatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
+		sendJson(res, 200, { ok: true, removed });
 		return;
 	}
 	if (pathname === "/api/office-preview/start" && req.method === "POST") {

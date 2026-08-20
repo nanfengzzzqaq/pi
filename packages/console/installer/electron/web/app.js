@@ -324,17 +324,19 @@ officePreviewResizerEl.addEventListener("pointerdown", (event) => {
 
 async function ensureSession() {
 	if (sessionId) {
+		const targetSessionId = sessionId;
 		try {
-			const history = await api(`/api/sessions/${sessionId}/history`);
+			const history = await api(`/api/sessions/${targetSessionId}/history`);
+			if (targetSessionId !== sessionId) return;
 			renderHistory(history);
 			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
 			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 			syncThinkingOptions(history.availableThinkingLevels);
 			renderSessionCapabilities(history.enabledCapabilities);
-			if (history.streaming) setRunning(true, true);
 			return;
 		} catch (error) {
 			if (error.status !== 404) throw error;
+			if (targetSessionId !== sessionId) return;
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
 		}
@@ -344,6 +346,8 @@ async function ensureSession() {
 	localStorage.setItem(SESSION_KEY, sessionId);
 	clearMessages();
 	const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+	if (history) renderHistory(history);
+	else setRunning(false, true);
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 	syncThinkingOptions(history?.availableThinkingLevels);
@@ -368,6 +372,8 @@ function syncThinkingOptions(availableLevels) {
 function clearMessages() {
 	messagesEl.querySelectorAll(".message").forEach((m) => m.remove());
 	messagesEmptyEl.hidden = false;
+	currentAssistant = null;
+	officeToolCalls.clear();
 }
 
 function renderHistory(history) {
@@ -409,7 +415,11 @@ function renderHistory(history) {
 			}
 		}
 	}
-	if (latestAssistant) latestAssistant.foldProcess();
+	if (latestAssistant) {
+		if (history.streaming) currentAssistant = latestAssistant;
+		else latestAssistant.foldProcess();
+	}
+	setRunning(Boolean(history.streaming), true);
 }
 
 function addCapabilitySelectionStep(container, event) {
@@ -441,18 +451,31 @@ function addModelUsageStep(container, usage, id) {
 // SSE
 // ---------------------------------------------------------------------------
 
+function disconnectSSE() {
+	clearTimeout(reconnectTimer);
+	reconnectTimer = null;
+	if (es) {
+		es.close();
+		es = null;
+	}
+}
+
 function connectSSE() {
 	if (!sessionId) return;
-	if (es) es.close();
+	disconnectSSE();
+	const connectedSessionId = sessionId;
 	const token = localStorage.getItem(TOKEN_KEY);
 	const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
-	es = new EventSource(`/api/sessions/${sessionId}/stream?since=${lastSeq}${tokenQuery}`);
+	const source = new EventSource(`/api/sessions/${connectedSessionId}/stream?since=${lastSeq}${tokenQuery}`);
+	es = source;
 
-	es.onopen = () => {
+	source.onopen = () => {
+		if (source !== es || connectedSessionId !== sessionId) return;
 		connStateEl.textContent = "已连接";
 		connStateEl.classList.remove("disconnected");
 	};
-	es.onmessage = (msg) => {
+	source.onmessage = (msg) => {
+		if (source !== es || connectedSessionId !== sessionId) return;
 		let event;
 		try {
 			event = JSON.parse(msg.data);
@@ -469,18 +492,22 @@ function connectSSE() {
 		}
 		handleEvent(event);
 	};
-	es.onerror = () => {
+	source.onerror = () => {
+		if (source !== es || connectedSessionId !== sessionId) return;
 		connStateEl.textContent = "重连中…";
 		connStateEl.classList.add("disconnected");
-		es.close();
+		source.close();
+		es = null;
 		clearTimeout(reconnectTimer);
 		reconnectTimer = setTimeout(connectSSE, 2000);
 	};
 }
 
 async function refreshFromHistory() {
+	const targetSessionId = sessionId;
 	try {
-		const history = await api(`/api/sessions/${sessionId}/history`);
+		const history = await api(`/api/sessions/${targetSessionId}/history`);
+		if (targetSessionId !== sessionId) return;
 		renderHistory(history);
 	} catch {
 		/* 等下次重连 */
@@ -501,14 +528,17 @@ async function loadSessions() {
 		}
 		for (const session of list) {
 			const row = document.createElement("div");
-			row.className = `session-row${session.id === sessionId ? " active" : ""}`;
+			row.className = `session-row${session.id === sessionId ? " active" : ""}${session.streaming ? " running" : ""}`;
 			row.dataset.sid = session.id;
 			const title = document.createElement("div");
 			title.className = "session-title";
 			title.textContent = session.title;
 			const meta = document.createElement("div");
-			meta.className = "session-meta";
-			meta.textContent = `${new Date(session.updatedAt).toLocaleDateString("zh-CN")} ${session.active ? "· 当前" : ""}`;
+			meta.className = `session-meta${session.streaming ? " running" : ""}`;
+			const states = [];
+			if (session.id === sessionId) states.push("当前");
+			if (session.streaming) states.push("运行中");
+			meta.textContent = `${new Date(session.updatedAt).toLocaleDateString("zh-CN")}${states.length ? ` · ${states.join(" · ")}` : ""}`;
 			row.appendChild(title);
 			row.appendChild(meta);
 			row.addEventListener("click", () => switchSession(session.id));
@@ -528,12 +558,15 @@ async function loadSessions() {
 async function switchSession(id) {
 	if (id === sessionId) return;
 	await closeOfficePreview();
+	disconnectSSE();
 	sessionId = id;
 	localStorage.setItem(SESSION_KEY, id);
 	clearMessages();
+	setRunning(false, true);
 	lastSeq = -1;
 	try {
 		await ensureSession();
+		if (id !== sessionId) return;
 		connectSSE();
 		await loadSessions();
 		await pollContext();
@@ -561,10 +594,8 @@ async function deleteSession(id) {
 				await switchSession(list[0].id);
 			} else {
 				// 没有会话了：保持空状态，页面显示空（用户可点 ＋ 新对话）
-				if (es) {
-					es.close();
-					es = null;
-				}
+				disconnectSSE();
+				setRunning(false, true);
 				connStateEl.textContent = "空闲";
 			}
 		}
@@ -634,6 +665,7 @@ document.addEventListener("contextmenu", hideSessionContextMenu);
 sessionNewBtnEl.addEventListener("click", async () => {
 	try {
 		await closeOfficePreview();
+		disconnectSSE();
 		const result = await api("/api/sessions", { method: "POST", body: "{}" });
 		sessionId = result.sessionId;
 		localStorage.setItem(SESSION_KEY, sessionId);
@@ -693,8 +725,10 @@ function renderContextRing(info) {
 
 async function pollContext() {
 	if (!sessionId) return;
+	const targetSessionId = sessionId;
 	try {
-		const info = await api(`/api/sessions/${sessionId}/context`);
+		const info = await api(`/api/sessions/${targetSessionId}/context`);
+		if (targetSessionId !== sessionId) return;
 		renderContextRing(info);
 		renderSessionCapabilities(info.enabledCapabilities);
 	} catch {
@@ -730,8 +764,11 @@ contextBtnEl.addEventListener("click", async () => {
 	}
 });
 
-// 每 5 秒刷新一次上下文圆环
-setInterval(pollContext, 5000);
+// 每 5 秒刷新当前上下文和左侧后台任务状态。
+setInterval(() => {
+	void pollContext();
+	void loadSessions();
+}, 5000);
 
 // ---------------------------------------------------------------------------
 // 事件处理
@@ -1756,6 +1793,7 @@ window.addEventListener("paste", (e) => {
 async function sendMessage() {
 	const text = inputEl.value.trim();
 	if ((!text && pendingAttachments.length === 0) || running || !sessionId) return;
+	const targetSessionId = sessionId;
 	const attachmentsToSend = [...pendingAttachments];
 	inputEl.value = "";
 	resizeComposerInput();
@@ -1770,25 +1808,27 @@ async function sendMessage() {
 		}
 		let savedPaths = [];
 		if (attachmentsToSend.length > 0) {
-			const saved = await api(`/api/sessions/${sessionId}/files`, {
+			const saved = await api(`/api/sessions/${targetSessionId}/files`, {
 				method: "POST",
 				body: JSON.stringify({
 					files: attachmentsToSend.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })),
 				}),
 			});
 			savedPaths = saved.files;
-			pendingAttachments = [];
+			pendingAttachments = pendingAttachments.filter((attachment) => !attachmentsToSend.includes(attachment));
 			renderAttachments();
 		}
-		appendMessage("user", text || `发送了 ${attachmentsToSend.length} 个文件`, savedPaths);
-		await api(`/api/sessions/${sessionId}/messages`, {
+		if (targetSessionId === sessionId) {
+			appendMessage("user", text || `发送了 ${attachmentsToSend.length} 个文件`, savedPaths);
+		}
+		await api(`/api/sessions/${targetSessionId}/messages`, {
 			method: "POST",
 			body: JSON.stringify({ text, images, attachments: savedPaths }),
 		});
-		loadSessions(); // 首条消息后标题更新，刷新左侧对话列表
+		void loadSessions(); // 首条消息后标题更新，并显示后台运行状态。
 	} catch (error) {
 		showError(error.message);
-		setRunning(false);
+		if (targetSessionId === sessionId) setRunning(false);
 	}
 }
 
@@ -2039,6 +2079,16 @@ function createCard(item, options) {
 			await options.onInstall(install);
 		});
 		actions.appendChild(install);
+	} else if (options.onUninstall) {
+		const uninstall = document.createElement("button");
+		uninstall.type = "button";
+		uninstall.className = "secondary-btn small danger";
+		uninstall.textContent = "卸载";
+		uninstall.addEventListener("click", async (event) => {
+			event.stopPropagation();
+			await options.onUninstall(uninstall);
+		});
+		actions.appendChild(uninstall);
 	}
 	card.append(main, actions);
 	card.addEventListener("click", options.onOpen);
@@ -2047,6 +2097,27 @@ function createCard(item, options) {
 
 function installDispatcher(tool) {
 	return tool.id === "redteam" ? installRedTeam : installOfficeCli;
+}
+
+async function uninstallTool(tool, button) {
+	const extra =
+		tool.id === "officecli"
+			? "同时会删除客户端安装的 OfficeCLI 官方技能；已生成的文档不会删除。"
+			: "已生成的红队配置和工作区报告不会删除。";
+	if (!window.confirm(`卸载 ${tool.displayName}？\n\n${extra}`)) return;
+	button.disabled = true;
+	button.textContent = "卸载中…";
+	try {
+		await api(`/api/tools/${tool.id}`, { method: "DELETE" });
+		closeDrawer();
+		await refreshCatalog();
+		await loadSessions();
+		showInfo(`${tool.displayName} 已卸载`);
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "卸载";
+		showError(`${tool.displayName} 卸载失败：${error.message}`);
+	}
 }
 
 function installDuration(elapsedMs) {
@@ -2093,6 +2164,7 @@ function renderTools(query) {
 				icon: tool.icon,
 				onOpen: () => openToolDetail(tool),
 				onInstall: installDispatcher(tool),
+				onUninstall: (button) => uninstallTool(tool, button),
 				...installState,
 			}),
 		);
@@ -2343,6 +2415,15 @@ function openToolDetail(tool) {
 		install.title = installState.installTitle;
 		install.addEventListener("click", () => installDispatcher(tool)(install));
 		actions.appendChild(install);
+		drawerContentEl.appendChild(actions);
+	} else {
+		const actions = document.createElement("div");
+		actions.className = "drawer-actions";
+		const uninstall = document.createElement("button");
+		uninstall.className = "secondary-btn danger";
+		uninstall.textContent = "卸载工具";
+		uninstall.addEventListener("click", () => uninstallTool(tool, uninstall));
+		actions.appendChild(uninstall);
 		drawerContentEl.appendChild(actions);
 	}
 	drawerEl.hidden = false;
