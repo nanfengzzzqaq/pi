@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isAgentBrowserRuntimeAvailable } from "./agent-browser-runtime.ts";
 import { extractFileReferences } from "./artifacts.ts";
+import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
 import * as fsExplorer from "./fs.ts";
@@ -88,6 +89,7 @@ process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
 const AGENT_BROWSER_PACK_NAME = "agent-browser";
+const CODE_DEVELOPMENT_PACK_NAME = "code-development";
 const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
 	sevenzip: "archive-files",
 	ocr: "image-ocr",
@@ -312,6 +314,8 @@ if (seedBundledSearchRuntime()) {
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
+if (codeDevelopment.isCodeDevelopmentInstalled()) activatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
+else deactivatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
 // 桌面版主进程注册运行时后才挂载；纯网页模式不向模型暴露不可执行的浏览器工具。
 if (isAgentBrowserRuntimeAvailable()) activatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
 else deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
@@ -763,6 +767,13 @@ async function buildCapabilityCatalog() {
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
 	const browserPack = listPacks().find((item) => item.name === AGENT_BROWSER_PACK_NAME);
+	const codeDevelopmentStatus = codeDevelopment.getCodeDevelopmentStatus();
+	const codeDevelopmentPack = listPacks().find((item) => item.name === CODE_DEVELOPMENT_PACK_NAME);
+	const codeDevelopmentCwd = workspace.getWorkspacePath() ?? DATA_DIR;
+	const githubAccount = await codeDevelopment.getGithubAccountStatus(codeDevelopmentCwd);
+	const developmentComponents = codeDevelopment.getDeveloperComponents();
+	const developmentProject = codeDevelopment.detectProjectEnvironment(codeDevelopmentCwd);
+	const developmentSkill = codeDevelopment.codeDevelopmentSkillInfo();
 	const managedStatus = Object.fromEntries(
 		(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
 			id,
@@ -772,6 +783,30 @@ async function buildCapabilityCatalog() {
 	const packByName = new Map(listPacks().map((item) => [item.name, item]));
 	return {
 		tools: [
+			{
+				id: "code-development",
+				internalName: "code-development",
+				displayName: "代码开发",
+				description:
+					"一个完整的 Windows 开发能力：编辑代码、审核差异、管理 Git/GitHub，并按项目安装 Node.js、Python、Java、Go、Rust 与 .NET 环境。",
+				category: "代码开发",
+				formats: ["Git", "GitHub", "JavaScript", "TypeScript", "Python", "Java", "Go", "Rust", ".NET"],
+				installed: codeDevelopmentStatus.installed,
+				version: codeDevelopmentStatus.version,
+				installPath: codeDevelopmentStatus.path,
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "</>",
+				sourceName: "mise、GitHub CLI 与 Monaco 官方组件",
+				sourceUrl: "https://mise.jdx.dev/",
+				activation: "识别到代码、Git 或 GitHub 任务时按本轮加载",
+				capabilities: codeDevelopmentPack?.tools ?? [],
+				skillCount: 1,
+				installedSkillCount: developmentSkill.installed ? 1 : 0,
+				components: developmentComponents,
+				github: githubAccount,
+				githubProgress: codeDevelopment.getGithubLoginProgress(),
+				project: developmentProject,
+			},
 			{
 				id: "agent-browser",
 				internalName: "agent-browser",
@@ -913,6 +948,15 @@ async function buildCapabilityCatalog() {
 		],
 		skillGroups: [
 			{
+				toolId: "code-development",
+				toolInternalName: "code-development",
+				toolDisplayName: "代码开发",
+				toolInstalled: codeDevelopmentStatus.installed,
+				icon: "",
+				iconText: "</>",
+				skills: [developmentSkill],
+			},
+			{
 				toolId: "officecli",
 				toolInternalName: "officecli",
 				toolDisplayName: "Office 文件处理",
@@ -923,6 +967,7 @@ async function buildCapabilityCatalog() {
 		],
 		download: officecli.getDownloadProgress(),
 		redteamDownload: redteam.getInstallProgress(),
+		codeDevelopmentDownload: codeDevelopment.getCodeDevelopmentProgress(),
 		toolProgress: Object.fromEntries(
 			(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
 				id,
@@ -1201,6 +1246,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 	const pathname = url.pathname;
 
 	if (req.method === "GET" && serveStatic(pathname, res)) return;
+	if (req.method === "GET" && pathname.startsWith("/code-development/monaco/")) {
+		const asset = codeDevelopment.resolveMonacoAsset(
+			decodeURIComponent(pathname.slice("/code-development/monaco/".length)),
+		);
+		if (!asset) {
+			sendJson(res, 404, { error: "代码开发插件未安装或 Monaco 资源不存在" });
+			return;
+		}
+		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
+		createReadStream(asset.path).pipe(res);
+		return;
+	}
 	if (req.method === "GET" && pathname.startsWith("/pdfjs/")) {
 		const asset = managedFileTools.resolvePdfJsAsset(decodeURIComponent(pathname.slice("/pdfjs/".length)));
 		if (!asset) {
@@ -1271,6 +1328,79 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// 工具与技能目录（当前仅 OfficeCLI）
 	if (pathname === "/api/catalog" && req.method === "GET") {
 		sendJson(res, 200, await buildCapabilityCatalog());
+		return;
+	}
+	if (pathname === "/api/tools/code-development/install" && req.method === "POST") {
+		const started = codeDevelopment.startCodeDevelopmentInstall();
+		if (!started) {
+			sendJson(res, 409, { error: "代码开发插件安装已在进行中" });
+			return;
+		}
+		void (async () => {
+			while (codeDevelopment.getCodeDevelopmentProgress().running) {
+				await new Promise((resolvePromise) => setTimeout(resolvePromise, 750));
+			}
+			if (!codeDevelopment.getCodeDevelopmentProgress().error) {
+				activatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
+				await reloadInstalledSkillsInSessions();
+			}
+		})();
+		sendJson(res, 202, { ok: true });
+		return;
+	}
+	if (pathname === "/api/tools/code-development/progress" && req.method === "GET") {
+		sendJson(res, 200, codeDevelopment.getCodeDevelopmentProgress());
+		return;
+	}
+	if (pathname === "/api/tools/code-development/github" && req.method === "GET") {
+		sendJson(res, 200, await codeDevelopment.getGithubAccountStatus(workspace.getWorkspacePath() ?? DATA_DIR));
+		return;
+	}
+	if (pathname === "/api/tools/code-development/github/login" && req.method === "POST") {
+		const started = codeDevelopment.startGithubLogin(workspace.getWorkspacePath() ?? DATA_DIR);
+		if (!started) {
+			sendJson(res, 409, { error: "GitHub 登录已在进行中" });
+			return;
+		}
+		sendJson(res, 202, { ok: true });
+		return;
+	}
+	if (pathname === "/api/tools/code-development/github/progress" && req.method === "GET") {
+		sendJson(res, 200, codeDevelopment.getGithubLoginProgress());
+		return;
+	}
+	if (pathname === "/api/tools/code-development/github" && req.method === "DELETE") {
+		await codeDevelopment.logoutGithub(workspace.getWorkspacePath() ?? DATA_DIR);
+		sendJson(res, 200, { ok: true });
+		return;
+	}
+	const developmentComponentMatch = pathname.match(
+		/^\/api\/tools\/code-development\/components\/(node|python|java|go|rust|dotnet)(?:\/(install|progress))?$/,
+	);
+	if (developmentComponentMatch) {
+		const id = developmentComponentMatch[1] as codeDevelopment.DeveloperComponentId;
+		const action = developmentComponentMatch[2];
+		if (req.method === "POST" && action === "install") {
+			const started = codeDevelopment.startDeveloperComponentInstall(id, workspace.getWorkspacePath() ?? DATA_DIR);
+			if (!started) {
+				sendJson(res, 409, { error: `${id} 安装已在进行中` });
+				return;
+			}
+			sendJson(res, 202, { ok: true });
+			return;
+		}
+		if (req.method === "GET" && action === "progress") {
+			const component = codeDevelopment.getDeveloperComponents().find((item) => item.id === id);
+			sendJson(res, 200, component?.progress ?? { error: `未知开发环境：${id}` });
+			return;
+		}
+		if (req.method === "DELETE" && !action) {
+			sendJson(res, 200, { ok: true, removed: await codeDevelopment.uninstallDeveloperComponent(id) });
+			return;
+		}
+	}
+	if (pathname === "/api/tools/code-development/repository" && req.method === "GET") {
+		sendJson(res, 200, await codeDevelopment.getRepositorySummary(workspace.getWorkspacePath() ?? DATA_DIR));
 		return;
 	}
 	const officeSkillInstallMatch = pathname.match(/^\/api\/tools\/officecli\/skills\/([a-z0-9-]+)\/install$/);
@@ -1392,7 +1522,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		);
 		return;
 	}
-	const toolUninstallMatch = pathname.match(/^\/api\/tools\/(officecli|redteam|pdfjs|sevenzip|ocr|libreoffice)$/);
+	const toolUninstallMatch = pathname.match(
+		/^\/api\/tools\/(officecli|redteam|code-development|pdfjs|sevenzip|ocr|libreoffice)$/,
+	);
 	if (toolUninstallMatch && req.method === "DELETE") {
 		const runningSessionIds = [...sessions.values()].filter((cs) => cs.session.isStreaming).map((cs) => cs.sessionId);
 		if (runningSessionIds.length > 0) {
@@ -1412,6 +1544,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const removed = redteam.uninstall();
 			deactivatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
 			sendJson(res, 200, { ok: true, removed });
+			return;
+		}
+		if (toolUninstallMatch[1] === "code-development") {
+			const removed = codeDevelopment.uninstallCodeDevelopment();
+			deactivatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
+			const reloadedSessions = await reloadInstalledSkillsInSessions();
+			sendJson(res, 200, { ok: true, removed, reloadedSessions });
 			return;
 		}
 		const id = toolUninstallMatch[1] as managedFileTools.ManagedToolId;
@@ -1612,6 +1751,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 200, fsExplorer.readTextFile(url.searchParams.get("path") ?? ""));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/text" && req.method === "PUT") {
+		const body = (await readBodyJson(req, 12 * 1024 * 1024)) as {
+			path?: unknown;
+			text?: unknown;
+			expectedSha256?: unknown;
+		};
+		if (
+			typeof body?.path !== "string" ||
+			typeof body?.text !== "string" ||
+			typeof body?.expectedSha256 !== "string"
+		) {
+			sendJson(res, 400, { error: '请求体需为 {"path":"...","text":"...","expectedSha256":"..."}' });
+			return;
+		}
+		try {
+			sendJson(res, 200, fsExplorer.writeTextFile(body.path, body.text, body.expectedSha256));
+		} catch (error) {
+			sendJson(res, 409, { error: error instanceof Error ? error.message : String(error) });
 		}
 		return;
 	}

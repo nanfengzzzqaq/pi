@@ -1,4 +1,4 @@
-# @pi/console — Pi Web 控制台（能力包框架 + Office 助手包 + Windows 安装包）
+# @pi/console — Pi 桌面控制台（按需能力包 + Windows 安装包）
 
 在浏览器里使用 Pi：`node:http` 原生后端 + 纯 HTML/JS/CSS 前端，无新增 npm 依赖、无构建步骤。
 默认形态为**纯净原生 Pi**（内置 read/bash/edit/write 工具，官方系统提示词）；能力包通过 `customTools` 注册、
@@ -39,6 +39,7 @@ npx tsx packages/console/src/server.ts
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
 - **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup，校验 SHA256 后静默重装，并从用户实际安装位置自动重启；私有仓库需在设置里填写 GitHub Token）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
+- **代码开发插件**：工具页只有一个“代码开发（code-development）”入口，内部统一提供 Monaco 编辑器、私有 Git/GitHub 工作流，以及按项目安装的 Node.js、Python、Java、Go、Rust、.NET 环境。组件都保存在 Pi 数据目录，不修改 Windows 系统 PATH，也不覆盖电脑已有环境。
 
 ## 客户端形态
 
@@ -98,6 +99,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `GET /api/officecli/status` | OfficeCLI 安装状态 `{installed,version,latestVersion,latestTag,updateAvailable,path}`（查 latest 失败优雅降级为 null） |
 | `POST /api/officecli/download` | 从 iOfficeAI/OfficeCLI 官方 Release 下载当前平台资产，SHA256 校验（asset digest 优先，其次官方 SHA256SUMS），先落临时文件、备份旧版再替换 |
 | `GET /api/officecli/progress` | 下载进度（轮询） |
+| `POST /api/tools/code-development/install` | 安装并校验代码开发插件核心（mise、GitHub CLI、Monaco） |
+| `GET /api/tools/code-development/github` | 读取插件私有 GitHub 登录状态；`POST .../login` 浏览器登录，`DELETE` 退出 |
+| `POST /api/tools/code-development/components/:id/install` | 按需安装 `node/python/java/go/rust/dotnet` 环境，进度见同路径 `/progress` |
+| `GET /api/tools/code-development/repository` | 返回当前工作区 Git 状态与暂存/未暂存差异 |
+| `PUT /api/fs/text` | 用打开时的 SHA256 防并发覆盖，保存 UTF-8/UTF-16 代码文件 |
 
 ## 能力包
 
@@ -110,6 +116,16 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 通过 OfficeCLI 操作 Word/Excel/PowerPoint，按真实命令树划分 13 个工具（`office_create` / `office_view` / `office_get` / `office_query` / `office_add` / `office_set` / `office_remove` / `office_move` / `office_swap` / `office_batch` / `office_import` / `office_merge` / `office_help`），参数用 TypeBox 明确声明，execFile 数组传参（禁 shell 拼接），cwd = 会话工作目录，超时 120 秒，输出截断 8000 字符，**不注入提示词**。二进制缺失时工具返回"OfficeCLI 未安装，请在页面点击下载"。
 
 二进制位置：`packages/console/data/bin/officecli.exe`（版本记录在 `data/bin/officecli.json`）。只检查、不自动下载；页面上"能力包 → Office 助手 → 下载/更新"按钮一键安装（33MB 带进度条与 SHA256 校验）。
+
+### 代码开发包（code-development）
+
+对用户只显示一个插件，内部组件分三层：
+
+- 核心：Monaco 代码编辑器、GitHub CLI、mise 环境管理器。
+- 项目环境：Node.js、Python、Java、Go、Rust、.NET，各自可安装和卸载；以后新增语言只需补充组件清单和识别标记，不增加新的工具卡片。
+- 智能体能力：仓库状态（`git_status`）、代码差异（`git_diff`）、分支（`git_branch`）、提交（`git_commit`）、同步（`git_sync`）、GitHub 仓库（`github_repository`）、拉取请求（`github_pull_request`）、项目环境（`development_environment`）。
+
+插件只在代码、Git 或 GitHub 任务命中时加载相应工具组；普通问候不会注入这些工具定义。GitHub 登录、Git 全局配置、语言环境和缓存全部放在 `<PI_CONSOLE_DATA>/tools/code-development/`，从而与电脑上已有开发环境隔离。配套技能安装到控制台私有智能体目录，要求先检查、再修改、运行验证、审核差异，并且只有用户明确授权才提交或推送。
 
 ## 前端
 

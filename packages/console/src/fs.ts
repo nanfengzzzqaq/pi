@@ -4,6 +4,7 @@
  * Windows 安装版可直接浏览本机磁盘，作为客户端内置的资源管理器；
  * 非 Windows 环境仍限制在工作区、数据目录与显式配置目录内。
  */
+import { createHash } from "node:crypto";
 import { copyFileSync, type Dirent, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { DATA_DIR } from "./paths.ts";
@@ -170,13 +171,64 @@ export function readFileAsBase64(path: string): { dataBase64: string; mimeType: 
 	return { dataBase64: data.toString("base64"), mimeType: mimeForPath(abs), size: stat.size };
 }
 
-export function readTextFile(path: string): { text: string; encoding: string; size: number; mimeType: string } {
+export function readTextFile(path: string): {
+	text: string;
+	encoding: string;
+	size: number;
+	mimeType: string;
+	sha256: string;
+} {
 	const abs = resolveAllowedFilePath(path);
 	if (!isTextFilePath(abs)) throw new Error("该文件不是可直接预览的文本格式");
 	const stat = statSync(abs);
 	if (stat.size > MAX_READ_BYTES) throw new Error(`文本文件超过 ${MAX_READ_BYTES / 1024 / 1024}MB，无法直接预览`);
-	const decoded = decodeTextBuffer(readFileSync(abs));
-	return { ...decoded, size: stat.size, mimeType: mimeForPath(abs) };
+	const data = readFileSync(abs);
+	const decoded = decodeTextBuffer(data);
+	return {
+		...decoded,
+		size: stat.size,
+		mimeType: mimeForPath(abs),
+		sha256: createHash("sha256").update(data).digest("hex"),
+	};
+}
+
+/** 保存 Monaco 编辑器中的文本；用打开时的 SHA256 防止覆盖外部并发修改。 */
+export function writeTextFile(path: string, text: string, expectedSha256: string): ReturnType<typeof readTextFile> {
+	const abs = resolveAllowedFilePath(path);
+	if (!isTextFilePath(abs)) throw new Error("该文件不是可编辑的文本格式");
+	const current = readFileSync(abs);
+	const actualSha256 = createHash("sha256").update(current).digest("hex");
+	if (expectedSha256 && actualSha256 !== expectedSha256) {
+		throw new Error("文件已被其他程序修改，请重新打开后再保存");
+	}
+	const decoded = decodeTextBuffer(current);
+	let encoded: Buffer;
+	if (decoded.encoding === "utf-16le") {
+		const body = Buffer.from(text, "utf16le");
+		encoded = current.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))
+			? Buffer.concat([Buffer.from([0xff, 0xfe]), body])
+			: body;
+	} else if (decoded.encoding === "utf-16be") {
+		const little = Buffer.from(text, "utf16le");
+		const big = Buffer.allocUnsafe(little.length);
+		for (let index = 0; index < little.length; index += 2) {
+			big[index] = little[index + 1] ?? 0;
+			big[index + 1] = little[index] ?? 0;
+		}
+		encoded = current.subarray(0, 2).equals(Buffer.from([0xfe, 0xff]))
+			? Buffer.concat([Buffer.from([0xfe, 0xff]), big])
+			: big;
+	} else if (decoded.encoding === "utf-8") {
+		const body = Buffer.from(text, "utf8");
+		encoded = current.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))
+			? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body])
+			: body;
+	} else {
+		throw new Error(`当前编辑器不会改写 ${decoded.encoding} 编码文件，请先转换为 UTF-8`);
+	}
+	if (encoded.length > MAX_READ_BYTES) throw new Error(`保存内容超过 ${MAX_READ_BYTES / 1024 / 1024}MB 上限`);
+	writeFileSync(abs, encoded);
+	return readTextFile(abs);
 }
 
 /** 在当前目录下递归搜索文件名或文本内容；全程本地执行，不调用模型。 */

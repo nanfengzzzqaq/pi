@@ -1,6 +1,6 @@
 {
 	"name": "pi-console-electron",
-	"version": "0.3.23",
+	"version": "0.3.24",
 	"private": true,
 	"description": "Pi 控制台 Electron 壳（主进程）",
 	"main": "main.js",
@@ -35,6 +35,7 @@
 			"src/**",
 			"web/**",
 			"packs/**",
+			"skills/**",
 			"data/**",
 			"extra/**",
 			"package.json",
@@ -43,6 +44,7 @@
 		"asarUnpack": [
 			"src/**",
 			"packs/**",
+			"skills/**",
 			"web/**",
 			"data/**",
 			"extra/**"

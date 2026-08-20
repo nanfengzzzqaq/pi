@@ -1,6 +1,6 @@
 ﻿# Pi 控制台 Electron 版构建脚本
 #
-# 流程：版本同步（读 console package.json）→ 拷贝 src/web/packs → 安装生产依赖
+# 流程：版本同步（读 console package.json）→ 拷贝 src/web/packs/skills → 安装生产依赖
 #       → electron-builder 打 NSIS 安装包
 # 产物：installer/electron/dist/Pi控制台-Setup-<version>.exe
 #
@@ -23,7 +23,7 @@ node (Join-Path $PSScriptRoot "sync-version.cjs") (Join-Path $ConsoleDir "packag
 $Version = (node (Join-Path $PSScriptRoot "get-version.cjs") (Join-Path $ElectronDir "package.json")).Trim()
 
 # 2. 拷贝最新源码
-foreach ($Dir in @("src", "web", "packs")) {
+foreach ($Dir in @("src", "web", "packs", "skills")) {
     $Target = Join-Path $ElectronDir $Dir
     if (Test-Path $Target) { Remove-Item $Target -Recurse -Force }
     Copy-Item (Join-Path $ConsoleDir $Dir) $Target -Recurse

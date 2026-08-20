@@ -23,6 +23,7 @@ const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_TIMEOUT_SECONDS = 2_147_000;
 const PRIVATE_MINGIT_DIR = join(DATA_DIR, "runtime", "mingit");
 const PRIVATE_AGENT_BIN_DIR = join(DATA_DIR, "agent", "bin");
+const CODE_DEVELOPMENT_DIR = join(DATA_DIR, "tools", "code-development");
 
 export interface WindowsToolContext {
 	getWorkspaceRoot(): string;
@@ -205,9 +206,18 @@ function formatResult(result: CommandResult): string {
 function privateBashEnvironment(root: string, source: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
 	const env = { ...(source ?? process.env) };
 	const pathKey = Object.keys(env).find((key) => key.toLocaleLowerCase("en-US") === "path") ?? "PATH";
-	const privatePaths = [join(root, "cmd"), join(root, "mingw64", "bin")];
+	const privatePaths = [join(CODE_DEVELOPMENT_DIR, "bin"), join(root, "cmd"), join(root, "mingw64", "bin")];
 	env[pathKey] = [...privatePaths, env[pathKey] ?? ""].filter(Boolean).join(delimiter);
 	env.PI_PRIVATE_BASH = "1";
+	env.MISE_DATA_DIR = join(CODE_DEVELOPMENT_DIR, "mise", "data");
+	env.MISE_CONFIG_DIR = join(CODE_DEVELOPMENT_DIR, "mise", "config");
+	env.MISE_CACHE_DIR = join(CODE_DEVELOPMENT_DIR, "mise", "cache");
+	env.MISE_STATE_DIR = join(CODE_DEVELOPMENT_DIR, "mise", "state");
+	env.MISE_YES = "1";
+	if (existsSync(join(CODE_DEVELOPMENT_DIR, "bin", "mise.exe"))) {
+		env.GH_CONFIG_DIR = join(CODE_DEVELOPMENT_DIR, "github");
+		env.GIT_CONFIG_GLOBAL = join(CODE_DEVELOPMENT_DIR, "gitconfig");
+	}
 	return env;
 }
 
