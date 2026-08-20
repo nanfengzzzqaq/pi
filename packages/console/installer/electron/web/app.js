@@ -373,14 +373,20 @@ function renderHistory(history) {
 	clearMessages();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
 	let latestAssistant = null;
+	let pendingCapabilityTrace = null;
 	for (const item of history.messages) {
 		if (item.role === "user") {
 			if (latestAssistant) latestAssistant.foldProcess();
 			latestAssistant = null;
+			pendingCapabilityTrace = item.capabilityTrace || null;
 			appendMessage("user", item.text || (item.attachments?.length ? `发送了 ${item.attachments.length} 个文件` : ""), item.attachments);
 		} else if (item.role === "assistant") {
 			const container = latestAssistant || appendMessage("assistant", "");
 			latestAssistant = container;
+			if (pendingCapabilityTrace) {
+				addCapabilitySelectionStep(container, pendingCapabilityTrace);
+				pendingCapabilityTrace = null;
+			}
 			if (item.text) container.appendHistoryText(item.text);
 			if (Array.isArray(item.toolCalls)) {
 				for (const call of item.toolCalls) {
@@ -389,6 +395,7 @@ function renderHistory(history) {
 					if (path) container.addArtifactPath(path);
 				}
 			}
+			if (item.usage) addModelUsageStep(container, item.usage, `history-usage-${item.timestamp}`);
 			void container.finalizeArtifacts();
 			if (item.errorMessage) showError(item.errorMessage);
 		} else if (item.role === "toolResult") {
@@ -402,6 +409,31 @@ function renderHistory(history) {
 		}
 	}
 	if (latestAssistant) latestAssistant.foldProcess();
+}
+
+function addCapabilitySelectionStep(container, event) {
+	const block = appendToolBlock(
+		event.stepId,
+		event.stepDisplayName || "查找可用能力（capability_search）",
+		{
+			检查范围: (event.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`),
+			选择方式: "本地规则，零模型 token",
+		},
+		"done",
+	);
+	updateToolBlock(block, false, formatCapabilitySelection(event));
+	container.addTool(block);
+}
+
+function addModelUsageStep(container, usage, id) {
+	const block = appendToolBlock(
+		id,
+		"模型用量（model_usage）",
+		{ 统计来源: "模型服务商返回的本轮实际用量" },
+		"done",
+	);
+	updateToolBlock(block, false, formatModelUsage(usage));
+	container.addTool(block);
 }
 
 // ---------------------------------------------------------------------------
@@ -735,30 +767,13 @@ function handleEvent(event) {
 			break;
 		}
 		case "capability_selection": {
-			const block = appendToolBlock(
-				event.stepId,
-				event.stepDisplayName || "查找可用能力（capability_search）",
-				{
-					检查范围: (event.enabledCapabilities || []).map((item) => `${item.displayName}（${item.name}）`),
-					选择方式: "本地规则，零模型 token",
-				},
-				"done",
-			);
-			updateToolBlock(block, false, formatCapabilitySelection(event));
-			ensureAssistant().addTool(block);
+			addCapabilitySelectionStep(ensureAssistant(), event);
 			break;
 		}
 		case "turn_end":
 			if (event.stopReason === "error") showError(event.errorMessage || "模型返回错误");
 			if (event.usage && currentAssistant) {
-				const block = appendToolBlock(
-					`usage-${event.seq}`,
-					"模型用量（model_usage）",
-					{ 统计来源: "模型服务商返回的本轮实际用量" },
-					"done",
-				);
-				updateToolBlock(block, false, formatModelUsage(event.usage));
-				currentAssistant.addTool(block);
+				addModelUsageStep(currentAssistant, event.usage, `usage-${event.seq}`);
 			}
 			if (currentAssistant) void currentAssistant.finalizeArtifacts();
 			setIndicator(false);
