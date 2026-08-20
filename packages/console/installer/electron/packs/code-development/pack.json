@@ -4,39 +4,131 @@
 	"description": "在工作区内编写、验证和提交代码，并连接 GitHub",
 	"version": "1.0.0",
 	"activation": {
-		"extensions": [".js", ".jsx", ".ts", ".tsx", ".py", ".java", ".go", ".rs", ".cs", ".cpp", ".c", ".html", ".css", ".json", ".toml", ".yaml"],
-		"keywords": ["代码", "编程", "开发", "仓库", "Git", "GitHub", "提交", "推送", "分支", "拉取请求", "测试", "构建", "修复 bug"],
+		"extensions": [
+			".js",
+			".jsx",
+			".ts",
+			".tsx",
+			".py",
+			".java",
+			".go",
+			".rs",
+			".cs",
+			".cpp",
+			".c",
+			".html",
+			".css",
+			".json",
+			".toml",
+			".yaml"
+		],
+		"keywords": [
+			"代码",
+			"编程",
+			"开发",
+			"仓库",
+			"Git",
+			"GitHub",
+			"提交",
+			"推送",
+			"分支",
+			"拉取请求",
+			"测试",
+			"构建",
+			"修复 bug"
+		],
 		"minimumScore": 2,
-		"defaultGroups": ["inspect"]
+		"defaultGroups": [
+			"inspect"
+		]
 	},
 	"toolGroups": [
 		{
 			"name": "inspect",
 			"displayName": "检查代码仓库",
 			"description": "识别项目并查看仓库状态与代码差异",
-			"tools": ["git_status", "git_diff", "development_environment"],
-			"keywords": ["代码", "项目", "仓库", "检查", "差异", "测试", "构建", "环境"]
+			"tools": [
+				"git_status",
+				"git_diff",
+				"development_environment",
+				"git_log"
+			],
+			"keywords": [
+				"代码",
+				"项目",
+				"仓库",
+				"检查",
+				"差异",
+				"测试",
+				"构建",
+				"环境"
+			]
 		},
 		{
 			"name": "change",
 			"displayName": "管理代码修改",
 			"description": "管理分支、提交以及远端同步",
-			"tools": ["git_status", "git_diff", "git_branch", "git_commit", "git_sync"],
-			"keywords": ["分支", "提交", "commit", "拉取", "pull", "推送", "push", "同步"]
+			"tools": [
+				"git_status",
+				"git_diff",
+				"git_branch",
+				"git_commit",
+				"git_sync"
+			],
+			"keywords": [
+				"分支",
+				"提交",
+				"commit",
+				"拉取",
+				"pull",
+				"推送",
+				"push",
+				"同步"
+			]
 		},
 		{
 			"name": "github",
 			"displayName": "GitHub 协作",
 			"description": "管理 GitHub 仓库、拉取请求和自动化检查",
-			"tools": ["github_repository", "github_pull_request", "git_status", "git_diff", "git_sync"],
-			"keywords": ["GitHub", "仓库", "克隆", "创建仓库", "拉取请求", "PR", "检查", "Actions"]
+			"tools": [
+				"github_repository",
+				"github_issue",
+				"github_pull_request",
+				"git_status",
+				"git_diff",
+				"git_sync",
+				"git_log"
+			],
+			"keywords": [
+				"GitHub",
+				"仓库",
+				"克隆",
+				"创建仓库",
+				"拉取请求",
+				"PR",
+				"检查",
+				"Actions"
+			]
 		},
 		{
 			"name": "environment",
 			"displayName": "项目环境",
 			"description": "识别、安装并运行项目所需的语言环境",
-			"tools": ["development_environment"],
-			"keywords": ["环境", "Node", "Python", "Java", "Go", "Rust", ".NET", "运行", "测试", "构建"]
+			"tools": [
+				"development_environment"
+			],
+			"keywords": [
+				"环境",
+				"Node",
+				"Python",
+				"Java",
+				"Go",
+				"Rust",
+				".NET",
+				"运行",
+				"测试",
+				"构建"
+			]
 		}
 	]
 }

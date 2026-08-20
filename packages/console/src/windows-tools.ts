@@ -5,7 +5,7 @@
  * 程序存在，因此控制台额外提供 PowerShell 工具。它始终用系统绝对路径启动，
  * 不写注册表、不修改系统 PATH，也不会覆盖电脑已有的 Git/Python/PowerShell。
  */
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -21,6 +21,7 @@ import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 const MAX_OUTPUT_CHARS = 16_000;
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_TIMEOUT_SECONDS = 2_147_000;
+const POWERSHELL_UPDATE_THROTTLE_MS = 150;
 const PRIVATE_MINGIT_DIR = join(DATA_DIR, "runtime", "mingit");
 const PRIVATE_AGENT_BIN_DIR = join(DATA_DIR, "agent", "bin");
 const CODE_DEVELOPMENT_DIR = join(DATA_DIR, "tools", "code-development");
@@ -159,6 +160,7 @@ function executePowerShell(
 	cwd: string,
 	timeoutSeconds: number | undefined,
 	signal: AbortSignal | undefined,
+	onChunk?: (text: string) => void,
 ): Promise<CommandResult> {
 	if (timeoutSeconds !== undefined && (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0)) {
 		throw new Error("timeout 必须是大于 0 的秒数");
@@ -171,29 +173,87 @@ function executePowerShell(
 		"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); " +
 		"$OutputEncoding = [Text.UTF8Encoding]::new($false); " +
 		command;
+	const decoded = new TextDecoder("utf-8");
+	let pending = "";
 	return new Promise((resolve) => {
-		execFile(
+		const child = spawn(
 			executable,
 			["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", utf8Command],
-			{
-				cwd,
-				env: process.env,
-				encoding: "utf8",
-				maxBuffer: MAX_BUFFER_BYTES,
-				signal,
-				timeout: timeoutSeconds === undefined ? undefined : Math.round(timeoutSeconds * 1000),
-				windowsHide: true,
-			},
-			(error, stdout, stderr) => {
-				resolve({
-					stdout: String(stdout ?? ""),
-					stderr: String(stderr ?? ""),
-					exitCode: error ? ((error as { code?: number | string | null }).code ?? null) : 0,
-					errorMessage: error?.message ?? "",
-				});
-			},
+			{ cwd, env: process.env, windowsHide: true },
 		);
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		let aborted = false;
+		let errorMessage = "";
+		const appendStream = (kind: "stdout" | "stderr", chunk: Buffer) => {
+			pending += decoded.decode(chunk, { stream: true });
+			const lastNewline = pending.lastIndexOf("\n");
+			const ready = lastNewline === -1 ? "" : pending.slice(0, lastNewline + 1);
+			pending = lastNewline === -1 ? pending : pending.slice(lastNewline + 1);
+			if (!ready) return;
+			if (kind === "stdout") {
+				stdout = keepRollingTail(stdout + ready);
+			} else {
+				stderr = keepRollingTail(stderr + ready);
+			}
+			onChunk?.(ready);
+		};
+		const flush = () => {
+			pending += decoded.decode();
+			if (!pending) return;
+			onChunk?.(pending);
+			pending = "";
+		};
+		child.stdout?.on("data", (chunk: Buffer) => appendStream("stdout", chunk));
+		child.stderr?.on("data", (chunk: Buffer) => appendStream("stderr", chunk));
+		const timer =
+			timeoutSeconds === undefined
+				? undefined
+				: setTimeout(
+						() => {
+							timedOut = true;
+							child.kill();
+						},
+						Math.round(timeoutSeconds * 1000),
+					);
+		const onAbort = () => {
+			aborted = true;
+			child.kill();
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const finish = (exitCode: number | string | null) => {
+			if (timer) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			flush();
+			if (timedOut) errorMessage = `命令超时（${timeoutSeconds} 秒）`;
+			else if (aborted) errorMessage = "命令已中止";
+			resolve({ stdout, stderr, exitCode, errorMessage });
+		};
+		child.on("error", (error) => {
+			errorMessage = error.message;
+			finish(null);
+		});
+		child.on("close", (code) => finish(code));
 	});
+}
+
+/** 工具层使用的流式入口：输出按行实时回调，供 onUpdate 增量推送。 */
+function executePowerShellStreaming(
+	executable: string,
+	command: string,
+	cwd: string,
+	timeoutSeconds: number | undefined,
+	signal: AbortSignal | undefined,
+	onChunk: (text: string) => void,
+): Promise<CommandResult> {
+	return executePowerShell(executable, command, cwd, timeoutSeconds, signal, onChunk);
+}
+
+/** 超过上限时保留尾部输出（长命令的末尾通常最有价值）。 */
+function keepRollingTail(text: string): string {
+	if (text.length <= MAX_BUFFER_BYTES) return text;
+	return text.slice(-MAX_BUFFER_BYTES);
 }
 
 function formatResult(result: CommandResult): string {
@@ -228,37 +288,77 @@ function createPrivateBashOperations(runtime: PrivateBashRuntime): BashOperation
 				return Promise.reject(new Error("Invalid timeout: must be a finite number of seconds"));
 			}
 			return new Promise((resolve, reject) => {
-				execFile(
-					runtime.executable,
-					["sh", "-c", command],
-					{
-						cwd,
-						env: privateBashEnvironment(runtime.root, env),
-						encoding: "utf8",
-						maxBuffer: MAX_BUFFER_BYTES,
-						signal,
-						timeout: timeout === undefined ? undefined : Math.round(timeout * 1000),
-						windowsHide: true,
-					},
-					(error, stdout, stderr) => {
-						if (stdout) onData(Buffer.from(String(stdout), "utf8"));
-						if (stderr) onData(Buffer.from(String(stderr), "utf8"));
-						if (signal?.aborted) {
+				const child = spawn(runtime.executable, ["sh", "-c", command], {
+					cwd,
+					env: privateBashEnvironment(runtime.root, env),
+					windowsHide: true,
+				});
+				const decoded = new TextDecoder("utf-8");
+				let settled = false;
+				let timedOut = false;
+				let aborted = false;
+				let pending = "";
+				const emit = (chunk: Buffer) => {
+					// 按行解码转发，避免多字节中文被半个 UTF-8 序列切开时显示乱码。
+					pending += decoded.decode(chunk, { stream: true });
+					const lastNewline = pending.lastIndexOf("\n");
+					if (lastNewline === -1) return;
+					const ready = pending.slice(0, lastNewline + 1);
+					pending = pending.slice(lastNewline + 1);
+					if (ready) onData(Buffer.from(ready, "utf8"));
+				};
+				const flush = () => {
+					pending += decoded.decode();
+					if (pending) {
+						onData(Buffer.from(pending, "utf8"));
+						pending = "";
+					}
+				};
+				child.stdout?.on("data", emit);
+				child.stderr?.on("data", emit);
+				const timer =
+					timeout === undefined
+						? undefined
+						: setTimeout(
+								() => {
+									timedOut = true;
+									child.kill();
+								},
+								Math.round(timeout * 1000),
+							);
+				const onAbort = () => {
+					aborted = true;
+					child.kill();
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+				const settle = (run: () => void) => {
+					if (settled) return;
+					settled = true;
+					if (timer) clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
+					flush();
+					run();
+				};
+				child.on("error", (error) => {
+					const code = (error as { code?: unknown }).code;
+					settle(() => {
+						if (code === "ENOENT") reject(error);
+						else reject(new Error(`命令启动失败：${error.message}`));
+					});
+				});
+				child.on("close", (code) => {
+					settle(() => {
+						if (aborted && signal?.aborted) {
 							reject(new Error("aborted"));
 							return;
 						}
-						if (error && (error as { killed?: boolean }).killed && timeout !== undefined) {
+						if (timedOut) {
 							reject(new Error(`timeout:${timeout}`));
 							return;
 						}
-						if (error && (error as { code?: number | string }).code === "ENOENT") {
-							reject(error);
-							return;
-						}
-						const errorCode = (error as { code?: unknown } | null)?.code;
-						resolve({ exitCode: error ? (typeof errorCode === "number" ? errorCode : 1) : 0 });
-					},
-				);
+						resolve({ exitCode: typeof code === "number" ? code : 1 });
+					});
+				});
 			});
 		},
 	};
@@ -294,21 +394,51 @@ export function instantiateWindowsTools(ctx: WindowsToolContext): AnyToolDefinit
 					command: Type.String({ description: "要执行的 PowerShell 命令" }),
 					timeout: Type.Optional(Type.Number({ description: "可选超时秒数；默认不限制" })),
 				}),
-				async execute(_toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
-					const result = await executePowerShell(
-						executable,
-						params.command,
-						ctx.getWorkspaceRoot(),
-						params.timeout,
-						signal,
-					);
-					const text = formatResult(result);
-					if (result.exitCode !== 0) {
-						throw new Error(
-							`${text}\n\nPowerShell 命令失败（exit ${result.exitCode ?? "未知"}）：${result.errorMessage}`,
+				async execute(_toolCallId, params, signal, onUpdate?): Promise<AgentToolResult<unknown>> {
+					let streamed = "";
+					let lastEmitAt = 0;
+					let emitTimer: NodeJS.Timeout | undefined;
+					const emitUpdate = (force = false) => {
+						if (!onUpdate) return;
+						const now = Date.now();
+						const elapsed = now - lastEmitAt;
+						if (!force && elapsed < POWERSHELL_UPDATE_THROTTLE_MS) {
+							emitTimer ??= setTimeout(() => {
+								emitTimer = undefined;
+								emitUpdate(true);
+							}, POWERSHELL_UPDATE_THROTTLE_MS - elapsed);
+							return;
+						}
+						lastEmitAt = now;
+						onUpdate({
+							content: streamed ? [{ type: "text", text: streamed }] : [],
+							details: { executable },
+						});
+					};
+					try {
+						const result = await executePowerShellStreaming(
+							executable,
+							params.command,
+							ctx.getWorkspaceRoot(),
+							params.timeout,
+							signal,
+							(text) => {
+								streamed = keepRollingTail(streamed + text);
+								emitUpdate();
+							},
 						);
+						if (emitTimer) clearTimeout(emitTimer);
+						emitUpdate(true);
+						const text = formatResult(result);
+						if (result.exitCode !== 0) {
+							throw new Error(
+								`${text}\n\nPowerShell 命令失败（exit ${result.exitCode ?? "未知"}）：${result.errorMessage}`,
+							);
+						}
+						return { content: [{ type: "text", text }], details: { executable } };
+					} finally {
+						if (emitTimer) clearTimeout(emitTimer);
 					}
-					return { content: [{ type: "text", text }], details: { executable } };
 				},
 			}),
 		);

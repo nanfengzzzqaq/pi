@@ -106,18 +106,35 @@ const officePreviewFrameEl = $("office-preview-frame");
 const officePreviewRefreshEl = $("office-preview-refresh");
 const officePreviewExternalEl = $("office-preview-external");
 const officePreviewCloseEl = $("office-preview-close");
-const agentBrowserPaneEl = $("agent-browser-pane");
-const agentBrowserResizerEl = $("agent-browser-resizer");
-const agentBrowserTitleEl = $("agent-browser-title");
-const agentBrowserStatusEl = $("agent-browser-status");
-const agentBrowserStageEl = $("agent-browser-stage");
-const agentBrowserAddressEl = $("agent-browser-address");
-const agentBrowserBackEl = $("agent-browser-back");
-const agentBrowserForwardEl = $("agent-browser-forward");
-const agentBrowserRefreshEl = $("agent-browser-refresh");
-const agentBrowserGoEl = $("agent-browser-go");
-const agentBrowserExternalEl = $("agent-browser-external");
-const agentBrowserCloseEl = $("agent-browser-close");
+const agentBrowserPaneEl = $("side-browser-pane");
+const agentBrowserTitleEl = $("side-browser-title");
+const agentBrowserStatusEl = $("side-browser-status");
+const agentBrowserStageEl = $("side-browser-stage");
+const agentBrowserAddressEl = $("side-browser-address");
+const agentBrowserBackEl = $("side-browser-back");
+const agentBrowserForwardEl = $("side-browser-forward");
+const agentBrowserRefreshEl = $("side-browser-refresh");
+const agentBrowserGoEl = $("side-browser-go");
+const agentBrowserExternalEl = $("side-browser-external");
+const agentBrowserCloseEl = $("side-browser-close");
+const workbenchSideEl = $("workbench-side");
+const workbenchSideResizerEl = $("workbench-side-resizer");
+const sideTabReviewEl = $("side-tab-review");
+const sideTabTerminalEl = $("side-tab-terminal");
+const sideTabBrowserEl = $("side-tab-browser");
+const reviewPaneEl = $("review-pane");
+const reviewStatusEl = $("review-status");
+const reviewSummaryEl = $("review-summary");
+const reviewFilesEl = $("review-files");
+const reviewDiffEl = $("review-diff");
+const reviewRefreshEl = $("review-refresh");
+const reviewCopyEl = $("review-copy");
+const terminalPaneEl = $("terminal-pane");
+const terminalStatusEl = $("terminal-status");
+const terminalOutputEl = $("terminal-output");
+const terminalCopyEl = $("terminal-copy");
+const terminalClearEl = $("terminal-clear");
+const updateOverlayEl = $("update-overlay");
 const codeEditorPaneEl = $("code-editor-pane");
 const codeEditorResizerEl = $("code-editor-resizer");
 const codeEditorTitleEl = $("code-editor-title");
@@ -157,7 +174,6 @@ let codeEditorFile = null;
 let codeEditorDirty = false;
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
-const AGENT_BROWSER_WIDTH_KEY = "pi-console-agent-browser-width";
 const CODE_EDITOR_WIDTH_KEY = "pi-console-code-editor-width";
 const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
 const TEXT_FILE_RE = /\.(?:bat|c|cc|cfg|cmd|conf|cpp|cs|css|csv|env|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|json5|jsonl|jsx|kt|kts|less|log|lua|md|mdx|mjs|php|properties|ps1|psm1|py|pyw|rb|rs|rst|scss|sh|sql|svelte|swift|tex|toml|ts|tsv|tsx|txt|vue|xml|yaml|yml|zsh)$/i;
@@ -254,13 +270,15 @@ async function closeOfficePreview() {
 	officePreviewPaneEl.hidden = true;
 	officePreviewResizerEl.hidden = true;
 	officePreviewLoadingEl.hidden = false;
+	restoreSidePanel();
 	await stopOfficePreviewSession(closing);
 }
 
 async function openOfficePreview(path, source = "manual") {
 	if (!isOfficeFilePath(path)) return false;
-	if (!agentBrowserPaneEl.hidden) await hideAgentBrowser();
 	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return false;
+	if (!catalogViewEl.hidden) closeCatalog();
+	suspendSidePanel();
 	const cleanPath = cleanOfficeFilePath(path);
 	const request = ++officePreviewRequest;
 	const shownName = cleanPath.split(/[\\/]/).pop() || cleanPath;
@@ -381,18 +399,161 @@ officePreviewResizerEl.addEventListener("pointerdown", (event) => {
 });
 
 // ---------------------------------------------------------------------------
+// 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换）
+// 原生浏览器画面只在“浏览器标签激活 + 目录/文档面板未占用主区”时显示，
+// 其余情况自动隐藏原生视图，从根本上避免面板互相遮挡。
+// ---------------------------------------------------------------------------
+
+const WORKBENCH_SIDE_WIDTH_KEY = "pi-console-workbench-side-width";
+/** 用户手动关闭浏览器后，智能体导航新页面在此时长内不自动重开（毫秒）。 */
+const SIDE_BROWSER_AUTO_REOPEN_MS = 60_000;
+
+let activeSideTab = null; // "review" | "terminal" | "browser" | null（面板关闭）
+let browserIntent = false; // 用户或智能体希望浏览器保持可用
+let browserUserClosedAt = 0;
+let sideBrowserLastUrl = "";
+/** office 预览 / 代码编辑器打开时侧栏暂时收起，关闭后恢复。 */
+let sidePanelSuppressed = false;
+
+const sideTabButtons = { review: sideTabReviewEl, terminal: sideTabTerminalEl, browser: sideTabBrowserEl };
+const sideTabPanes = { review: reviewPaneEl, terminal: terminalPaneEl, browser: agentBrowserPaneEl };
+
+/** 侧栏内容此刻是否展开显示（收起状态只剩底部标签条）。 */
+function sidePanelVisible() {
+	return !workbenchSideEl.hidden && !workbenchSideEl.classList.contains("collapsed");
+}
+
+function applyWorkbenchSideWidth(width) {
+	const bounds = conversationWorkbenchEl.getBoundingClientRect();
+	const max = Math.max(360, bounds.width - 340);
+	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.5), max));
+	workbenchSideEl.style.width = `${next}px`;
+}
+
+/** 浏览器标签此刻是否真正可见（未被目录、Office 预览或代码编辑器覆盖）。 */
+function browserTabActive() {
+	return (
+		activeSideTab === "browser" &&
+		!workbenchSideEl.hidden &&
+		!workbenchSideEl.classList.contains("collapsed") &&
+		catalogViewEl.hidden &&
+		officePreviewPaneEl.hidden &&
+		codeEditorPaneEl.hidden
+	);
+}
+
+/**
+ * 把原生浏览器画面的可见性对齐到当前布局：标签不可见时隐藏原生视图（页面继续在后台运行），
+ * 恢复可见时重新打开。所有联动入口（目录/预览/编辑器/标签切换）都调用这里收敛处理。
+ */
+function syncBrowserNativeVisibility() {
+	if (!window.piDesktop) return;
+	const shouldShow = browserIntent && browserTabActive();
+	if (shouldShow && !agentBrowserState?.open) {
+		window.piDesktop
+			.openBrowser()
+			.then(renderAgentBrowserState)
+			.catch(() => {});
+	} else if (!shouldShow && agentBrowserState?.open) {
+		window.piDesktop
+			.hideBrowser()
+			.then(renderAgentBrowserState)
+			.catch(() => {});
+	} else if (shouldShow) {
+		requestAnimationFrame(syncAgentBrowserBounds);
+	}
+}
+
+function renderSideTabs() {
+	for (const [name, button] of Object.entries(sideTabButtons)) button.classList.toggle("active", activeSideTab === name);
+	for (const [name, pane] of Object.entries(sideTabPanes)) pane.hidden = name !== activeSideTab;
+}
+
+function showSidePanel(tab) {
+	applyWorkbenchSideWidth(localStorage.getItem(WORKBENCH_SIDE_WIDTH_KEY));
+	sidePanelSuppressed = false;
+	activeSideTab = tab;
+	workbenchSideEl.hidden = false;
+	workbenchSideEl.classList.remove("collapsed");
+	workbenchSideResizerEl.hidden = false;
+	sideTabButtons[tab]?.classList.remove("activity");
+	renderSideTabs();
+	syncBrowserNativeVisibility();
+	if (tab === "review") void loadReview();
+}
+
+/** 收起侧栏：内容隐藏，底部标签条保留，点击任意标签即可重新展开。 */
+function hideSidePanel() {
+	if (workbenchSideEl.hidden) return;
+	workbenchSideEl.classList.add("collapsed");
+	workbenchSideResizerEl.hidden = true;
+	renderSideTabs();
+	syncBrowserNativeVisibility();
+}
+
+/** Office 预览 / 代码编辑器占用右侧时收起侧栏（保留标签状态）。 */
+function suspendSidePanel() {
+	if (workbenchSideEl.hidden) return;
+	sidePanelSuppressed = true;
+	workbenchSideEl.hidden = true;
+	workbenchSideResizerEl.hidden = true;
+	renderSideTabs();
+	syncBrowserNativeVisibility();
+}
+
+function restoreSidePanel() {
+	if (!sidePanelSuppressed) return;
+	sidePanelSuppressed = false;
+	if (!activeSideTab) return;
+	workbenchSideEl.hidden = false;
+	workbenchSideResizerEl.hidden = false;
+	renderSideTabs();
+	syncBrowserNativeVisibility();
+}
+
+sideTabReviewEl.addEventListener("click", () => {
+	if (activeSideTab === "review" && sidePanelVisible()) hideSidePanel();
+	else showSidePanel("review");
+});
+sideTabTerminalEl.addEventListener("click", () => {
+	if (activeSideTab === "terminal" && sidePanelVisible()) hideSidePanel();
+	else showSidePanel("terminal");
+});
+sideTabBrowserEl.addEventListener("click", () => {
+	if (activeSideTab === "browser" && sidePanelVisible() && !browserIntent) hideSidePanel();
+	else {
+		browserIntent = true;
+		browserUserClosedAt = 0;
+		showSidePanel("browser");
+	}
+});
+
+workbenchSideResizerEl.addEventListener("pointerdown", (event) => {
+	event.preventDefault();
+	workbenchSideResizerEl.setPointerCapture(event.pointerId);
+	const resize = (moveEvent) => {
+		const bounds = conversationWorkbenchEl.getBoundingClientRect();
+		applyWorkbenchSideWidth(bounds.right - moveEvent.clientX);
+		syncAgentBrowserBounds();
+	};
+	const finish = () => {
+		workbenchSideResizerEl.removeEventListener("pointermove", resize);
+		localStorage.setItem(
+			WORKBENCH_SIDE_WIDTH_KEY,
+			String(Math.round(workbenchSideEl.getBoundingClientRect().width)),
+		);
+	};
+	workbenchSideResizerEl.addEventListener("pointermove", resize);
+	workbenchSideResizerEl.addEventListener("pointerup", finish, { once: true });
+	workbenchSideResizerEl.addEventListener("pointercancel", finish, { once: true });
+});
+
+// ---------------------------------------------------------------------------
 // 客户端独立浏览器（agent_browser）
 // ---------------------------------------------------------------------------
 
-function applyAgentBrowserWidth(width) {
-	const bounds = conversationWorkbenchEl.getBoundingClientRect();
-	const max = Math.max(360, bounds.width - 340);
-	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.56), max));
-	agentBrowserPaneEl.style.width = `${next}px`;
-}
-
 function syncAgentBrowserBounds() {
-	if (agentBrowserPaneEl.hidden || !window.piDesktop?.setBrowserBounds) return;
+	if (!browserTabActive() || !window.piDesktop?.setBrowserBounds) return;
 	const bounds = agentBrowserStageEl.getBoundingClientRect();
 	window.piDesktop.setBrowserBounds({
 		x: Math.round(bounds.left),
@@ -405,31 +566,39 @@ function syncAgentBrowserBounds() {
 function renderAgentBrowserState(state) {
 	if (!state) return;
 	agentBrowserState = state;
-	agentBrowserPaneEl.hidden = !state.open;
-	agentBrowserResizerEl.hidden = !state.open;
-	agentBrowserBtnEl.classList.toggle("active", state.open);
 	agentBrowserTitleEl.textContent = state.title || "独立浏览器";
 	agentBrowserTitleEl.title = state.url || "";
 	agentBrowserStatusEl.textContent = state.status || (state.loading ? "正在加载网页" : "网页已加载");
 	agentBrowserBackEl.disabled = !state.canGoBack;
 	agentBrowserForwardEl.disabled = !state.canGoForward;
 	if (document.activeElement !== agentBrowserAddressEl) agentBrowserAddressEl.value = state.url || "";
-	if (state.open) requestAnimationFrame(syncAgentBrowserBounds);
 	if (state.downloadPath) {
 		showInfo(`浏览器下载完成：${state.downloadPath}`);
 		if (currentFsPath) void loadFsDir(currentFsPath);
 	}
+	// 智能体导航到新页面：浏览器被关闭时自动展示浏览器标签（刚手动关闭的不打扰）
+	if (state.open && state.url && state.url !== sideBrowserLastUrl) {
+		sideBrowserLastUrl = state.url;
+		if (!browserIntent && Date.now() - browserUserClosedAt > SIDE_BROWSER_AUTO_REOPEN_MS) {
+			browserIntent = true;
+			showSidePanel("browser");
+		} else if (browserIntent && sidePanelVisible() && activeSideTab !== "browser") {
+			sideTabBrowserEl.classList.add("activity");
+		}
+	}
+	syncBrowserNativeVisibility();
 }
 
 async function openAgentBrowser(url) {
+	if (!catalogViewEl.hidden) closeCatalog();
+	browserIntent = true;
+	browserUserClosedAt = 0;
+	showSidePanel("browser");
 	if (!window.piDesktop?.openBrowser) {
 		if (url) window.open(url, "_blank", "noopener");
 		else showInfo("客户端独立浏览器只在 Windows 桌面版中可用");
 		return;
 	}
-	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
-	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
-	applyAgentBrowserWidth(localStorage.getItem(AGENT_BROWSER_WIDTH_KEY));
 	try {
 		renderAgentBrowserState(await window.piDesktop.openBrowser(url));
 	} catch (error) {
@@ -437,7 +606,9 @@ async function openAgentBrowser(url) {
 	}
 }
 
-async function hideAgentBrowser() {
+async function closeAgentBrowser() {
+	browserIntent = false;
+	browserUserClosedAt = Date.now();
 	if (!window.piDesktop?.hideBrowser) return;
 	try {
 		renderAgentBrowserState(await window.piDesktop.hideBrowser());
@@ -449,6 +620,8 @@ async function hideAgentBrowser() {
 async function navigateAgentBrowser() {
 	const target = agentBrowserAddressEl.value.trim();
 	if (!target || !window.piDesktop?.navigateBrowser) return;
+	browserIntent = true;
+	if (activeSideTab !== "browser") showSidePanel("browser");
 	try {
 		renderAgentBrowserState(await window.piDesktop.navigateBrowser(target));
 	} catch (error) {
@@ -457,10 +630,10 @@ async function navigateAgentBrowser() {
 }
 
 agentBrowserBtnEl.addEventListener("click", () => {
-	if (agentBrowserState?.open) void hideAgentBrowser();
+	if (browserIntent && activeSideTab === "browser") void closeAgentBrowser();
 	else void openAgentBrowser();
 });
-agentBrowserCloseEl.addEventListener("click", () => void hideAgentBrowser());
+agentBrowserCloseEl.addEventListener("click", () => void closeAgentBrowser());
 agentBrowserGoEl.addEventListener("click", () => void navigateAgentBrowser());
 agentBrowserAddressEl.addEventListener("keydown", (event) => {
 	if (event.key !== "Enter") return;
@@ -478,24 +651,6 @@ agentBrowserRefreshEl.addEventListener("click", async () => {
 });
 agentBrowserExternalEl.addEventListener("click", () => {
 	if (agentBrowserState?.url) openExternalUrl(agentBrowserState.url);
-});
-
-agentBrowserResizerEl.addEventListener("pointerdown", (event) => {
-	event.preventDefault();
-	agentBrowserResizerEl.setPointerCapture(event.pointerId);
-	const resize = (moveEvent) => {
-		const bounds = conversationWorkbenchEl.getBoundingClientRect();
-		applyAgentBrowserWidth(bounds.right - moveEvent.clientX);
-		syncAgentBrowserBounds();
-	};
-	const finish = () => {
-		agentBrowserResizerEl.removeEventListener("pointermove", resize);
-		localStorage.setItem(AGENT_BROWSER_WIDTH_KEY, String(Math.round(agentBrowserPaneEl.getBoundingClientRect().width)));
-		syncAgentBrowserBounds();
-	};
-	agentBrowserResizerEl.addEventListener("pointermove", resize);
-	agentBrowserResizerEl.addEventListener("pointerup", finish, { once: true });
-agentBrowserResizerEl.addEventListener("pointercancel", finish, { once: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -579,7 +734,8 @@ async function openCodeEditor(path, name) {
 		return true;
 	}
 	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
-	if (!agentBrowserPaneEl.hidden) await hideAgentBrowser();
+	if (!catalogViewEl.hidden) closeCatalog();
+	suspendSidePanel();
 	applyCodeEditorWidth(localStorage.getItem(CODE_EDITOR_WIDTH_KEY));
 	codeEditorPaneEl.hidden = false;
 	codeEditorResizerEl.hidden = false;
@@ -649,32 +805,13 @@ function closeCodeEditor() {
 	codeEditorPaneEl.hidden = true;
 	codeEditorResizerEl.hidden = true;
 	codeEditorStageEl.innerHTML = '<div class="code-editor-placeholder">选择代码文件开始编辑</div>';
+	restoreSidePanel();
 	return true;
 }
 
 async function showRepositoryDiff() {
-	try {
-		const summary = await api("/api/tools/code-development/repository");
-		drawerTitleEl.textContent = "代码差异（git_diff）";
-		drawerContentEl.innerHTML = "";
-		const review = document.createElement("div");
-		review.className = "repository-review";
-		const meta = document.createElement("div");
-		meta.className = "repository-review-summary";
-		meta.textContent = summary.isRepository
-			? `分支：${summary.branch || "（未命名）"} · ${summary.files.length} 个文件有改动`
-			: "当前工作区不是 Git 仓库";
-		const diff = document.createElement("pre");
-		diff.className = "repository-review-diff";
-		diff.textContent = [summary.stagedDiff && "# 已暂存\n" + summary.stagedDiff, summary.diff && "# 未暂存\n" + summary.diff]
-			.filter(Boolean)
-			.join("\n\n") || "没有代码差异";
-		review.append(meta, diff);
-		drawerContentEl.appendChild(review);
-		drawerEl.hidden = false;
-	} catch (error) {
-		showError(`读取代码差异失败：${error.message}`);
-	}
+	showSidePanel("review");
+	await loadReview();
 }
 
 codeEditorSaveEl.addEventListener("click", () => void saveCodeEditor());
@@ -700,6 +837,220 @@ if (window.ResizeObserver) new ResizeObserver(syncAgentBrowserBounds).observe(ag
 window.addEventListener("resize", syncAgentBrowserBounds);
 if (window.piDesktop?.onBrowserState) window.piDesktop.onBrowserState(renderAgentBrowserState);
 if (window.piDesktop?.browserState) void window.piDesktop.browserState().then(renderAgentBrowserState);
+
+// ---------------------------------------------------------------------------
+// 终端面板：实时显示智能体的本地命令执行（bash / powershell）
+// ---------------------------------------------------------------------------
+
+const TERMINAL_TOOLS = new Set(["bash", "powershell"]);
+/** toolCallId → { wrap, out, state, startedAt } */
+const terminalEntries = new Map();
+/** 智能体连续使用终端时避免反复抢占标签：记录用户最后一次手动切换标签的时间。 */
+let terminalAutoShowSuppressedAt = 0;
+
+function isTerminalToolName(name) {
+	return typeof name === "string" && TERMINAL_TOOLS.has(name);
+}
+
+function terminalCommandText(args) {
+	if (typeof args === "string") return args;
+	if (args && typeof args === "object" && typeof args.command === "string") return args.command;
+	return "";
+}
+
+function appendTerminalEntry(toolCallId, toolName, args, status, { restored = false } = {}) {
+	terminalOutputEl.querySelector(".terminal-empty")?.remove();
+	const wrap = document.createElement("div");
+	wrap.className = `terminal-entry ${status === "running" ? "running" : "done"}`;
+	wrap.dataset.toolCallId = toolCallId;
+	const head = document.createElement("div");
+	head.className = "terminal-entry-head";
+	const badge = document.createElement("span");
+	badge.className = "terminal-entry-badge";
+	badge.textContent = toolName;
+	const cmd = document.createElement("code");
+	cmd.className = "terminal-entry-cmd";
+	cmd.title = "点击复制命令";
+	cmd.textContent = terminalCommandText(args) || "（无命令）";
+	cmd.addEventListener("click", () => copyTextToClipboard(cmd.textContent));
+	const state = document.createElement("span");
+	state.className = "terminal-entry-state";
+	state.textContent = status === "running" ? "运行中…" : "完成";
+	head.append(badge, cmd, state);
+	const out = document.createElement("pre");
+	out.className = "terminal-entry-output";
+	out.hidden = true;
+	wrap.append(head, out);
+	terminalOutputEl.appendChild(wrap);
+	// 历史恢复的条目没有真实起始时间，完成时不显示耗时
+	terminalEntries.set(toolCallId, { wrap, out, state, startedAt: restored ? 0 : Date.now() });
+	scrollTerminalOutput();
+}
+
+/** 展示用文本：统一换行符，去掉 Windows 回车符避免 pre-wrap 下出现空行。 */
+function normalizeTerminalText(text) {
+	return String(text ?? "").replace(/\r\n?/g, "\n");
+}
+
+function updateTerminalEntry(toolCallId, text, { final = false, isError = false } = {}) {
+	const entry = terminalEntries.get(toolCallId);
+	if (!entry) return;
+	if (text && (final || !entry.out.textContent || text.length >= entry.out.textContent.length)) {
+		entry.out.textContent = normalizeTerminalText(text);
+		entry.out.hidden = false;
+	}
+	if (final) {
+		entry.wrap.classList.remove("running");
+		entry.wrap.classList.add(isError ? "error" : "done");
+		const seconds = entry.startedAt > 0 ? Math.max(1, Math.round((Date.now() - entry.startedAt) / 1000)) : 0;
+		entry.state.textContent = isError ? (seconds ? `失败 · ${seconds}s` : "失败") : seconds ? `完成 · ${seconds}s` : "完成";
+	}
+	scrollTerminalOutput();
+}
+
+function updateTerminalStatus() {
+	let runningCount = 0;
+	for (const entry of terminalEntries.values()) {
+		if (entry.wrap.classList.contains("running")) runningCount++;
+	}
+	terminalStatusEl.textContent =
+		runningCount > 0 ? `执行中…（${runningCount} 条命令）` : terminalEntries.size > 0 ? `${terminalEntries.size} 条记录` : "空闲";
+}
+
+function scrollTerminalOutput() {
+	terminalOutputEl.scrollTop = terminalOutputEl.scrollHeight;
+}
+
+function clearTerminal() {
+	terminalEntries.clear();
+	terminalOutputEl.innerHTML = '<div class="terminal-empty">智能体运行本地命令时，这里会实时显示命令与输出。</div>';
+	updateTerminalStatus();
+}
+
+/** 终端工具开始执行：记录条目并展示终端标签（不打断用户正在查看的其他标签）。 */
+function handleTerminalToolStart(event) {
+	appendTerminalEntry(event.toolCallId, event.toolName, event.args, "running");
+	if (!sidePanelVisible()) showSidePanel("terminal");
+	else if (activeSideTab !== "terminal") {
+		if (Date.now() - terminalAutoShowSuppressedAt < 8000) sideTabTerminalEl.classList.add("activity");
+		else showSidePanel("terminal");
+	}
+	updateTerminalStatus();
+}
+
+// 用户手动点击侧栏标签视为“我在看这里”：短期内终端工具不再自动切换标签
+for (const button of [sideTabReviewEl, sideTabTerminalEl, sideTabBrowserEl]) {
+	button.addEventListener("click", () => {
+		terminalAutoShowSuppressedAt = Date.now();
+	});
+}
+
+terminalClearEl.addEventListener("click", clearTerminal);
+terminalCopyEl.addEventListener("click", () => {
+	const text = terminalOutputEl.innerText;
+	if (!text.trim()) return;
+	copyTextToClipboard(text);
+});
+
+// ---------------------------------------------------------------------------
+// 审查面板：工作区 Git 差异（文件列表 + 增删行着色）
+// ---------------------------------------------------------------------------
+
+let reviewRequest = 0;
+
+async function loadReview() {
+	const request = ++reviewRequest;
+	reviewStatusEl.textContent = "加载中…";
+	try {
+		const summary = await api("/api/tools/code-development/repository");
+		if (request !== reviewRequest) return;
+		renderReview(summary);
+	} catch (error) {
+		if (request !== reviewRequest) return;
+		reviewStatusEl.textContent = "加载失败";
+		reviewSummaryEl.textContent = error.message;
+		reviewFilesEl.innerHTML = "";
+		reviewDiffEl.innerHTML = "";
+	}
+}
+
+function renderReview(summary) {
+	reviewSummaryEl.innerHTML = "";
+	reviewFilesEl.innerHTML = "";
+	reviewDiffEl.innerHTML = "";
+	if (!summary.isRepository) {
+		reviewSummaryEl.textContent = "当前工作区不是 Git 仓库；让智能体初始化仓库或切换到 Git 工作区后再试。";
+		reviewStatusEl.textContent = "无差异";
+		return;
+	}
+	reviewStatusEl.textContent = summary.files.length > 0 ? `${summary.files.length} 个文件有改动` : "工作区干净";
+	const meta = document.createElement("div");
+	meta.className = "review-meta";
+	meta.textContent = `分支：${summary.branch || "（未命名）"}${summary.upstream ? ` · 跟踪 ${summary.upstream}` : ""}`;
+	reviewSummaryEl.appendChild(meta);
+	if (summary.files.length === 0) {
+		reviewDiffEl.innerHTML = '<div class="review-empty">没有代码差异</div>';
+		return;
+	}
+	for (const file of summary.files) {
+		const row = document.createElement("button");
+		row.type = "button";
+		row.className = "review-file";
+		const mark = `${file.index}${file.worktree}`.trim();
+		const name = document.createElement("span");
+		name.className = "review-file-name";
+		name.textContent = file.path;
+		name.title = file.path;
+		const state = document.createElement("span");
+		state.className = `review-file-state ${mark === "?" ? "added" : "modified"}`;
+		state.textContent = mark === "??" || mark === "?" ? "新增" : mark || "修改";
+		row.append(name, state);
+		row.addEventListener("click", () => {
+			const target = reviewDiffEl.querySelector(`[data-review-file="${CSS.escape(file.path)}"]`);
+			if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
+		});
+		reviewFilesEl.appendChild(row);
+	}
+	renderReviewDiff([summary.stagedDiff, summary.diff].filter(Boolean).join("\n"));
+}
+
+function renderReviewDiff(fullDiff) {
+	if (!fullDiff) {
+		reviewDiffEl.innerHTML = '<div class="review-empty">没有代码差异</div>';
+		return;
+	}
+	let currentBlock = null;
+	for (const line of fullDiff.split("\n")) {
+		if (line.startsWith("diff --git ")) {
+			const markerIndex = line.indexOf(" b/");
+			const name = markerIndex >= 0 ? line.slice(markerIndex + 3) : line.slice(11);
+			currentBlock = document.createElement("div");
+			currentBlock.className = "review-file-diff";
+			currentBlock.dataset.reviewFile = name;
+			const head = document.createElement("div");
+			head.className = "review-file-diff-head";
+			head.textContent = name;
+			head.title = name;
+			currentBlock.appendChild(head);
+			reviewDiffEl.appendChild(currentBlock);
+			continue;
+		}
+		const target = currentBlock ?? reviewDiffEl;
+		const row = document.createElement("div");
+		if (line.startsWith("+")) row.className = "review-line add";
+		else if (line.startsWith("-")) row.className = "review-line del";
+		else if (line.startsWith("@@")) row.className = "review-line hunk";
+		row.textContent = line || " ";
+		target.appendChild(row);
+	}
+}
+
+reviewRefreshEl.addEventListener("click", () => void loadReview());
+reviewCopyEl.addEventListener("click", () => {
+	const text = reviewDiffEl.innerText;
+	if (!text.trim()) return;
+	copyTextToClipboard(text);
+});
 
 // ---------------------------------------------------------------------------
 // 会话初始化与恢复
@@ -761,6 +1112,7 @@ function clearMessages() {
 
 function renderHistory(history) {
 	clearMessages();
+	clearTerminal();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
 	let latestAssistant = null;
 	let pendingCapabilityTrace = null;
@@ -780,9 +1132,11 @@ function renderHistory(history) {
 			if (item.text) container.appendHistoryText(item.text);
 			if (Array.isArray(item.toolCalls)) {
 				for (const call of item.toolCalls) {
-					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
+					const block = appendToolBlock(call.id, call.displayName || call.name, call.args, "done");
+					container.addTool(block);
 					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
 					if (path) container.addArtifactPath(path);
+					if (isTerminalToolName(call.name)) appendTerminalEntry(call.id, call.name, call.args, "done", { restored: true });
 				}
 			}
 			if (item.usage) addModelUsageStep(container, item.usage, `history-usage-${item.timestamp}`);
@@ -791,6 +1145,9 @@ function renderHistory(history) {
 		} else if (item.role === "toolResult") {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(item.toolCallId)}"]`);
 			if (block) updateToolBlock(block, item.isError, item.text);
+			if (terminalEntries.has(item.toolCallId)) {
+				updateTerminalEntry(item.toolCallId, item.text, { final: true, isError: item.isError });
+			}
 			if (latestAssistant && !item.isError) {
 				const path = findDeliverableToolPath(item.text);
 				if (path) latestAssistant.addArtifactPath(path);
@@ -798,6 +1155,7 @@ function renderHistory(history) {
 			}
 		}
 	}
+	updateTerminalStatus();
 	if (latestAssistant) {
 		if (history.streaming) currentAssistant = latestAssistant;
 		else latestAssistant.foldProcess();
@@ -1167,14 +1525,22 @@ function handleEvent(event) {
 			setIndicator(true, "思考中…");
 			ensureAssistant().appendThinking(event.delta);
 			break;
-		case "tool_execution_start":
+		case "tool_execution_start": {
 			setIndicator(false);
 			officeToolCalls.set(event.toolCallId, { toolName: event.toolName, args: event.args });
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
-			ensureAssistant().addTool(
-				appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running"),
-			);
+			const block = appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running");
+			block.dataset.startedAt = String(Date.now());
+			ensureAssistant().addTool(block);
+			if (isTerminalToolName(event.toolName)) handleTerminalToolStart(event);
 			break;
+		}
+		case "tool_execution_update": {
+			// 流式部分结果：聊天区的工具块实时显示输出，终端面板同步刷新
+			updateToolBlockLive(event.toolCallId, event.text);
+			if (terminalEntries.has(event.toolCallId)) updateTerminalEntry(event.toolCallId, event.text);
+			break;
+		}
 		case "tool_execution_end": {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(event.toolCallId)}"]`);
 			if (block) updateToolBlock(block, event.isError, event.result);
@@ -1184,6 +1550,13 @@ function handleEvent(event) {
 				maybePreviewOfficeTool(toolCall);
 				const path = findDeliverableToolPath(toolCall?.args, ["output", "file", "path", "target", "destination"]);
 				if (path) currentAssistant?.addArtifactPath(path);
+			}
+			if (terminalEntries.has(event.toolCallId)) {
+				// 终端终值：流式快照通常比摘要结果更完整，保留较长的一份
+				const prior = terminalEntries.get(event.toolCallId).out.textContent || "";
+				const finalText = typeof event.result === "string" && event.result.length > prior.length ? event.result : prior;
+				updateTerminalEntry(event.toolCallId, finalText, { final: true, isError: event.isError });
+				updateTerminalStatus();
 			}
 			break;
 		}
@@ -1206,6 +1579,8 @@ function handleEvent(event) {
 			}
 			setRunning(false);
 			setIndicator(false);
+			// 智能体本轮可能改动了工作区文件：审查标签可见时自动刷新差异
+			if (activeSideTab === "review" && sidePanelVisible()) void loadReview();
 			break;
 		case "auto_retry_start":
 			setIndicator(true, `请求失败，自动重试中（第 ${event.attempt}/${event.maxAttempts} 次）`);
@@ -1840,6 +2215,12 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 	argsEl.textContent = summarizeArgs(args);
 	body.appendChild(argsEl);
 
+	// 运行中的实时输出（流式）：结束后由最终结果取代
+	const liveEl = document.createElement("pre");
+	liveEl.className = "tool-live";
+	liveEl.hidden = true;
+	body.appendChild(liveEl);
+
 	const resultEl = document.createElement("div");
 	resultEl.className = "tool-result";
 	resultEl.hidden = true;
@@ -1885,12 +2266,64 @@ function updateToolBlock(block, isError, resultText) {
 	block.classList.remove("running");
 	block.classList.add(isError ? "error" : "done");
 	const statusEl = block.querySelector(".tool-status");
-	if (statusEl) statusEl.textContent = isError ? "失败" : "成功";
+	if (statusEl) {
+		const startedAt = Number(block.dataset.startedAt);
+		const duration =
+			Number.isFinite(startedAt) && startedAt > 0 ? ` · ${((Date.now() - startedAt) / 1000).toFixed(1)}s` : "";
+		statusEl.textContent = isError ? `失败${duration}` : `成功${duration}`;
+	}
+	const liveEl = block.querySelector(".tool-live");
+	if (liveEl) liveEl.hidden = true;
 	const resultEl = block.querySelector(".tool-result");
 	if (resultEl && resultText) {
 		resultEl.innerHTML = renderResultText(resultText);
 		resultEl.hidden = false;
 	}
+}
+
+/** 流式工具更新：运行中的工具块实时显示累计输出，并自动展开。 */
+function updateToolBlockLive(toolCallId, text) {
+	const block = document.querySelector(`[data-tool-call-id="${CSS.escape(toolCallId)}"]`);
+	if (!block || !text) return;
+	const liveEl = block.querySelector(".tool-live");
+	if (liveEl) {
+		liveEl.textContent = normalizeTerminalText(text);
+		liveEl.hidden = false;
+		liveEl.scrollTop = liveEl.scrollHeight;
+	}
+	const body = block.querySelector(".tool-body");
+	const chevron = block.querySelector(".tool-chevron");
+	if (body?.hidden) {
+		body.hidden = false;
+		if (chevron) chevron.textContent = "▾";
+	}
+}
+
+/** 统一复制入口：优先异步剪贴板 API，降级到隐藏 textarea + execCommand。 */
+function copyTextToClipboard(text) {
+	if (!text) return;
+	const done = () => showInfo(`已复制（${text.length} 字符）`);
+	const fail = () => showError("复制失败，请手动选择文本后按 Ctrl+C");
+	if (navigator.clipboard?.writeText) {
+		navigator.clipboard.writeText(text).then(done).catch(fail);
+		return;
+	}
+	const area = document.createElement("textarea");
+	area.value = text;
+	area.setAttribute("readonly", "");
+	area.style.position = "fixed";
+	area.style.opacity = "0";
+	document.body.appendChild(area);
+	area.select();
+	let copied = false;
+	try {
+		copied = document.execCommand("copy");
+	} catch {
+		copied = false;
+	}
+	area.remove();
+	if (copied) done();
+	else fail();
 }
 
 /** 复制：消息 / 代码块 / 工具步骤 / 整个执行过程 */
@@ -1918,7 +2351,7 @@ function copyTextFrom(btn) {
 		}
 	}
 	if (!text) return false;
-	navigator.clipboard.writeText(text).then(() => showInfo(`已复制（${text.length} 字符）`)).catch(() => showError("复制失败"));
+	copyTextToClipboard(text);
 	return true;
 }
 
@@ -1989,13 +2422,18 @@ async function attachPathLink(path) {
 
 function summarizeArgs(args) {
 	if (args === undefined || args === null) return "";
-	try {
-		let text = typeof args === "string" ? args : JSON.stringify(args);
-		if (text.length > 200) text = `${text.slice(0, 200)}…`;
-		return text;
-	} catch {
-		return String(args);
+	let text;
+	if (typeof args === "string") {
+		text = args;
+	} else {
+		try {
+			text = JSON.stringify(args, null, "\t");
+		} catch {
+			text = String(args);
+		}
 	}
+	if (text.length > 600) text = `${text.slice(0, 600)}…`;
+	return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -2424,6 +2862,8 @@ async function openCatalog(mode) {
 	toolsNavBtnEl.classList.toggle("active", mode === "tools");
 	skillsNavBtnEl.classList.toggle("active", mode === "skills");
 	closeDrawer();
+	// 目录覆盖整个主区：原生浏览器画面（不受 CSS 层级控制）必须同步隐藏。
+	syncBrowserNativeVisibility();
 	if (!catalogCache) catalogContentEl.textContent = "加载中…";
 	try {
 		if (!catalogCache) await refreshCatalog();
@@ -2438,6 +2878,7 @@ function closeCatalog() {
 	toolsNavBtnEl.classList.remove("active");
 	skillsNavBtnEl.classList.remove("active");
 	closeDrawer();
+	syncBrowserNativeVisibility();
 	inputEl.focus();
 }
 
@@ -3787,6 +4228,7 @@ themeBtnEl.addEventListener("click", () => {
 applyTheme(localStorage.getItem("pi-console-theme") || "dark");
 
 settingsBtnEl.addEventListener("click", () => {
+	settingsBtnEl.classList.remove("update-available");
 	settingsModalEl.hidden = false;
 	loadKeysSection();
 	loadCodexOAuthSection();
@@ -3879,7 +4321,7 @@ codexOAuthLogoutBtnEl.addEventListener("click", async () => {
 codexOAuthCodeEl.addEventListener("click", () => {
 	const code = codexOAuthCodeEl.textContent.match(/设备码：([^（]+)/)?.[1]?.trim();
 	if (!code) return;
-	navigator.clipboard.writeText(code).then(() => showInfo("Codex 设备码已复制")).catch(() => showError("复制设备码失败"));
+	copyTextToClipboard(code);
 });
 
 async function loadKeysSection() {
@@ -4063,6 +4505,7 @@ updateRunBtnEl.addEventListener("click", async () => {
 		try {
 			progress = await api("/api/app/update-progress");
 		} catch {
+			// 更新安装期间后端退出会导致轮询暂时失败：保持遮罩等待重启即可。
 			return;
 		}
 		if (progress.running && progress.phase === "downloading") {
@@ -4070,16 +4513,42 @@ updateRunBtnEl.addEventListener("click", async () => {
 			const p = total > 0 ? Math.min(100, Math.round((progress.receivedBytes / total) * 100)) : 0;
 			updateProgressBarEl.style.width = `${p}%`;
 			updateStatusEl.textContent = `正在下载更新… ${p}%`;
+		} else if (progress.running && progress.phase === "verifying") {
+			updateStatusEl.textContent = "正在校验更新包…";
 		} else if (progress.running && progress.phase === "installing") {
 			updateStatusEl.textContent = "下载完成，正在安装并重启客户端…";
+			updateOverlayEl.hidden = false;
 		} else if (progress.error) {
 			clearInterval(timer);
 			updateStatusEl.textContent = `更新失败：${progress.error}`;
 			updateRunBtnEl.disabled = false;
 			updateProgressEl.hidden = true;
+			updateOverlayEl.hidden = true;
 		}
 	}, 1000);
 });
+
+// ---------------------------------------------------------------------------
+// 启动时静默检查更新（每 24 小时一次，发现新版本在设置按钮上打点提示）
+// ---------------------------------------------------------------------------
+
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_CHECKED_AT_KEY = "pi-console-update-checked-at";
+
+async function autoCheckUpdate() {
+	const last = Number(localStorage.getItem(UPDATE_CHECKED_AT_KEY)) || 0;
+	if (Number.isFinite(last) && Date.now() - last < UPDATE_CHECK_INTERVAL_MS) return;
+	localStorage.setItem(UPDATE_CHECKED_AT_KEY, String(Date.now()));
+	try {
+		const info = await api("/api/app/update-check");
+		if (info.updateAvailable) {
+			settingsBtnEl.classList.add("update-available");
+			showInfo(`发现新版本 v${info.latest}（当前 v${info.current}），可在「设置 → 关于与更新」中升级`);
+		}
+	} catch {
+		/* 静默：不打扰启动 */
+	}
+}
 
 // ---------------------------------------------------------------------------
 // 启动
@@ -4096,6 +4565,9 @@ updateRunBtnEl.addEventListener("click", async () => {
 		thinkingSelectEl.disabled = false;
 		pollContext();
 		inputEl.focus();
+		// 默认展开右侧边栏的终端标签：智能体运行本地命令时可以直接看到同步输出。
+		showSidePanel("terminal");
+		void autoCheckUpdate();
 	} catch (error) {
 		showError(`初始化失败：${error.message}`);
 		connStateEl.textContent = "未连接";

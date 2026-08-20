@@ -181,31 +181,6 @@
 					</div>
 				</section>
 
-				<div id="agent-browser-resizer" class="office-preview-resizer" title="拖动调整浏览器宽度" hidden></div>
-				<section id="agent-browser-pane" class="agent-browser-pane" hidden>
-					<header class="agent-browser-header">
-						<div class="agent-browser-heading">
-							<span class="office-preview-kicker">智能体浏览器（agent_browser）</span>
-							<strong id="agent-browser-title" class="office-preview-title">独立浏览器</strong>
-							<span id="agent-browser-status" class="office-preview-status">浏览器已准备</span>
-						</div>
-						<div class="office-preview-actions">
-							<button id="agent-browser-external" class="icon-btn small" type="button" title="在系统浏览器中打开当前网页">↗</button>
-							<button id="agent-browser-close" class="icon-btn small" type="button" title="隐藏客户端浏览器，后台任务不会停止">×</button>
-						</div>
-					</header>
-					<div class="agent-browser-toolbar">
-						<button id="agent-browser-back" class="icon-btn small" type="button" title="后退" disabled>←</button>
-						<button id="agent-browser-forward" class="icon-btn small" type="button" title="前进" disabled>→</button>
-						<button id="agent-browser-refresh" class="icon-btn small" type="button" title="刷新">⟳</button>
-						<input id="agent-browser-address" type="text" aria-label="浏览器地址" placeholder="输入网址或搜索内容" autocomplete="off">
-						<button id="agent-browser-go" class="secondary-btn small" type="button">打开</button>
-					</div>
-					<div id="agent-browser-stage" class="agent-browser-stage">
-						<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>
-					</div>
-				</section>
-
 				<div id="code-editor-resizer" class="office-preview-resizer" title="拖动调整代码编辑器宽度" hidden></div>
 				<section id="code-editor-pane" class="code-editor-pane" hidden>
 					<header class="code-editor-header">
@@ -225,6 +200,80 @@
 						<div class="code-editor-placeholder">安装“代码开发”插件后，可在这里直接编辑工作区代码。</div>
 					</div>
 				</section>
+
+				<!-- 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换，原生浏览器只在浏览器标签激活时显示） -->
+				<div id="workbench-side-resizer" class="office-preview-resizer" title="拖动调整侧栏宽度" hidden></div>
+				<section id="workbench-side" class="workbench-side" hidden>
+					<div id="review-pane" class="workbench-pane" hidden>
+						<header class="workbench-pane-header">
+							<div class="workbench-pane-heading">
+								<span class="office-preview-kicker">代码审查（git_diff）</span>
+								<strong id="review-title" class="office-preview-title">工作区差异</strong>
+								<span id="review-status" class="office-preview-status">未加载</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="review-copy" class="icon-btn small" type="button" title="复制完整差异">⧉</button>
+								<button id="review-refresh" class="icon-btn small" type="button" title="刷新差异">⟳</button>
+							</div>
+						</header>
+						<div id="review-summary" class="review-summary"></div>
+						<div id="review-files" class="review-files"></div>
+						<div id="review-diff" class="review-diff"></div>
+					</div>
+
+					<div id="terminal-pane" class="workbench-pane" hidden>
+						<header class="workbench-pane-header">
+							<div class="workbench-pane-heading">
+								<span class="office-preview-kicker">本地终端（bash / powershell）</span>
+								<strong id="terminal-title" class="office-preview-title">执行记录</strong>
+								<span id="terminal-status" class="office-preview-status">空闲</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="terminal-copy" class="icon-btn small" type="button" title="复制终端输出">⧉</button>
+								<button id="terminal-clear" class="icon-btn small" type="button" title="清空终端记录">×</button>
+							</div>
+						</header>
+						<div id="terminal-output" class="terminal-output">
+							<div class="terminal-empty">智能体运行本地命令时，这里会实时显示命令与输出。</div>
+						</div>
+					</div>
+
+					<div id="side-browser-pane" class="workbench-pane" hidden>
+						<header class="agent-browser-header">
+							<div class="agent-browser-heading">
+								<span class="office-preview-kicker">智能体浏览器（agent_browser）</span>
+								<strong id="side-browser-title" class="office-preview-title">独立浏览器</strong>
+								<span id="side-browser-status" class="office-preview-status">浏览器已准备</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="side-browser-external" class="icon-btn small" type="button" title="在系统浏览器中打开当前网页">↗</button>
+								<button id="side-browser-close" class="icon-btn small" type="button" title="隐藏客户端浏览器，后台任务不会停止">×</button>
+							</div>
+						</header>
+						<div class="agent-browser-toolbar">
+							<button id="side-browser-back" class="icon-btn small" type="button" title="后退" disabled>←</button>
+							<button id="side-browser-forward" class="icon-btn small" type="button" title="前进" disabled>→</button>
+							<button id="side-browser-refresh" class="icon-btn small" type="button" title="刷新">⟳</button>
+							<input id="side-browser-address" type="text" aria-label="浏览器地址" placeholder="输入网址或搜索内容" autocomplete="off">
+							<button id="side-browser-go" class="secondary-btn small" type="button">打开</button>
+						</div>
+						<div id="side-browser-stage" class="agent-browser-stage">
+							<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>
+						</div>
+					</div>
+
+					<nav class="workbench-tabs" aria-label="侧栏视图">
+						<button id="side-tab-review" class="workbench-tab" type="button" title="审查工作区代码差异">
+							<span class="workbench-tab-icon">☰</span><span>审查</span>
+						</button>
+						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
+							<span class="workbench-tab-icon">&gt;_</span><span>终端</span>
+						</button>
+						<button id="side-tab-browser" class="workbench-tab" type="button" title="打开客户端独立浏览器">
+							<span class="workbench-tab-icon">◎</span><span>浏览器</span>
+						</button>
+					</nav>
+				</section>
 			</div>
 		</main>
 
@@ -240,6 +289,15 @@
 
 	<div id="drop-overlay" class="drop-overlay" hidden>
 		<div class="drop-overlay-inner">📥 释放以添加附件</div>
+	</div>
+
+	<!-- 更新安装遮罩：安装器接管期间覆盖全屏，避免把退出误判为断线 -->
+	<div id="update-overlay" class="update-overlay" hidden>
+		<div class="update-overlay-card">
+			<div class="update-overlay-spinner" aria-hidden="true"></div>
+			<div class="update-overlay-title">正在安装更新</div>
+			<div class="update-overlay-text">安装完成后客户端会自动重启，期间请勿断电或强制关闭。</div>
+		</div>
 	</div>
 
 	<!-- 文件预览弹层 -->

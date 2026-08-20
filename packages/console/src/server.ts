@@ -99,6 +99,8 @@ const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>
 // Electron/Node fetch does not automatically inherit the Windows WinINET proxy.
 // Configure it before any model catalog, provider, or updater network request.
 configureConsoleNetworking();
+// 清理历史更新残留，避免 update 目录无限累积旧安装包。
+updates.cleanupStaleUpdateFiles();
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
@@ -376,6 +378,24 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 				isError: ev.isError,
 				result: summarizeToolResult(ev.result),
 			};
+		case "tool_execution_update": {
+			// 流式部分结果（bash/powershell 等长命令的实时输出）。
+			// 只发在线客户端，不进入重放缓冲：终值由 tool_execution_end 提供，
+			// 避免高频更新把断线补发窗口挤掉触发整段 resync。
+			const partial = ev.partialResult as { content?: Array<{ type?: string; text?: unknown }> } | undefined;
+			const text = (partial?.content ?? [])
+				.filter((block) => block.type === "text" && typeof block.text === "string")
+				.map((block) => block.text)
+				.join("\n");
+			if (!text) return undefined;
+			return {
+				type: "tool_execution_update",
+				toolCallId: ev.toolCallId,
+				toolName: ev.toolName,
+				toolDisplayName: toolDisplayName(ev.toolName),
+				text,
+			};
+		}
 		case "turn_end": {
 			const message = ev.message as {
 				stopReason?: string;
@@ -506,11 +526,16 @@ function releaseTurnCapabilities(cs: ConsoleSession): void {
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 }
 
+/** 只对在线连接广播、不写入重放缓冲的瞬时事件类型（终值由后续事件补全）。 */
+const TRANSIENT_EVENT_TYPES = new Set(["tool_execution_update"]);
+
 function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [key: string]: unknown }): void {
 	const event: BufferedEvent = { seq: cs.nextSeq++, ...clientEvent };
-	cs.events.push(event);
-	if (cs.events.length > MAX_BUFFERED_EVENTS) {
-		cs.events.splice(0, cs.events.length - MAX_BUFFERED_EVENTS);
+	if (!TRANSIENT_EVENT_TYPES.has(clientEvent.type)) {
+		cs.events.push(event);
+		if (cs.events.length > MAX_BUFFERED_EVENTS) {
+			cs.events.splice(0, cs.events.length - MAX_BUFFERED_EVENTS);
+		}
 	}
 	const payload = `data: ${JSON.stringify(event)}\n\n`;
 	for (const client of cs.sseClients) {

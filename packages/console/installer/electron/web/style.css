@@ -30,6 +30,7 @@
 	--tok-comment: #7a7a84;
 	--tok-number: #f2c76e;
 	--mono: "Cascadia Code", Consolas, "Courier New", monospace;
+	--sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
 	--radius: 10px;
 	--radius-lg: 14px;
 	--shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
@@ -2769,4 +2770,446 @@ body {
 
 .session-context-item.danger:hover {
 	background: var(--error-bg);
+}
+
+/* ========================================================================== */
+/* 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换，ZCode 风格布局）          */
+/* ========================================================================== */
+
+.workbench-side {
+	width: min(50%, 760px);
+	min-width: 360px;
+	min-height: 0;
+	flex: 0 0 auto;
+	display: flex;
+	flex-direction: column;
+	background: var(--panel);
+	border-left: 1px solid var(--border);
+}
+
+.workbench-side[hidden],
+.workbench-side-resizer[hidden] {
+	display: none;
+}
+
+/* 收起状态：只保留底部标签条（贴右下角），随时可以点回任意面板 */
+.workbench-side.collapsed {
+	width: 264px;
+	min-width: 264px;
+	justify-content: flex-end;
+	border-left: 0;
+}
+
+.workbench-side.collapsed .workbench-pane {
+	display: none;
+}
+
+.workbench-side.collapsed .workbench-tabs {
+	border: 1px solid var(--border);
+	border-bottom: 0;
+	border-radius: 12px 12px 0 0;
+	box-shadow: 0 -6px 24px rgb(0 0 0 / 0.18);
+}
+
+.workbench-side.collapsed .workbench-tab .workbench-tab-icon {
+	display: none;
+}
+
+.workbench-pane {
+	flex: 1;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+}
+
+.workbench-pane[hidden] {
+	display: none;
+}
+
+.workbench-pane-header {
+	min-height: 58px;
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 8px 10px 8px 14px;
+	border-bottom: 1px solid var(--border);
+	background: var(--sidebar-bg);
+}
+
+.workbench-pane-heading {
+	min-width: 0;
+	flex: 1;
+	display: grid;
+	grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+	align-items: baseline;
+	column-gap: 8px;
+	row-gap: 2px;
+}
+
+/* 底部标签栏 */
+.workbench-tabs {
+	display: flex;
+	gap: 4px;
+	padding: 6px 8px;
+	border-top: 1px solid var(--border);
+	background: var(--sidebar-bg);
+}
+
+.workbench-tab {
+	position: relative;
+	flex: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 7px;
+	padding: 8px 10px;
+	border: 1px solid transparent;
+	border-radius: 9px;
+	background: transparent;
+	color: var(--muted);
+	font: 600 12px var(--sans);
+	cursor: pointer;
+	transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.workbench-tab:hover {
+	background: var(--panel-2);
+	color: var(--fg);
+}
+
+.workbench-tab.active {
+	background: color-mix(in srgb, var(--accent) 14%, transparent);
+	border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+	color: var(--accent);
+}
+
+.workbench-tab-icon {
+	font: 700 12px var(--mono);
+	letter-spacing: -0.5px;
+}
+
+.workbench-tab.activity::after {
+	content: "";
+	position: absolute;
+	top: 6px;
+	right: 8px;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--accent, #3b6ef5);
+	box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #3b6ef5) 22%, transparent);
+}
+
+/* ---------- 审查面板 ---------- */
+
+.review-summary {
+	padding: 10px 14px;
+	border-bottom: 1px solid var(--border);
+	color: var(--muted);
+	font: 11.5px var(--mono);
+}
+
+.review-meta {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.review-files {
+	max-height: 168px;
+	overflow-y: auto;
+	padding: 8px 10px;
+	border-bottom: 1px solid var(--border);
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.review-file {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 5px 9px;
+	border: 0;
+	border-radius: 8px;
+	background: transparent;
+	color: var(--fg);
+	font: 12px var(--sans);
+	text-align: left;
+	cursor: pointer;
+}
+
+.review-file:hover {
+	background: var(--panel-2);
+}
+
+.review-file-name {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	direction: rtl;
+	text-align: left;
+	font-family: var(--mono);
+	font-size: 11.5px;
+}
+
+.review-file-state {
+	flex-shrink: 0;
+	padding: 1px 7px;
+	border-radius: 999px;
+	font: 600 10px var(--sans);
+}
+
+.review-file-state.modified {
+	background: color-mix(in srgb, #f5a524 16%, transparent);
+	color: #f5a524;
+}
+
+.review-file-state.added {
+	background: color-mix(in srgb, #30a46c 16%, transparent);
+	color: #30a46c;
+}
+
+.review-diff {
+	flex: 1;
+	min-height: 0;
+	overflow: auto;
+	padding: 4px 0 24px;
+	background: var(--bg);
+	user-select: text;
+}
+
+.review-empty {
+	padding: 32px 16px;
+	color: var(--faint);
+	text-align: center;
+	font-size: 12.5px;
+}
+
+.review-file-diff {
+	margin: 12px 0;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	overflow: hidden;
+}
+
+.review-file-diff-head {
+	padding: 7px 12px;
+	background: var(--panel-2);
+	border-bottom: 1px solid var(--border);
+	color: var(--muted);
+	font: 600 11.5px var(--mono);
+	word-break: break-all;
+}
+
+.review-line {
+	padding: 0 12px;
+	font: 11.5px/1.65 var(--mono);
+	white-space: pre-wrap;
+	word-break: break-all;
+	color: var(--fg);
+}
+
+.review-line.add {
+	background: color-mix(in srgb, #30a46c 13%, transparent);
+	color: #57ab5a;
+}
+
+.review-line.del {
+	background: color-mix(in srgb, #e5484d 12%, transparent);
+	color: #f2555a;
+}
+
+.review-line.hunk {
+	padding: 4px 12px;
+	background: var(--panel-2);
+	color: var(--accent);
+	font-weight: 600;
+}
+
+/* ---------- 终端面板 ---------- */
+
+.terminal-output {
+	flex: 1;
+	min-height: 0;
+	overflow-y: auto;
+	padding: 10px 12px 18px;
+	background: var(--bg);
+	font-family: var(--mono);
+	user-select: text;
+}
+
+.terminal-empty {
+	padding: 28px 8px;
+	color: var(--faint);
+	text-align: center;
+	font-size: 12px;
+}
+
+.terminal-entry {
+	margin-bottom: 10px;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	overflow: hidden;
+	background: color-mix(in srgb, var(--panel) 60%, transparent);
+}
+
+.terminal-entry.running {
+	border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+}
+
+.terminal-entry.error {
+	border-color: color-mix(in srgb, #e5484d 46%, var(--border));
+}
+
+.terminal-entry-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 7px 10px;
+	background: var(--panel-2);
+	border-bottom: 1px solid var(--border);
+}
+
+.terminal-entry-badge {
+	flex-shrink: 0;
+	padding: 1px 7px;
+	border-radius: 6px;
+	background: color-mix(in srgb, var(--accent) 16%, transparent);
+	color: var(--accent);
+	font: 700 10px var(--mono);
+}
+
+.terminal-entry-cmd {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--fg);
+	font: 11.5px var(--mono);
+	cursor: copy;
+}
+
+.terminal-entry-state {
+	flex-shrink: 0;
+	color: var(--faint);
+	font: 10.5px var(--mono);
+}
+
+.terminal-entry.running .terminal-entry-state {
+	color: var(--accent);
+}
+
+.terminal-entry.error .terminal-entry-state {
+	color: #f2555a;
+}
+
+.terminal-entry-output {
+	max-height: 320px;
+	overflow-y: auto;
+	margin: 0;
+	padding: 8px 10px;
+	font: 11.5px/1.6 var(--mono);
+	white-space: pre-wrap;
+	word-break: break-all;
+	color: var(--muted);
+}
+
+/* ---------- 运行中工具的实时输出（聊天区执行过程） ---------- */
+
+.tool-live {
+	max-height: 260px;
+	overflow-y: auto;
+	margin: 6px 0;
+	padding: 8px 10px;
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--bg) 72%, transparent);
+	border: 1px solid var(--border);
+	font: 11.5px/1.6 var(--mono);
+	white-space: pre-wrap;
+	word-break: break-all;
+	color: var(--muted);
+	user-select: text;
+}
+
+.tool-args {
+	font-family: var(--mono);
+	font-size: 11.5px;
+	white-space: pre-wrap;
+	word-break: break-all;
+	user-select: text;
+}
+
+/* ---------- 更新遮罩与设置按钮更新提示 ---------- */
+
+.update-overlay {
+	position: fixed;
+	inset: 0;
+	z-index: 200;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: color-mix(in srgb, var(--bg) 78%, transparent);
+	backdrop-filter: blur(6px);
+}
+
+.update-overlay[hidden] {
+	display: none;
+}
+
+.update-overlay-card {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 14px;
+	padding: 36px 48px;
+	border: 1px solid var(--border);
+	border-radius: 16px;
+	background: var(--panel);
+	box-shadow: 0 24px 60px rgb(0 0 0 / 0.35);
+}
+
+.update-overlay-spinner {
+	width: 34px;
+	height: 34px;
+	border-radius: 50%;
+	border: 3px solid var(--border);
+	border-top-color: var(--accent, #3b6ef5);
+	animation: update-overlay-spin 0.9s linear infinite;
+}
+
+@keyframes update-overlay-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+.update-overlay-title {
+	font-size: 16px;
+	font-weight: 650;
+}
+
+.update-overlay-text {
+	color: var(--muted);
+	font-size: 12.5px;
+}
+
+.icon-btn.update-available {
+	position: relative;
+}
+
+.icon-btn.update-available::after {
+	content: "";
+	position: absolute;
+	top: 4px;
+	right: 4px;
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: #30a46c;
+	box-shadow: 0 0 0 3px color-mix(in srgb, #30a46c 25%, transparent);
 }

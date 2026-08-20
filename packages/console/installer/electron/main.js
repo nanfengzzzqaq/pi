@@ -4,7 +4,7 @@
  * 直接加载现有 TypeScript 后端（Node ≥22.18 原生 type-stripping），
  * 数据目录与旧版一致（%APPDATA%\pi-console\data），所有数据无缝继承。
  */
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, shell } from "electron";
+import { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, shell } from "electron";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -90,6 +90,26 @@ function upgradeLegacyLauncher() {
 	}
 }
 
+/**
+ * 全局右键菜单：聊天正文、工具输出、终端、地址栏等任何地方都能复制粘贴，
+ * 与主流桌面应用保持一致。Electron 默认不提供菜单，必须显式注册。
+ */
+function registerContextMenu(targetWindow) {
+	targetWindow.webContents.on("context-menu", (_event, params) => {
+		const editable = Boolean(params.editFlags?.canEdit);
+		const hasSelection = Boolean(params.editFlags?.canCopy);
+		const template = [];
+		if (hasSelection) template.push({ role: "copy", label: "复制" });
+		if (editable) {
+			if (hasSelection) template.push({ role: "cut", label: "剪切" });
+			template.push({ role: "paste", label: "粘贴" });
+		}
+		if (hasSelection || editable) template.push({ type: "separator" });
+		template.push({ role: "selectAll", label: "全选" });
+		Menu.buildFromTemplate(template).popup({ window: targetWindow });
+	});
+}
+
 function createWindow() {
 	win = new BrowserWindow({
 		width: 1280,
@@ -107,6 +127,7 @@ function createWindow() {
 			nodeIntegration: false,
 		},
 	});
+	registerContextMenu(win);
 	win.webContents.setWindowOpenHandler(({ url }) => {
 		if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
 		return { action: "deny" };

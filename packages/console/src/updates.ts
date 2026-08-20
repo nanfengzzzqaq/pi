@@ -13,8 +13,10 @@ import {
 	createWriteStream,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -138,6 +140,29 @@ export function clearGithubToken(): boolean {
 	return true;
 }
 
+/** 启动时清理历史更新残留（中断的安装包与错误日志，超过 7 天删除）。 */
+export function cleanupStaleUpdateFiles(maxAgeMs = 7 * 24 * 60 * 60 * 1000): number {
+	const updateDir = join(DATA_DIR, "update");
+	let removed = 0;
+	try {
+		for (const name of readdirSync(updateDir)) {
+			const file = join(updateDir, name);
+			try {
+				const stats = statSync(file);
+				if (stats.isFile() && Date.now() - stats.mtimeMs > maxAgeMs) {
+					unlinkSync(file);
+					removed++;
+				}
+			} catch {
+				/* 单个文件失败不影响其余清理 */
+			}
+		}
+	} catch {
+		/* 目录不存在或不可读 */
+	}
+	return removed;
+}
+
 /** GitHub 请求公共头（带可选令牌） */
 function githubHeaders(credential: GithubCredential | null = resolveGithubCredential()): Record<string, string> {
 	const headers: Record<string, string> = { "User-Agent": "pi-console" };
@@ -254,7 +279,7 @@ export interface UpdateProgress {
 	receivedBytes: number;
 	totalBytes: number | null;
 	error: string | null;
-	phase: "idle" | "downloading" | "installing";
+	phase: "idle" | "downloading" | "verifying" | "installing";
 }
 
 let progress: UpdateProgress = { running: false, receivedBytes: 0, totalBytes: null, error: null, phase: "idle" };
@@ -323,6 +348,8 @@ export function buildUpdateHelperScript(
 			"\t$installer = Start-Process -FilePath $setupPath -ArgumentList '/S' -PassThru -Wait",
 			'\tif ($installer.ExitCode -ne 0) { throw "安装程序退出码：$($installer.ExitCode)" }',
 			'\tif (-not (Test-Path -LiteralPath $relaunchPath -PathType Leaf)) { throw "更新完成，但启动文件不存在：$relaunchPath" }',
+			"\t# 安装成功后清理安装包，避免 update 目录残留上亿元的旧安装程序",
+			"\tRemove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue",
 			"\tStart-Process -FilePath $relaunchPath",
 			"} catch {",
 			"\t($_ | Out-String) | Set-Content -LiteralPath $errorLogPath -Encoding UTF8",
@@ -406,6 +433,7 @@ export async function runUpdate(): Promise<void> {
 		});
 
 		try {
+			progress.phase = "verifying";
 			await verifyDownloadedInstaller(setupPath, progress.receivedBytes, progress.totalBytes, info.assetDigest);
 		} catch (error) {
 			if (existsSync(setupPath)) unlinkSync(setupPath);
