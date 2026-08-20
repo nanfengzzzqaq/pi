@@ -4,13 +4,19 @@
  * Windows 安装版可直接浏览本机磁盘，作为客户端内置的资源管理器；
  * 非 Windows 环境仍限制在工作区、数据目录与显式配置目录内。
  */
-import { copyFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, type Dirent, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { DATA_DIR } from "./paths.ts";
+import { decodeTextBuffer, isTextFilePath } from "./text-files.ts";
 import { getWorkspacePath } from "./workspace.ts";
 
 const MAX_READ_BYTES = 10 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+const MAX_SEARCH_FILES = 50_000;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
+const SEARCH_TIMEOUT_MS = 8_000;
+const SEARCH_IGNORED_DIRECTORIES = new Set([".git", ".svn", "node_modules"]);
 
 export interface FsRoot {
 	path: string;
@@ -108,6 +114,16 @@ export interface AllowedFileInfo {
 	mimeType: string;
 }
 
+export interface FsSearchResult {
+	path: string;
+	name: string;
+	size: number;
+	mtime: number;
+	isWorkspace: boolean;
+	line: number | null;
+	preview: string | null;
+}
+
 /** 列目录；path 为绝对路径（必须落在某个根内） */
 export function listDir(path: string): Array<FsEntry & { root: string }> {
 	const abs = resolve(path);
@@ -154,6 +170,97 @@ export function readFileAsBase64(path: string): { dataBase64: string; mimeType: 
 	return { dataBase64: data.toString("base64"), mimeType: mimeForPath(abs), size: stat.size };
 }
 
+export function readTextFile(path: string): { text: string; encoding: string; size: number; mimeType: string } {
+	const abs = resolveAllowedFilePath(path);
+	if (!isTextFilePath(abs)) throw new Error("该文件不是可直接预览的文本格式");
+	const stat = statSync(abs);
+	if (stat.size > MAX_READ_BYTES) throw new Error(`文本文件超过 ${MAX_READ_BYTES / 1024 / 1024}MB，无法直接预览`);
+	const decoded = decodeTextBuffer(readFileSync(abs));
+	return { ...decoded, size: stat.size, mimeType: mimeForPath(abs) };
+}
+
+/** 在当前目录下递归搜索文件名或文本内容；全程本地执行，不调用模型。 */
+export function searchFiles(
+	path: string,
+	query: string,
+	mode: "name" | "content",
+): { results: FsSearchResult[]; scanned: number; truncated: boolean } {
+	const root = resolve(path);
+	if (!withinRoots(root)) throw new Error("路径不在可浏览范围内");
+	if (!statSync(root).isDirectory()) throw new Error("目标不是目录");
+	const needle = query.trim().toLocaleLowerCase("zh-CN");
+	if (!needle) return { results: [], scanned: 0, truncated: false };
+
+	const results: FsSearchResult[] = [];
+	const queue = [root];
+	const startedAt = Date.now();
+	let scanned = 0;
+	let truncated = false;
+	while (queue.length > 0) {
+		if (
+			scanned >= MAX_SEARCH_FILES ||
+			results.length >= MAX_SEARCH_RESULTS ||
+			Date.now() - startedAt > SEARCH_TIMEOUT_MS
+		) {
+			truncated = true;
+			break;
+		}
+		const directory = queue.shift();
+		if (!directory) break;
+		let entries: Dirent[];
+		try {
+			entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) {
+				truncated = true;
+				break;
+			}
+			const entryPath = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				if (!SEARCH_IGNORED_DIRECTORIES.has(entry.name.toLocaleLowerCase("en-US"))) queue.push(entryPath);
+				continue;
+			}
+			if (!entry.isFile()) continue;
+			scanned++;
+			try {
+				const stat = statSync(entryPath);
+				let line: number | null = null;
+				let preview: string | null = null;
+				let matched = entry.name.toLocaleLowerCase("zh-CN").includes(needle);
+				if (mode === "content") {
+					matched = false;
+					if (stat.size <= MAX_SEARCH_FILE_BYTES && isTextFilePath(entryPath)) {
+						const lines = decodeTextBuffer(readFileSync(entryPath)).text.split(/\r?\n/);
+						const index = lines.findIndex((value) => value.toLocaleLowerCase("zh-CN").includes(needle));
+						if (index >= 0) {
+							matched = true;
+							line = index + 1;
+							preview = lines[index].trim().slice(0, 240);
+						}
+					}
+				}
+				if (matched) {
+					results.push({
+						path: entryPath,
+						name: entry.name,
+						size: stat.size,
+						mtime: stat.mtimeMs,
+						isWorkspace: isWorkspacePath(entryPath),
+						line,
+						preview,
+					});
+				}
+			} catch {
+				/* 跳过搜索过程中失效或无权限的文件 */
+			}
+		}
+	}
+	return { results, scanned, truncated };
+}
+
 export function mimeForPath(path: string): string {
 	const ext = path.split(".").pop()?.toLowerCase() ?? "";
 	const map: Record<string, string> = {
@@ -165,12 +272,25 @@ export function mimeForPath(path: string): string {
 		svg: "image/svg+xml",
 		txt: "text/plain",
 		md: "text/markdown",
+		mdx: "text/markdown",
 		json: "application/json",
+		jsonl: "application/x-ndjson",
+		yaml: "text/yaml",
+		yml: "text/yaml",
+		toml: "text/plain",
+		xml: "application/xml",
 		js: "text/javascript",
+		jsx: "text/javascript",
+		mjs: "text/javascript",
 		ts: "text/typescript",
+		tsx: "text/typescript",
 		css: "text/css",
+		scss: "text/css",
 		html: "text/html",
 		csv: "text/csv",
+		tsv: "text/tab-separated-values",
+		log: "text/plain",
+		ini: "text/plain",
 		docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 		doc: "application/msword",
 		xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

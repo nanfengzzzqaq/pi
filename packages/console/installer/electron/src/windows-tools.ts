@@ -22,6 +22,7 @@ const MAX_OUTPUT_CHARS = 16_000;
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const MAX_TIMEOUT_SECONDS = 2_147_000;
 const PRIVATE_MINGIT_DIR = join(DATA_DIR, "runtime", "mingit");
+const PRIVATE_AGENT_BIN_DIR = join(DATA_DIR, "agent", "bin");
 
 export interface WindowsToolContext {
 	getWorkspaceRoot(): string;
@@ -103,6 +104,28 @@ export function seedBundledWindowsRuntime(): boolean {
 	mkdirSync(PRIVATE_MINGIT_DIR, { recursive: true });
 	cpSync(bundledMinGitDir, PRIVATE_MINGIT_DIR, { recursive: true, force: true });
 	return true;
+}
+
+/** 把安装包预置的 rg/fd 复制到 Pi 私有 agent/bin，供官方 grep/find 工具直接使用。 */
+export function seedBundledSearchRuntime(): boolean {
+	if (process.platform !== "win32") return false;
+	const roots = PACKAGE_ROOT.toLocaleLowerCase("en-US").endsWith(".asar")
+		? [`${PACKAGE_ROOT}.unpacked`, PACKAGE_ROOT]
+		: [PACKAGE_ROOT];
+	const bundled = roots
+		.map((root) => join(root, "data", "agent", "bin"))
+		.find((root) => existsSync(join(root, "rg.exe")));
+	if (!bundled) return false;
+	let changed = false;
+	mkdirSync(PRIVATE_AGENT_BIN_DIR, { recursive: true });
+	for (const name of ["rg.exe", "fd.exe"]) {
+		const source = join(bundled, name);
+		const destination = join(PRIVATE_AGENT_BIN_DIR, name);
+		if (!existsSync(source) || existsSync(destination)) continue;
+		cpSync(source, destination, { force: true });
+		changed = true;
+	}
+	return changed;
 }
 
 function readRuntimeRecord(path: string): RuntimeRecord {

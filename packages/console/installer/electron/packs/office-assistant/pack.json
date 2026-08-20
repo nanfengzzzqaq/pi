@@ -6,7 +6,7 @@
 	"deferred": true,
 	"metaTool": "office_enable",
 	"activation": {
-		"extensions": [".docx", ".xlsx", ".pptx", ".csv", ".tsv"],
+		"extensions": [".docx", ".xlsx", ".pptx"],
 		"keywords": [
 			"Office",
 			"Word",
@@ -21,8 +21,7 @@
 			"报告",
 			"合同",
 			"简历",
-			"模板",
-			"CSV"
+			"模板"
 		],
 		"minimumScore": 2,
 		"defaultGroups": ["inspect"]

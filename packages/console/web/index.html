@@ -56,6 +56,14 @@
 							<input id="fs-path-input" type="text" aria-label="本地路径" placeholder="输入 Windows 文件夹路径" autocomplete="off">
 							<button id="fs-path-go" class="secondary-btn small" type="button">转到</button>
 						</div>
+						<div class="files-search-row">
+							<select id="fs-search-mode" aria-label="搜索方式">
+								<option value="name">文件名</option>
+								<option value="content">文件内容</option>
+							</select>
+							<input id="fs-search-input" type="search" placeholder="在当前文件夹中搜索" autocomplete="off">
+							<button id="fs-search-clear" class="icon-btn small" type="button" title="清除搜索">×</button>
+						</div>
 						<div class="files-workspace-line" id="files-workspace-line" title="当前工作区（会话工作目录）">
 							<span class="files-workspace-label">工作区</span>
 							<span id="fs-workspace-path" class="files-workspace-path">（未设置）</span>

@@ -1,0 +1,35 @@
+{
+	"name": "archive-files",
+	"displayName": "压缩包处理",
+	"description": "使用私有 7-Zip 查看、解压、创建和校验压缩包",
+	"version": "1.0.0",
+	"activation": {
+		"extensions": [".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"],
+		"keywords": ["压缩包", "解压", "压缩", "归档", "7-Zip", "ZIP", "RAR"],
+		"minimumScore": 2,
+		"defaultGroups": ["inspect"]
+	},
+	"toolGroups": [
+		{
+			"name": "inspect",
+			"displayName": "查看与校验",
+			"description": "列出或校验压缩包内容",
+			"tools": ["archive_list", "archive_test"],
+			"keywords": ["查看", "列出", "内容", "检查", "校验", "损坏"]
+		},
+		{
+			"name": "extract",
+			"displayName": "解压",
+			"description": "解压压缩包",
+			"tools": ["archive_extract", "archive_list"],
+			"keywords": ["解压", "提取", "打开"]
+		},
+		{
+			"name": "create",
+			"displayName": "创建压缩包",
+			"description": "把文件或文件夹压缩为归档",
+			"tools": ["archive_create"],
+			"keywords": ["压缩", "打包", "创建", "归档"]
+		}
+	]
+}

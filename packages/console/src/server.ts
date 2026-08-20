@@ -22,7 +22,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { extractFileReferences } from "./artifacts.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
+import { instantiateCoreFileTools } from "./core-file-tools.ts";
 import * as fsExplorer from "./fs.ts";
+import * as managedFileTools from "./managed-file-tools.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
@@ -53,7 +55,7 @@ import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
-import { instantiateWindowsTools, seedBundledWindowsRuntime } from "./windows-tools.ts";
+import { instantiateWindowsTools, seedBundledSearchRuntime, seedBundledWindowsRuntime } from "./windows-tools.ts";
 import * as workspace from "./workspace.ts";
 
 // ---------------------------------------------------------------------------
@@ -80,8 +82,15 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
+// Pi 官方 grep/find 会从 agent/bin 读取私有 rg/fd；网页开发模式与 Electron 安装版保持一致。
+process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
+const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
+	sevenzip: "archive-files",
+	ocr: "image-ocr",
+	libreoffice: "legacy-documents",
+};
 
 // Electron/Node fetch does not automatically inherit the Windows WinINET proxy.
 // Configure it before any model catalog, provider, or updater network request.
@@ -295,9 +304,16 @@ if (await registerDetectedWhiteRabbitNeo(modelRuntime)) {
 if (seedBundledWindowsRuntime()) {
 	console.log("Windows 工具：已把 Pi 私有 Bash/Git 运行时复制到数据目录");
 }
+if (seedBundledSearchRuntime()) {
+	console.log("Windows 工具：已把 Pi 私有文件搜索运行时复制到数据目录");
+}
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
+for (const [id, packName] of Object.entries(MANAGED_TOOL_PACKS) as Array<[managedFileTools.ManagedToolId, string]>) {
+	if (managedFileTools.getManagedToolStatus(id).installed) activatePackForAllSessions(packName);
+	else deactivatePackForAllSessions(packName);
+}
 
 // 首启引导：把安装包预置的 OfficeCLI 拷到外置数据目录（开发模式两者同路径，无操作）
 if (officecli.seedBundledBinary()) {
@@ -534,6 +550,7 @@ async function buildSession(
 		agentDir: CONSOLE_AGENT_DIR,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
 		customTools: [
+			...instantiateCoreFileTools(cwd),
 			...instantiateWindowsTools({ getWorkspaceRoot: () => cwd }),
 			...instantiatePackTools({
 				getWorkspaceRoot: () => cwd,
@@ -733,13 +750,20 @@ function buildHistory(session: AgentSession, enabledPacks: Set<string>): History
 	return items;
 }
 
-/** 工具/技能目录：当前只发布经过验证的 OfficeCLI，后续工具沿用同一结构追加。 */
+/** 工具/技能目录：基础文本搜索常驻；大型文件运行时由用户按需安装。 */
 async function buildCapabilityCatalog() {
 	const status = await officecli.getLocalStatus();
 	const pack = listPacks().find((item) => item.name === OFFICECLI_PACK_NAME);
 	const skills = listOfficeCliSkills(CONSOLE_AGENT_DIR);
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
+	const managedStatus = Object.fromEntries(
+		(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
+			id,
+			managedFileTools.getManagedToolStatus(id),
+		]),
+	);
+	const packByName = new Map(listPacks().map((item) => [item.name, item]));
 	return {
 		tools: [
 			{
@@ -748,7 +772,7 @@ async function buildCapabilityCatalog() {
 				displayName: "Office 文件处理",
 				description: "在本地创建、读取、编辑、检查和预览 Word、Excel、PowerPoint 文件。",
 				category: "文档办公",
-				formats: [".docx", ".xlsx", ".pptx", ".csv", ".tsv"],
+				formats: [".docx", ".xlsx", ".pptx"],
 				installed: status.installed,
 				version: status.version,
 				installPath: status.path,
@@ -760,6 +784,85 @@ async function buildCapabilityCatalog() {
 				capabilities: pack?.tools ?? [],
 				skillCount: skills.length,
 				installedSkillCount: skills.filter((skill) => skill.installed).length,
+			},
+			{
+				id: "pdfjs",
+				internalName: "pdfjs",
+				displayName: "PDF 渲染预览",
+				description:
+					"在客户端内使用 PDF.js 渲染 PDF，支持缩放、分页、搜索、复制与打印。仅负责查看，不抢占文件编辑任务。",
+				category: "文件处理",
+				formats: [".pdf"],
+				installed: managedStatus.pdfjs.installed,
+				version: managedStatus.pdfjs.version,
+				installPath: managedStatus.pdfjs.path,
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "PDF",
+				sourceName: "Mozilla PDF.js 官方项目",
+				sourceUrl: "https://github.com/mozilla/pdf.js",
+				activation: "点击 PDF 时本地使用，不注入模型",
+				capabilities: [],
+				skillCount: 0,
+				installedSkillCount: 0,
+			},
+			{
+				id: "sevenzip",
+				internalName: "7zip",
+				displayName: "压缩包处理",
+				description: "私有安装 7-Zip，用于查看、校验、解压和创建 ZIP、7z、RAR、TAR 等压缩包。",
+				category: "文件处理",
+				formats: [".zip", ".7z", ".rar", ".tar", ".gz", ".bz2", ".xz"],
+				installed: managedStatus.sevenzip.installed,
+				version: managedStatus.sevenzip.version,
+				installPath: managedStatus.sevenzip.path,
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "7Z",
+				sourceName: "7-Zip 官方项目",
+				sourceUrl: "https://github.com/ip7z/7zip",
+				activation: "识别到压缩包任务时加载",
+				capabilities: packByName.get("archive-files")?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
+			},
+			{
+				id: "ocr",
+				internalName: "tesseract_ocr",
+				displayName: "图片文字识别",
+				description:
+					"私有安装 Tesseract OCR 与中英文语言数据，从图片或扫描页中提取文字。安装时自动准备 7-Zip 依赖。",
+				category: "文件处理",
+				formats: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"],
+				installed: managedStatus.ocr.installed,
+				version: managedStatus.ocr.version,
+				installPath: managedStatus.ocr.path,
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "OCR",
+				sourceName: "Tesseract OCR 官方项目",
+				sourceUrl: "https://github.com/tesseract-ocr/tesseract",
+				activation: "识别到图片文字任务时加载",
+				capabilities: packByName.get("image-ocr")?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
+			},
+			{
+				id: "libreoffice",
+				internalName: "libreoffice",
+				displayName: "兼容文档转换",
+				description:
+					"私有安装 LibreOffice，专门转换 .doc/.xls/.ppt 与 OpenDocument 等兼容格式；现代 Office 文件仍由 OfficeCLI 负责。",
+				category: "文件处理",
+				formats: [".doc", ".xls", ".ppt", ".odt", ".ods", ".odp", ".rtf"],
+				installed: managedStatus.libreoffice.installed,
+				version: managedStatus.libreoffice.version,
+				installPath: managedStatus.libreoffice.path,
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "LO",
+				sourceName: "LibreOffice 官方项目",
+				sourceUrl: "https://www.libreoffice.org/",
+				activation: "识别到旧版或 OpenDocument 转换任务时加载",
+				capabilities: packByName.get("legacy-documents")?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
 			},
 			{
 				id: "redteam",
@@ -794,6 +897,12 @@ async function buildCapabilityCatalog() {
 		],
 		download: officecli.getDownloadProgress(),
 		redteamDownload: redteam.getInstallProgress(),
+		toolProgress: Object.fromEntries(
+			(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
+				id,
+				managedFileTools.getManagedToolProgress(id),
+			]),
+		),
 	};
 }
 
@@ -942,6 +1051,18 @@ function sendFileDownload(res: ServerResponse, file: fsExplorer.AllowedFileInfo)
 	stream.pipe(res);
 }
 
+function sendFileInline(res: ServerResponse, file: fsExplorer.AllowedFileInfo): void {
+	res.writeHead(200, {
+		"Content-Type": file.mimeType,
+		"Content-Length": file.size,
+		"Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+		"Cache-Control": "no-store",
+	});
+	const stream = createReadStream(file.path);
+	stream.on("error", () => res.destroy());
+	stream.pipe(res);
+}
+
 function readBodyJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
@@ -1054,6 +1175,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 	const pathname = url.pathname;
 
 	if (req.method === "GET" && serveStatic(pathname, res)) return;
+	if (req.method === "GET" && pathname.startsWith("/pdfjs/")) {
+		const asset = managedFileTools.resolvePdfJsAsset(decodeURIComponent(pathname.slice("/pdfjs/".length)));
+		if (!asset) {
+			sendJson(res, 404, { error: "PDF.js 未安装或资源不存在" });
+			return;
+		}
+		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
+		createReadStream(asset.path).pipe(res);
+		return;
+	}
 
 	if (pathname.startsWith("/api/")) {
 		if (!isAuthorized(req, url)) {
@@ -1203,7 +1334,39 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, redteam.getInstallProgress());
 		return;
 	}
-	const toolUninstallMatch = pathname.match(/^\/api\/tools\/(officecli|redteam)$/);
+	const managedInstallMatch = pathname.match(/^\/api\/tools\/(pdfjs|sevenzip|ocr|libreoffice)\/install$/);
+	if (managedInstallMatch && req.method === "POST") {
+		const id = managedInstallMatch[1] as managedFileTools.ManagedToolId;
+		const started = managedFileTools.startManagedToolInstall(id);
+		if (!started) {
+			sendJson(res, 409, { error: "安装已在进行中" });
+			return;
+		}
+		void (async () => {
+			while (managedFileTools.getManagedToolProgress(id).running) {
+				await new Promise((resolvePromise) => setTimeout(resolvePromise, 750));
+			}
+			if (!managedFileTools.getManagedToolProgress(id).error) {
+				const packName = MANAGED_TOOL_PACKS[id];
+				if (packName) activatePackForAllSessions(packName);
+				if (id === "ocr" && managedFileTools.getManagedToolStatus("sevenzip").installed) {
+					activatePackForAllSessions("archive-files");
+				}
+			}
+		})();
+		sendJson(res, 202, { ok: true });
+		return;
+	}
+	const managedProgressMatch = pathname.match(/^\/api\/tools\/(pdfjs|sevenzip|ocr|libreoffice)\/progress$/);
+	if (managedProgressMatch && req.method === "GET") {
+		sendJson(
+			res,
+			200,
+			managedFileTools.getManagedToolProgress(managedProgressMatch[1] as managedFileTools.ManagedToolId),
+		);
+		return;
+	}
+	const toolUninstallMatch = pathname.match(/^\/api\/tools\/(officecli|redteam|pdfjs|sevenzip|ocr|libreoffice)$/);
 	if (toolUninstallMatch && req.method === "DELETE") {
 		const runningSessionIds = [...sessions.values()].filter((cs) => cs.session.isStreaming).map((cs) => cs.sessionId);
 		if (runningSessionIds.length > 0) {
@@ -1219,8 +1382,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 200, { ok: true, ...result, removedSkills, reloadedSessions });
 			return;
 		}
-		const removed = redteam.uninstall();
-		deactivatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
+		if (toolUninstallMatch[1] === "redteam") {
+			const removed = redteam.uninstall();
+			deactivatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
+			sendJson(res, 200, { ok: true, removed });
+			return;
+		}
+		const id = toolUninstallMatch[1] as managedFileTools.ManagedToolId;
+		const removed = managedFileTools.uninstallManagedTool(id);
+		const packName = MANAGED_TOOL_PACKS[id];
+		if (packName) deactivatePackForAllSessions(packName);
 		sendJson(res, 200, { ok: true, removed });
 		return;
 	}
@@ -1356,6 +1527,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		return;
 	}
+	if (pathname === "/api/fs/search" && req.method === "GET") {
+		const path = url.searchParams.get("path") ?? "";
+		const query = url.searchParams.get("q") ?? "";
+		const mode = url.searchParams.get("mode") === "content" ? "content" : "name";
+		try {
+			sendJson(res, 200, fsExplorer.searchFiles(path, query, mode));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
 	if (pathname === "/api/fs/copy" && req.method === "POST") {
 		const body = (await readBodyJson(req)) as { source?: unknown; destination?: unknown };
 		if (typeof body?.source !== "string" || typeof body?.destination !== "string") {
@@ -1394,6 +1576,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const path = url.searchParams.get("path") ?? "";
 		try {
 			sendJson(res, 200, fsExplorer.readFileAsBase64(path));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/text" && req.method === "GET") {
+		try {
+			sendJson(res, 200, fsExplorer.readTextFile(url.searchParams.get("path") ?? ""));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/fs/raw" && req.method === "GET") {
+		try {
+			sendFileInline(res, fsExplorer.getAllowedFileInfo(url.searchParams.get("path") ?? ""));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
