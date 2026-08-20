@@ -1869,7 +1869,7 @@ body {
 
 /* 文件预览弹层 */
 .preview-body {
-	width: min(720px, calc(100vw - 40px));
+	width: min(980px, calc(100vw - 40px));
 }
 
 .preview-content {
@@ -1879,8 +1879,21 @@ body {
 }
 
 .preview-image {
+	display: block;
 	max-width: 100%;
+	max-height: 68vh;
+	margin: 0 auto;
 	border-radius: 8px;
+}
+
+.preview-document {
+	display: block;
+	width: 100%;
+	height: min(68vh, 780px);
+	min-height: 440px;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	background: #fff;
 }
 
 .preview-text {
@@ -2231,6 +2244,13 @@ body {
 	border-radius: 12px;
 	background: color-mix(in srgb, var(--panel) 90%, transparent);
 	box-shadow: 0 5px 18px rgba(0, 0, 0, 0.08);
+	cursor: pointer;
+	transition: border-color 0.15s, background 0.15s;
+}
+
+.artifact-card:hover {
+	border-color: color-mix(in srgb, var(--accent) 48%, var(--border-strong));
+	background: color-mix(in srgb, var(--accent) 7%, var(--panel));
 }
 
 .artifact-card::after {

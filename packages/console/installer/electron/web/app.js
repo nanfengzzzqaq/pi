@@ -106,6 +106,7 @@ let reconnectTimer = null;
 let currentAssistant = null;
 let pendingAttachments = [];
 let previewFile = null; // 预览中的文件 {name, mimeType, dataBase64, size}
+let previewObjectUrl = null;
 let catalogCache = null;
 let catalogMode = "tools";
 let catalogFilter = "全部";
@@ -890,6 +891,8 @@ function renderArtifactCards(container, files) {
 		card.className = "artifact-card";
 		card.draggable = true;
 		card.dataset.artifactPath = file.path;
+		card.dataset.artifactName = file.name;
+		card.title = file.officePreview ? "点击打开实时预览" : "点击预览文件";
 		const icon = document.createElement("span");
 		icon.className = "artifact-icon";
 		icon.textContent = presentation.icon;
@@ -905,15 +908,14 @@ function renderArtifactCards(container, files) {
 		info.append(name, meta);
 		const actions = document.createElement("div");
 		actions.className = "artifact-actions";
-		if (file.officePreview) {
-			const preview = document.createElement("button");
-			preview.type = "button";
-			preview.className = "artifact-action secondary";
-			preview.textContent = "实时预览";
-			preview.title = "实时预览（office_preview_watch）";
-			preview.dataset.previewPath = file.path;
-			actions.appendChild(preview);
-		}
+		const preview = document.createElement("button");
+		preview.type = "button";
+		preview.className = "artifact-action secondary";
+		preview.textContent = file.officePreview ? "实时预览" : "预览";
+		preview.title = file.officePreview ? "实时预览（office_preview_watch）" : "预览文件（file_preview）";
+		preview.dataset.previewPath = file.path;
+		preview.dataset.previewName = file.name;
+		actions.appendChild(preview);
 		const download = document.createElement("button");
 		download.type = "button";
 		download.className = "artifact-action primary";
@@ -1620,7 +1622,7 @@ messagesEl.addEventListener("click", (e) => {
 	const previewLink = e.target.closest("[data-preview-path]");
 	if (previewLink) {
 		e.preventDefault();
-		void openOfficePreview(previewLink.dataset.previewPath, "artifact");
+		void openFilePreview(previewLink.dataset.previewPath, previewLink.dataset.previewName, "artifact");
 		return;
 	}
 	const downloadLink = e.target.closest("[data-download-path]");
@@ -1639,6 +1641,12 @@ messagesEl.addEventListener("click", (e) => {
 		else void downloadPathLink(fileLink.dataset.path);
 		return;
 	}
+	const artifactCard = e.target.closest("[data-artifact-path]");
+	if (artifactCard) {
+		e.preventDefault();
+		void openFilePreview(artifactCard.dataset.artifactPath, artifactCard.dataset.artifactName, "artifact");
+		return;
+	}
 	const btn = e.target.closest("[data-copy]");
 	if (btn) copyTextFrom(btn);
 });
@@ -1652,7 +1660,7 @@ messagesEl.addEventListener("dragstart", (event) => {
 // 附件（＋按钮 / 拖拽 / 粘贴）
 // ---------------------------------------------------------------------------
 
-const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]);
 
 function formatSize(bytes) {
 	if (bytes < 1024) return `${bytes} B`;
@@ -2694,15 +2702,34 @@ fsTreeEl.addEventListener("drop", (event) => {
 	if (event.dataTransfer) void copyDroppedFilesToCurrentDirectory(event.dataTransfer);
 });
 
-async function previewFsFile(row) {
+function releasePreviewObjectUrl() {
+	if (!previewObjectUrl) return;
+	URL.revokeObjectURL(previewObjectUrl);
+	previewObjectUrl = null;
+}
+
+function base64ObjectUrl(base64, mimeType) {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+	return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+function closeFilePreview() {
+	previewModalEl.hidden = true;
+	previewFile = null;
+	releasePreviewObjectUrl();
+}
+
+async function openFilePreview(path, name, source = "file") {
 	try {
-		if (isOfficeFilePath(row.dataset.path)) {
-			await openOfficePreview(row.dataset.path, "file");
+		if (isOfficeFilePath(path)) {
+			await openOfficePreview(path, source);
 			return;
 		}
-		const file = await api(`/api/fs/read?path=${encodeURIComponent(row.dataset.path)}`);
+		const file = await api(`/api/fs/read?path=${encodeURIComponent(path)}`);
 		previewFile = {
-			name: row.dataset.name,
+			name: name || path.split(/[\\/]/).pop() || "文件预览",
 			mimeType: file.mimeType,
 			dataBase64: file.dataBase64,
 			size: file.size,
@@ -2710,6 +2737,7 @@ async function previewFsFile(row) {
 		};
 		previewTitleEl.textContent = previewFile.name;
 		previewContentEl.innerHTML = "";
+		releasePreviewObjectUrl();
 		if (previewFile.isImage) {
 			const img = document.createElement("img");
 			img.src = `data:${previewFile.mimeType};base64,${previewFile.dataBase64}`;
@@ -2720,19 +2748,27 @@ async function previewFsFile(row) {
 			pre.className = "preview-text";
 			pre.textContent = decodeBase64(previewFile.dataBase64);
 			previewContentEl.appendChild(pre);
-		} else if (file.mimeType.includes("officedocument") || file.mimeType === "application/pdf") {
-			previewContentEl.innerHTML =
-				'<div class="context-empty">该文件类型暂不支持内联预览。<br>可“添加到对话”后交给 Office 文件处理工具。</div>';
+		} else if (file.mimeType === "application/pdf") {
+			previewObjectUrl = base64ObjectUrl(previewFile.dataBase64, previewFile.mimeType);
+			const frame = document.createElement("iframe");
+			frame.className = "preview-document";
+			frame.src = previewObjectUrl;
+			frame.title = `${previewFile.name} PDF 预览`;
+			previewContentEl.appendChild(frame);
 		} else {
-			const pre = document.createElement("pre");
-			pre.className = "preview-text";
-			pre.textContent = decodeBase64(previewFile.dataBase64);
-			previewContentEl.appendChild(pre);
+			const empty = document.createElement("div");
+			empty.className = "context-empty";
+			empty.textContent = "该文件类型暂不支持内嵌渲染，可以下载文件或添加到对话交给智能体处理。";
+			previewContentEl.appendChild(empty);
 		}
 		previewModalEl.hidden = false;
 	} catch (error) {
 		showError(`读取文件失败：${error.message}`);
 	}
+}
+
+function previewFsFile(row) {
+	return openFilePreview(row.dataset.path, row.dataset.name, "file");
 }
 
 function decodeBase64(base64) {
@@ -2746,22 +2782,15 @@ function decodeBase64(base64) {
 	}
 }
 
-previewCloseEl.addEventListener("click", () => {
-	previewModalEl.hidden = true;
-	previewFile = null;
-});
+previewCloseEl.addEventListener("click", closeFilePreview);
 previewModalEl.addEventListener("click", (e) => {
-	if (e.target === previewModalEl) {
-		previewModalEl.hidden = true;
-		previewFile = null;
-	}
+	if (e.target === previewModalEl) closeFilePreview();
 });
 previewAttachBtnEl.addEventListener("click", () => {
 	if (!previewFile) return;
 	pendingAttachments.push({ ...previewFile });
 	renderAttachments();
-	previewModalEl.hidden = true;
-	previewFile = null;
+	closeFilePreview();
 	showInfo("已添加到对话附件");
 });
 
