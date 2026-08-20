@@ -657,7 +657,8 @@ body {
 }
 
 .office-preview-pane,
-.agent-browser-pane {
+.agent-browser-pane,
+.code-editor-pane {
 	width: min(56%, 820px);
 	min-width: 360px;
 	min-height: 0;
@@ -670,6 +671,7 @@ body {
 
 .office-preview-pane[hidden],
 .agent-browser-pane[hidden],
+.code-editor-pane[hidden],
 .office-preview-resizer[hidden] {
 	display: none;
 }
@@ -762,6 +764,117 @@ body {
 	flex-direction: column;
 	background: var(--panel);
 	border-left: 1px solid var(--border);
+}
+
+.code-editor-pane {
+	min-height: 0;
+	flex: 0 0 auto;
+	display: flex;
+	flex-direction: column;
+	background: var(--panel);
+	border-left: 1px solid var(--border);
+}
+
+.code-editor-header {
+	min-height: 58px;
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 8px 12px 8px 16px;
+	border-bottom: 1px solid var(--border);
+}
+
+.code-editor-heading {
+	min-width: 0;
+	flex: 1;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.code-editor-path {
+	padding: 7px 14px;
+	border-bottom: 1px solid var(--border);
+	color: var(--muted);
+	font: 11px var(--mono);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.code-editor-stage {
+	position: relative;
+	min-height: 0;
+	flex: 1;
+	overflow: hidden;
+}
+
+.code-editor-placeholder {
+	display: grid;
+	place-items: center;
+	height: 100%;
+	padding: 24px;
+	color: var(--muted);
+	text-align: center;
+}
+
+.repository-review {
+	display: grid;
+	gap: 10px;
+}
+
+.repository-review-summary {
+	color: var(--muted);
+	font-size: 12px;
+	line-height: 1.6;
+}
+
+.repository-review-diff {
+	max-height: 58vh;
+	margin: 0;
+	padding: 12px;
+	overflow: auto;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	background: var(--code-bg);
+	color: var(--code-text);
+	font: 12px/1.55 var(--mono);
+	white-space: pre;
+}
+
+.development-components {
+	display: grid;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+.development-component {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 8px 12px;
+	padding: 10px;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+}
+
+.development-component-name {
+	font-size: 13px;
+	font-weight: 600;
+}
+
+.development-component-desc,
+.development-progress-log {
+	margin-top: 3px;
+	color: var(--muted);
+	font-size: 11px;
+	line-height: 1.5;
+}
+
+.development-progress-log {
+	grid-column: 1 / -1;
+	max-height: 120px;
+	overflow: auto;
+	white-space: pre-wrap;
 }
 
 .agent-browser-header {

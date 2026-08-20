@@ -205,6 +205,26 @@
 						<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>
 					</div>
 				</section>
+
+				<div id="code-editor-resizer" class="office-preview-resizer" title="拖动调整代码编辑器宽度" hidden></div>
+				<section id="code-editor-pane" class="code-editor-pane" hidden>
+					<header class="code-editor-header">
+						<div class="code-editor-heading">
+							<span class="office-preview-kicker">代码编辑器（code_editor）</span>
+							<strong id="code-editor-title" class="office-preview-title">代码文件</strong>
+							<span id="code-editor-status" class="office-preview-status">未修改</span>
+						</div>
+						<div class="office-preview-actions">
+							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异（git_diff）">查看差异</button>
+							<button id="code-editor-save" class="primary-btn small" type="button" title="保存当前文件（code_save）" disabled>保存</button>
+							<button id="code-editor-close" class="icon-btn small" type="button" title="关闭代码编辑器">×</button>
+						</div>
+					</header>
+					<div id="code-editor-path" class="code-editor-path"></div>
+					<div id="code-editor-stage" class="code-editor-stage">
+						<div class="code-editor-placeholder">安装“代码开发”插件后，可在这里直接编辑工作区代码。</div>
+					</div>
+				</section>
 			</div>
 		</main>
 

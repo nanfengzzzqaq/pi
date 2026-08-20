@@ -38,6 +38,17 @@ describe("按本轮选择能力", () => {
 		expect(interact?.toolNames).toContain("browser_click");
 	});
 
+	it("代码任务只加载相应的代码开发分组", () => {
+		expect(selectCapabilities("你好", ["code-development"])).toEqual([]);
+		const [inspect] = selectCapabilities("检查这个 TypeScript 项目的代码差异", ["code-development"]);
+		expect(inspect?.groupNames).toContain("inspect");
+		expect(inspect?.toolNames).toContain("git_diff");
+
+		const [github] = selectCapabilities("把当前分支推送到 GitHub 并创建 PR", ["code-development"]);
+		expect(github?.groupNames).toEqual(expect.arrayContaining(["change", "github"]));
+		expect(github?.toolNames).toContain("github_pull_request");
+	});
+
 	it("面向用户显示中文名称和内部代码名", () => {
 		expect(toolDisplayName("office_view")).toBe("查看文档（office_view）");
 		expect(toolDisplayName("read")).toBe("读取文件（read）");

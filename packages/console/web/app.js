@@ -118,6 +118,15 @@ const agentBrowserRefreshEl = $("agent-browser-refresh");
 const agentBrowserGoEl = $("agent-browser-go");
 const agentBrowserExternalEl = $("agent-browser-external");
 const agentBrowserCloseEl = $("agent-browser-close");
+const codeEditorPaneEl = $("code-editor-pane");
+const codeEditorResizerEl = $("code-editor-resizer");
+const codeEditorTitleEl = $("code-editor-title");
+const codeEditorStatusEl = $("code-editor-status");
+const codeEditorPathEl = $("code-editor-path");
+const codeEditorStageEl = $("code-editor-stage");
+const codeEditorDiffEl = $("code-editor-diff");
+const codeEditorSaveEl = $("code-editor-save");
+const codeEditorCloseEl = $("code-editor-close");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
@@ -133,17 +142,42 @@ let catalogMode = "tools";
 let catalogFilter = "全部";
 let officeInstallTimer = null;
 let redTeamInstallTimer = null;
+let codeDevelopmentInstallTimer = null;
+let githubLoginTimer = null;
 const managedInstallTimers = new Map();
+const developmentComponentTimers = new Map();
 let codexOAuthTimer = null;
 let officePreview = null;
 let officePreviewRequest = 0;
 const officeToolCalls = new Map();
 let agentBrowserState = null;
+let monacoLoading = null;
+let codeEditor = null;
+let codeEditorFile = null;
+let codeEditorDirty = false;
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
 const AGENT_BROWSER_WIDTH_KEY = "pi-console-agent-browser-width";
+const CODE_EDITOR_WIDTH_KEY = "pi-console-code-editor-width";
 const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
 const TEXT_FILE_RE = /\.(?:bat|c|cc|cfg|cmd|conf|cpp|cs|css|csv|env|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|json5|jsonl|jsx|kt|kts|less|log|lua|md|mdx|mjs|php|properties|ps1|psm1|py|pyw|rb|rs|rst|scss|sh|sql|svelte|swift|tex|toml|ts|tsv|tsx|txt|vue|xml|yaml|yml|zsh)$/i;
+const TEXT_FILE_NAMES = new Set([
+	"agents.md",
+	"changelog",
+	"dockerfile",
+	"license",
+	"makefile",
+	"readme",
+	".dockerignore",
+	".editorconfig",
+	".gitattributes",
+	".gitignore",
+]);
+
+function isTextPreviewPath(path) {
+	const name = path.split(/[\\/]/).pop()?.toLocaleLowerCase("en-US") || "";
+	return TEXT_FILE_RE.test(name) || TEXT_FILE_NAMES.has(name);
+}
 const DELIVERABLE_FILE_RE = /\.[A-Za-z0-9]{1,16}$/i;
 
 // ---------------------------------------------------------------------------
@@ -226,6 +260,7 @@ async function closeOfficePreview() {
 async function openOfficePreview(path, source = "manual") {
 	if (!isOfficeFilePath(path)) return false;
 	if (!agentBrowserPaneEl.hidden) await hideAgentBrowser();
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return false;
 	const cleanPath = cleanOfficeFilePath(path);
 	const request = ++officePreviewRequest;
 	const shownName = cleanPath.split(/[\\/]/).pop() || cleanPath;
@@ -393,6 +428,7 @@ async function openAgentBrowser(url) {
 		return;
 	}
 	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	applyAgentBrowserWidth(localStorage.getItem(AGENT_BROWSER_WIDTH_KEY));
 	try {
 		renderAgentBrowserState(await window.piDesktop.openBrowser(url));
@@ -459,7 +495,205 @@ agentBrowserResizerEl.addEventListener("pointerdown", (event) => {
 	};
 	agentBrowserResizerEl.addEventListener("pointermove", resize);
 	agentBrowserResizerEl.addEventListener("pointerup", finish, { once: true });
-	agentBrowserResizerEl.addEventListener("pointercancel", finish, { once: true });
+agentBrowserResizerEl.addEventListener("pointercancel", finish, { once: true });
+});
+
+// ---------------------------------------------------------------------------
+// Monaco 代码编辑器（code_editor）
+// ---------------------------------------------------------------------------
+
+function applyCodeEditorWidth(width) {
+	const bounds = conversationWorkbenchEl.getBoundingClientRect();
+	const max = Math.max(420, bounds.width - 340);
+	const next = Math.max(420, Math.min(Number(width) || Math.round(bounds.width * 0.62), max));
+	codeEditorPaneEl.style.width = `${next}px`;
+}
+
+function codeLanguage(path) {
+	const extension = path.split(".").pop()?.toLocaleLowerCase("en-US") || "";
+	return (
+		{
+			bat: "bat",
+			c: "c",
+			cc: "cpp",
+			cpp: "cpp",
+			cs: "csharp",
+			css: "css",
+			go: "go",
+			h: "cpp",
+			hpp: "cpp",
+			html: "html",
+			java: "java",
+			js: "javascript",
+			json: "json",
+			jsx: "javascript",
+			kt: "kotlin",
+			md: "markdown",
+			mdx: "markdown",
+			mjs: "javascript",
+			php: "php",
+			ps1: "powershell",
+			py: "python",
+			rs: "rust",
+			scss: "scss",
+			sh: "shell",
+			sql: "sql",
+			toml: "ini",
+			ts: "typescript",
+			tsx: "typescript",
+			vue: "html",
+			xml: "xml",
+			yaml: "yaml",
+			yml: "yaml",
+		}[extension] || "plaintext"
+	);
+}
+
+function ensureMonaco() {
+	if (window.monaco) return Promise.resolve(window.monaco);
+	if (monacoLoading) return monacoLoading;
+	monacoLoading = new Promise((resolve, reject) => {
+		const loader = document.createElement("script");
+		loader.src = "/code-development/monaco/vs/loader.js";
+		loader.onload = () => {
+			window.require.config({ paths: { vs: "/code-development/monaco/vs" } });
+			window.require(["vs/editor/editor.main"], () => resolve(window.monaco), reject);
+		};
+		loader.onerror = () => reject(new Error("Monaco 编辑器资源加载失败"));
+		document.head.appendChild(loader);
+	});
+	return monacoLoading;
+}
+
+function setCodeEditorDirty(dirty) {
+	codeEditorDirty = dirty;
+	codeEditorSaveEl.disabled = !dirty;
+	codeEditorStatusEl.textContent = dirty ? "有未保存修改" : "已保存";
+}
+
+async function openCodeEditor(path, name) {
+	if (!catalogCache) catalogCache = await api("/api/catalog");
+	const installed = catalogCache.tools?.some((tool) => tool.id === "code-development" && tool.installed);
+	if (!installed) return false;
+	if (codeEditorDirty && codeEditorFile?.path !== path && !window.confirm("当前代码文件还有未保存修改，仍要打开其他文件吗？")) {
+		return true;
+	}
+	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
+	if (!agentBrowserPaneEl.hidden) await hideAgentBrowser();
+	applyCodeEditorWidth(localStorage.getItem(CODE_EDITOR_WIDTH_KEY));
+	codeEditorPaneEl.hidden = false;
+	codeEditorResizerEl.hidden = false;
+	codeEditorTitleEl.textContent = name || path.split(/[\\/]/).pop() || "代码文件";
+	codeEditorPathEl.textContent = path;
+	codeEditorPathEl.title = path;
+	codeEditorStatusEl.textContent = "正在读取…";
+	try {
+		const [monaco, file] = await Promise.all([ensureMonaco(), api(`/api/fs/text?path=${encodeURIComponent(path)}`)]);
+		codeEditor?.getModel()?.dispose();
+		codeEditor?.dispose();
+		codeEditorStageEl.innerHTML = "";
+		const model = monaco.editor.createModel(file.text, codeLanguage(path), monaco.Uri.file(path));
+		codeEditor = monaco.editor.create(codeEditorStageEl, {
+			model,
+			theme: document.documentElement.dataset.theme === "light" ? "vs" : "vs-dark",
+			automaticLayout: true,
+			fontSize: 13,
+			minimap: { enabled: true },
+			scrollBeyondLastLine: false,
+			wordWrap: "off",
+		});
+		codeEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveCodeEditor());
+		codeEditorFile = { path, name: name || path.split(/[\\/]/).pop(), sha256: file.sha256, encoding: file.encoding };
+		setCodeEditorDirty(false);
+		model.onDidChangeContent(() => setCodeEditorDirty(true));
+		codeEditor.focus();
+		return true;
+	} catch (error) {
+		codeEditorStatusEl.textContent = "打开失败";
+		showError(`代码编辑器打开失败：${error.message}`);
+		return false;
+	}
+}
+
+async function saveCodeEditor() {
+	if (!codeEditor || !codeEditorFile || !codeEditorDirty) return;
+	codeEditorSaveEl.disabled = true;
+	codeEditorStatusEl.textContent = "正在保存（code_save）";
+	try {
+		const saved = await api("/api/fs/text", {
+			method: "PUT",
+			body: JSON.stringify({
+				path: codeEditorFile.path,
+				text: codeEditor.getValue(),
+				expectedSha256: codeEditorFile.sha256,
+			}),
+		});
+		codeEditorFile.sha256 = saved.sha256;
+		setCodeEditorDirty(false);
+		if (currentFsPath) void loadFsDir(currentFsPath);
+		showInfo(`已保存 ${codeEditorFile.name}（code_save）`);
+	} catch (error) {
+		codeEditorSaveEl.disabled = false;
+		codeEditorStatusEl.textContent = "保存失败";
+		showError(`保存代码失败：${error.message}`);
+	}
+}
+
+function closeCodeEditor() {
+	if (codeEditorDirty && !window.confirm("当前代码文件还有未保存修改，确定关闭吗？")) return false;
+	codeEditor?.getModel()?.dispose();
+	codeEditor?.dispose();
+	codeEditor = null;
+	codeEditorFile = null;
+	codeEditorDirty = false;
+	codeEditorPaneEl.hidden = true;
+	codeEditorResizerEl.hidden = true;
+	codeEditorStageEl.innerHTML = '<div class="code-editor-placeholder">选择代码文件开始编辑</div>';
+	return true;
+}
+
+async function showRepositoryDiff() {
+	try {
+		const summary = await api("/api/tools/code-development/repository");
+		drawerTitleEl.textContent = "代码差异（git_diff）";
+		drawerContentEl.innerHTML = "";
+		const review = document.createElement("div");
+		review.className = "repository-review";
+		const meta = document.createElement("div");
+		meta.className = "repository-review-summary";
+		meta.textContent = summary.isRepository
+			? `分支：${summary.branch || "（未命名）"} · ${summary.files.length} 个文件有改动`
+			: "当前工作区不是 Git 仓库";
+		const diff = document.createElement("pre");
+		diff.className = "repository-review-diff";
+		diff.textContent = [summary.stagedDiff && "# 已暂存\n" + summary.stagedDiff, summary.diff && "# 未暂存\n" + summary.diff]
+			.filter(Boolean)
+			.join("\n\n") || "没有代码差异";
+		review.append(meta, diff);
+		drawerContentEl.appendChild(review);
+		drawerEl.hidden = false;
+	} catch (error) {
+		showError(`读取代码差异失败：${error.message}`);
+	}
+}
+
+codeEditorSaveEl.addEventListener("click", () => void saveCodeEditor());
+codeEditorCloseEl.addEventListener("click", closeCodeEditor);
+codeEditorDiffEl.addEventListener("click", () => void showRepositoryDiff());
+codeEditorResizerEl.addEventListener("pointerdown", (event) => {
+	event.preventDefault();
+	codeEditorResizerEl.setPointerCapture(event.pointerId);
+	const resize = (moveEvent) => {
+		const bounds = conversationWorkbenchEl.getBoundingClientRect();
+		applyCodeEditorWidth(bounds.right - moveEvent.clientX);
+	};
+	const finish = () => {
+		codeEditorResizerEl.removeEventListener("pointermove", resize);
+		localStorage.setItem(CODE_EDITOR_WIDTH_KEY, String(Math.round(codeEditorPaneEl.getBoundingClientRect().width)));
+	};
+	codeEditorResizerEl.addEventListener("pointermove", resize);
+	codeEditorResizerEl.addEventListener("pointerup", finish, { once: true });
+	codeEditorResizerEl.addEventListener("pointercancel", finish, { once: true });
 });
 
 if (window.ResizeObserver) new ResizeObserver(syncAgentBrowserBounds).observe(agentBrowserStageEl);
@@ -2164,6 +2398,18 @@ async function refreshCatalog() {
 	if (catalogCache.redteamDownload?.running && !redTeamInstallTimer) {
 		redTeamInstallTimer = setInterval(() => void pollRedTeamInstall(), 1500);
 	}
+	if (catalogCache.codeDevelopmentDownload?.running && !codeDevelopmentInstallTimer) {
+		codeDevelopmentInstallTimer = setInterval(() => void pollCodeDevelopmentInstall(), 900);
+	}
+	const developmentTool = catalogCache.tools?.find((tool) => tool.id === "code-development");
+	if (developmentTool?.githubProgress?.running && !githubLoginTimer) {
+		githubLoginTimer = setInterval(() => void pollGithubLogin(), 1000);
+	}
+	for (const component of developmentTool?.components || []) {
+		if (component.progress?.running && !developmentComponentTimers.has(component.id)) {
+			developmentComponentTimers.set(component.id, setInterval(() => void pollDevelopmentComponent(component.id), 1200));
+		}
+	}
 	for (const [id, progress] of Object.entries(catalogCache.toolProgress || {})) {
 		if (progress?.running && !managedInstallTimers.has(id)) {
 			managedInstallTimers.set(id, setInterval(() => void pollManagedToolInstall(id), 900));
@@ -2300,6 +2546,7 @@ function createCard(item, options) {
 }
 
 function installDispatcher(tool) {
+	if (tool.id === "code-development") return installCodeDevelopment;
 	if (tool.id === "officecli") return installOfficeCli;
 	if (tool.id === "redteam") return installRedTeam;
 	return (button) => installManagedTool(tool, button);
@@ -2313,6 +2560,7 @@ async function uninstallTool(tool, button) {
 				? "已生成的红队配置和工作区报告不会删除。"
 				: "只删除 Pi 私有目录中的工具文件，不影响电脑上已安装的软件或工作区文件。";
 	if (!window.confirm(`卸载 ${tool.displayName}？\n\n${extra}`)) return;
+	if (tool.id === "code-development" && !codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	button.disabled = true;
 	button.textContent = "卸载中…";
 	try {
@@ -2336,7 +2584,9 @@ function installDuration(elapsedMs) {
 
 function installUi(tool) {
 	const progress =
-		tool.id === "officecli"
+		tool.id === "code-development"
+			? catalogCache?.codeDevelopmentDownload
+			: tool.id === "officecli"
 			? catalogCache?.download
 			: tool.id === "redteam"
 				? catalogCache?.redteamDownload
@@ -2366,6 +2616,7 @@ function renderTools(query) {
 		if (catalogFilter === "文档办公" && tool.category !== "文档办公") return false;
 		if (catalogFilter === "文件处理" && tool.category !== "文件处理") return false;
 		if (catalogFilter === "安全测试" && tool.category !== "安全测试") return false;
+		if (catalogFilter === "代码开发" && tool.category !== "代码开发") return false;
 		if (catalogFilter === "效率工具" && tool.category !== "效率工具") return false;
 		return catalogMatches(tool, query);
 	});
@@ -2393,7 +2644,8 @@ function renderSkills(query) {
 	for (const group of catalogCache?.skillGroups || []) {
 		const skills = group.skills.filter((skill) => {
 			if (catalogFilter === "已安装" && !skill.installed) return false;
-			if (["Word", "PowerPoint", "Excel"].includes(catalogFilter) && skill.category !== catalogFilter) return false;
+			if (["Word", "PowerPoint", "Excel", "代码开发"].includes(catalogFilter) && skill.category !== catalogFilter)
+				return false;
 			return catalogMatches(skill, query);
 		});
 		if (skills.length === 0) continue;
@@ -2401,9 +2653,9 @@ function renderSkills(query) {
 		section.className = "catalog-group";
 		const header = document.createElement("div");
 		header.className = "catalog-group-header";
-		const image = document.createElement("img");
-		image.src = group.icon;
-		image.alt = "";
+		const image = group.icon
+			? Object.assign(document.createElement("img"), { src: group.icon, alt: "" })
+			: createCatalogIcon("tool", "", group.iconText || "技");
 		const heading = document.createElement("div");
 		const installedCount = group.skills.filter((skill) => skill.installed).length;
 		heading.innerHTML = `<div class="catalog-group-title">${group.toolDisplayName}（${group.toolInternalName}）</div><div class="catalog-group-meta">${installedCount}/${group.skills.length} 个技能已安装</div>`;
@@ -2448,13 +2700,55 @@ function renderCatalog() {
 	catalogSkillsTabEl.classList.toggle("active", !toolsMode);
 	renderCatalogFilters(
 		toolsMode
-			? ["全部", "已安装", "效率工具", "文件处理", "文档办公", "安全测试"]
-			: ["全部", "已安装", "Word", "PowerPoint", "Excel"],
+			? ["全部", "已安装", "代码开发", "效率工具", "文件处理", "文档办公", "安全测试"]
+			: ["全部", "已安装", "代码开发", "Word", "PowerPoint", "Excel"],
 	);
 	catalogContentEl.innerHTML = "";
 	const query = catalogSearchInputEl.value.trim().toLocaleLowerCase("zh-CN");
 	if (toolsMode) renderTools(query);
 	else renderSkills(query);
+}
+
+async function installCodeDevelopment(button) {
+	button.disabled = true;
+	button.textContent = "准备安装…";
+	try {
+		await api("/api/tools/code-development/install", { method: "POST", body: "{}" });
+		showInfo("代码开发插件正在下载 mise、GitHub CLI 和 Monaco 官方组件");
+		clearInterval(codeDevelopmentInstallTimer);
+		codeDevelopmentInstallTimer = setInterval(() => void pollCodeDevelopmentInstall(), 900);
+		await pollCodeDevelopmentInstall();
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`代码开发插件安装失败：${error.message}`);
+	}
+}
+
+async function pollCodeDevelopmentInstall() {
+	try {
+		const progress = await api("/api/tools/code-development/progress");
+		if (catalogCache) catalogCache.codeDevelopmentDownload = progress;
+		if (progress.running) {
+			renderCatalog();
+			return;
+		}
+		clearInterval(codeDevelopmentInstallTimer);
+		codeDevelopmentInstallTimer = null;
+		if (progress.error) {
+			showError(`代码开发插件安装失败：${progress.error}`);
+			await refreshCatalog();
+			return;
+		}
+		closeDrawer();
+		await refreshCatalog();
+		await loadSessions();
+		showInfo("代码开发插件已安装，可以登录 GitHub 或安装项目环境");
+	} catch (error) {
+		clearInterval(codeDevelopmentInstallTimer);
+		codeDevelopmentInstallTimer = null;
+		showError(`读取代码开发插件安装进度失败：${error.message}`);
+	}
 }
 
 async function installOfficeCli(button) {
@@ -2633,6 +2927,204 @@ function appendDrawerDetails(rows) {
 	drawerContentEl.appendChild(list);
 }
 
+function currentDevelopmentTool() {
+	return catalogCache?.tools?.find((item) => item.id === "code-development");
+}
+
+async function refreshDevelopmentDetail() {
+	await refreshCatalog();
+	const tool = currentDevelopmentTool();
+	if (tool && !drawerEl.hidden) openToolDetail(tool);
+}
+
+async function startGithubLogin(button) {
+	button.disabled = true;
+	button.textContent = "等待浏览器确认…";
+	try {
+		await api("/api/tools/code-development/github/login", { method: "POST", body: "{}" });
+		clearInterval(githubLoginTimer);
+		githubLoginTimer = setInterval(() => void pollGithubLogin(), 1000);
+		await pollGithubLogin();
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "登录 GitHub";
+		showError(`GitHub 登录失败：${error.message}`);
+	}
+}
+
+async function pollGithubLogin() {
+	try {
+		const progress = await api("/api/tools/code-development/github/progress");
+		const tool = currentDevelopmentTool();
+		if (tool) tool.githubProgress = progress;
+		if (progress.running) {
+			if (tool && !drawerEl.hidden && drawerTitleEl.textContent.includes("代码开发")) openToolDetail(tool);
+			return;
+		}
+		clearInterval(githubLoginTimer);
+		githubLoginTimer = null;
+		if (progress.error) showError(`GitHub 登录失败：${progress.error}`);
+		else showInfo("GitHub 登录完成，代码仓库推送已可用");
+		await refreshDevelopmentDetail();
+	} catch (error) {
+		clearInterval(githubLoginTimer);
+		githubLoginTimer = null;
+		showError(`读取 GitHub 登录状态失败：${error.message}`);
+	}
+}
+
+async function logoutGithub(button) {
+	button.disabled = true;
+	try {
+		await api("/api/tools/code-development/github", { method: "DELETE" });
+		showInfo("已退出 GitHub");
+		await refreshDevelopmentDetail();
+	} catch (error) {
+		button.disabled = false;
+		showError(`退出 GitHub 失败：${error.message}`);
+	}
+}
+
+async function installDevelopmentComponent(component, button) {
+	button.disabled = true;
+	button.textContent = "准备安装…";
+	try {
+		await api(`/api/tools/code-development/components/${component.id}/install`, { method: "POST", body: "{}" });
+		const oldTimer = developmentComponentTimers.get(component.id);
+		if (oldTimer) clearInterval(oldTimer);
+		developmentComponentTimers.set(component.id, setInterval(() => void pollDevelopmentComponent(component.id), 1200));
+		await pollDevelopmentComponent(component.id);
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`${component.displayName} 安装失败：${error.message}`);
+	}
+}
+
+async function pollDevelopmentComponent(id) {
+	try {
+		const progress = await api(`/api/tools/code-development/components/${id}/progress`);
+		const component = currentDevelopmentTool()?.components?.find((item) => item.id === id);
+		if (component) component.progress = progress;
+		if (progress.running) {
+			const tool = currentDevelopmentTool();
+			if (tool && !drawerEl.hidden && drawerTitleEl.textContent.includes("代码开发")) openToolDetail(tool);
+			return;
+		}
+		const timer = developmentComponentTimers.get(id);
+		if (timer) clearInterval(timer);
+		developmentComponentTimers.delete(id);
+		if (progress.error) showError(`开发环境安装失败：${progress.error}`);
+		else showInfo(`${id} 开发环境安装完成`);
+		await refreshDevelopmentDetail();
+	} catch (error) {
+		const timer = developmentComponentTimers.get(id);
+		if (timer) clearInterval(timer);
+		developmentComponentTimers.delete(id);
+		showError(`读取开发环境安装进度失败：${error.message}`);
+	}
+}
+
+async function uninstallDevelopmentComponent(component, button) {
+	if (!window.confirm(`卸载代码开发插件中的 ${component.displayName} 环境？`)) return;
+	button.disabled = true;
+	try {
+		await api(`/api/tools/code-development/components/${component.id}`, { method: "DELETE" });
+		showInfo(`${component.displayName} 已卸载`);
+		await refreshDevelopmentDetail();
+	} catch (error) {
+		button.disabled = false;
+		showError(`${component.displayName} 卸载失败：${error.message}`);
+	}
+}
+
+function appendCodeDevelopmentDetails(tool) {
+	const githubTitle = document.createElement("div");
+	githubTitle.className = "drawer-block-title";
+	githubTitle.textContent = "GitHub 连接";
+	const githubRow = document.createElement("div");
+	githubRow.className = "development-component";
+	const githubMain = document.createElement("div");
+	const githubName = document.createElement("div");
+	githubName.className = "development-component-name";
+	githubName.textContent = tool.github?.loggedIn
+		? `已登录：${tool.github.name || tool.github.login}（${tool.github.login}）`
+		: "尚未登录 GitHub";
+	const githubDesc = document.createElement("div");
+	githubDesc.className = "development-component-desc";
+	githubDesc.textContent = "浏览器登录后，可克隆、提交、推送、创建仓库和拉取请求。";
+	githubMain.append(githubName, githubDesc);
+	const githubButton = document.createElement("button");
+	githubButton.className = tool.github?.loggedIn ? "secondary-btn small danger" : "primary-btn small";
+	githubButton.textContent = tool.githubProgress?.running
+		? "等待浏览器确认…"
+		: tool.github?.loggedIn
+			? "退出"
+			: "登录 GitHub";
+	githubButton.disabled = tool.githubProgress?.running === true;
+	githubButton.addEventListener("click", () =>
+		tool.github?.loggedIn ? logoutGithub(githubButton) : startGithubLogin(githubButton),
+	);
+	githubRow.append(githubMain, githubButton);
+	if (tool.githubProgress?.log || tool.githubProgress?.error) {
+		const log = document.createElement("div");
+		log.className = "development-progress-log";
+		log.textContent = tool.githubProgress.error || tool.githubProgress.log;
+		githubRow.appendChild(log);
+	}
+	drawerContentEl.append(githubTitle, githubRow);
+
+	const projectTitle = document.createElement("div");
+	projectTitle.className = "drawer-block-title";
+	projectTitle.textContent = "当前工作区";
+	const project = document.createElement("div");
+	project.className = "drawer-desc";
+	project.textContent = tool.project?.reasons?.length
+		? `识别到：${tool.project.reasons.join("；")}`
+		: "暂未识别到明确的语言环境；打开具体项目后会自动检测。";
+	const diffButton = document.createElement("button");
+	diffButton.className = "secondary-btn small";
+	diffButton.textContent = "查看代码差异（git_diff）";
+	diffButton.addEventListener("click", () => void showRepositoryDiff());
+	drawerContentEl.append(projectTitle, project, diffButton);
+
+	const componentsTitle = document.createElement("div");
+	componentsTitle.className = "drawer-block-title";
+	componentsTitle.textContent = "项目运行环境";
+	const components = document.createElement("div");
+	components.className = "development-components";
+	for (const component of tool.components || []) {
+		const row = document.createElement("div");
+		row.className = "development-component";
+		const main = document.createElement("div");
+		const name = document.createElement("div");
+		name.className = "development-component-name";
+		name.textContent = `${component.displayName}（${component.id}）${component.installed ? " · 已安装" : ""}`;
+		const desc = document.createElement("div");
+		desc.className = "development-component-desc";
+		desc.textContent = component.description;
+		main.append(name, desc);
+		const button = document.createElement("button");
+		button.className = component.installed ? "secondary-btn small danger" : "primary-btn small";
+		button.textContent = component.progress?.running ? "安装中…" : component.installed ? "卸载" : "安装";
+		button.disabled = component.progress?.running === true;
+		button.addEventListener("click", () =>
+			component.installed
+				? uninstallDevelopmentComponent(component, button)
+				: installDevelopmentComponent(component, button),
+		);
+		row.append(main, button);
+		if (component.progress?.log || component.progress?.error) {
+			const log = document.createElement("div");
+			log.className = "development-progress-log";
+			log.textContent = component.progress.error || component.progress.log;
+			row.appendChild(log);
+		}
+		components.appendChild(row);
+	}
+	drawerContentEl.append(componentsTitle, components);
+}
+
 function openToolDetail(tool) {
 	drawerTitleEl.textContent = `${tool.displayName}（${tool.internalName}）`;
 	drawerContentEl.innerHTML = "";
@@ -2656,6 +3148,7 @@ function openToolDetail(tool) {
 		...(tool.skillCount > 0 ? [["技能", `${tool.installedSkillCount}/${tool.skillCount} 个已安装`]] : []),
 		["来源", source],
 	]);
+	if (tool.id === "code-development" && tool.installed) appendCodeDevelopmentDetails(tool);
 	const toolsTitle = document.createElement("div");
 	toolsTitle.className = "drawer-block-title";
 	toolsTitle.textContent = `代码能力（${tool.capabilities.length}）`;
@@ -2839,6 +3332,7 @@ fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 		showError("请先在文件面板浏览到一个目录");
 		return;
 	}
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	try {
 		const result = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: currentFsPath }) });
 		await afterWorkspaceChanged(result);
@@ -2849,6 +3343,7 @@ fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 
 /** 设置弹窗：保存工作区 */
 workspaceSaveBtnEl.addEventListener("click", async () => {
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	workspaceSaveBtnEl.disabled = true;
 	try {
 		const result = await api("/api/workspace", {
@@ -2894,6 +3389,7 @@ storageMigrateBtnEl.addEventListener("click", async () => {
 		showError("请先选择新的 Agent 数据目录");
 		return;
 	}
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	if (!window.confirm(`把全部 Agent 数据复制到：\n${path}\n\n迁移完成后客户端会重启，旧目录将保留作备份。`)) return;
 	storageMigrateBtnEl.disabled = true;
 	storageMigrateBtnEl.textContent = "正在迁移…";
@@ -3174,6 +3670,7 @@ async function openFilePreview(path, name, source = "file") {
 			return;
 		}
 		const shownName = name || path.split(/[\\/]/).pop() || "文件预览";
+		if (isTextPreviewPath(path) && (await openCodeEditor(path, shownName))) return;
 		if (/\.pdf$/i.test(path)) {
 			if (!catalogCache) catalogCache = await api("/api/catalog");
 			const token = localStorage.getItem(TOKEN_KEY);
@@ -3190,7 +3687,7 @@ async function openFilePreview(path, name, source = "file") {
 			previewModalEl.hidden = false;
 			return;
 		}
-		if (TEXT_FILE_RE.test(path)) {
+		if (isTextPreviewPath(path)) {
 			const file = await api(`/api/fs/text?path=${encodeURIComponent(path)}`);
 			previewFile = { path, name: shownName, mimeType: file.mimeType, size: file.size, isImage: false };
 			previewTitleEl.textContent = `${shownName} · ${file.encoding}`;
@@ -3278,6 +3775,7 @@ function applyTheme(theme) {
 	document.documentElement.dataset.theme = theme;
 	themeBtnEl.textContent = theme === "dark" ? "🌙" : "☀️";
 	themeBtnEl.title = theme === "dark" ? "切换到亮色主题" : "切换到暗色主题";
+	if (window.monaco) window.monaco.editor.setTheme(theme === "light" ? "vs" : "vs-dark");
 }
 
 themeBtnEl.addEventListener("click", () => {

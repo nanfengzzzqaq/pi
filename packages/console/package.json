@@ -1,6 +1,6 @@
 {
 	"name": "@pi/console",
-	"version": "0.3.23",
+	"version": "0.3.24",
 	"private": true,
 	"type": "module",
 	"description": "Pi Web 控制台：后端骨架 + 最简对话页面（第 1 步）",
