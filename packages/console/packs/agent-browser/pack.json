@@ -1,0 +1,35 @@
+{
+	"name": "agent-browser",
+	"displayName": "客户端浏览器",
+	"description": "在 Pi 客户端内使用独立浏览器访问、读取和操作网页",
+	"version": "1.0.0",
+	"activation": {
+		"extensions": [],
+		"keywords": ["网页", "浏览器", "网站", "网址", "链接", "访问", "打开页面", "http://", "https://", "搜索网络", "上网"],
+		"minimumScore": 2,
+		"defaultGroups": ["navigate"]
+	},
+	"toolGroups": [
+		{
+			"name": "navigate",
+			"displayName": "打开与定位",
+			"description": "打开网页并获取精简页面状态",
+			"tools": ["browser_navigate", "browser_snapshot", "browser_wait"],
+			"keywords": ["网页", "浏览器", "网站", "网址", "链接", "访问", "打开", "http://", "https://", "上网"]
+		},
+		{
+			"name": "inspect",
+			"displayName": "读取与检查",
+			"description": "读取网页正文或检查视觉画面",
+			"tools": ["browser_snapshot", "browser_extract", "browser_screenshot", "browser_wait"],
+			"keywords": ["查看", "读取", "内容", "提取", "检查", "截图", "页面是什么", "总结"]
+		},
+		{
+			"name": "interact",
+			"displayName": "页面交互",
+			"description": "点击、输入、滚动并等待页面响应",
+			"tools": ["browser_snapshot", "browser_click", "browser_type", "browser_scroll", "browser_wait", "browser_extract", "browser_screenshot"],
+			"keywords": ["点击", "输入", "填写", "登录", "提交", "滚动", "操作", "上传", "下载", "搜索"]
+		}
+	]
+}

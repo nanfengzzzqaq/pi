@@ -20,6 +20,7 @@ import {
 	SessionManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { isAgentBrowserRuntimeAvailable } from "./agent-browser-runtime.ts";
 import { extractFileReferences } from "./artifacts.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
@@ -86,6 +87,7 @@ const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
 process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
+const AGENT_BROWSER_PACK_NAME = "agent-browser";
 const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
 	sevenzip: "archive-files",
 	ocr: "image-ocr",
@@ -310,6 +312,9 @@ if (seedBundledSearchRuntime()) {
 
 // 加载能力包（新加的包重启服务后生效）
 await loadPacks();
+// 桌面版主进程注册运行时后才挂载；纯网页模式不向模型暴露不可执行的浏览器工具。
+if (isAgentBrowserRuntimeAvailable()) activatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
+else deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
 for (const [id, packName] of Object.entries(MANAGED_TOOL_PACKS) as Array<[managedFileTools.ManagedToolId, string]>) {
 	if (managedFileTools.getManagedToolStatus(id).installed) activatePackForAllSessions(packName);
 	else deactivatePackForAllSessions(packName);
@@ -757,6 +762,7 @@ async function buildCapabilityCatalog() {
 	const skills = listOfficeCliSkills(CONSOLE_AGENT_DIR);
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
+	const browserPack = listPacks().find((item) => item.name === AGENT_BROWSER_PACK_NAME);
 	const managedStatus = Object.fromEntries(
 		(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
 			id,
@@ -766,6 +772,26 @@ async function buildCapabilityCatalog() {
 	const packByName = new Map(listPacks().map((item) => [item.name, item]));
 	return {
 		tools: [
+			{
+				id: "agent-browser",
+				internalName: "agent-browser",
+				displayName: "客户端浏览器",
+				description: "在 Pi 客户端侧栏中显示独立浏览器，智能体可打开、读取和操作网页，不占用你的 Chrome 窗口。",
+				category: "效率工具",
+				formats: ["网页", "网站", "表单", "下载"],
+				installed: isAgentBrowserRuntimeAvailable(),
+				version: "1.0.0",
+				installPath: "Pi 控制台内置",
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "网",
+				sourceName: "Electron WebContentsView",
+				sourceUrl: "https://www.electronjs.org/docs/latest/api/web-contents-view",
+				activation: "识别到网页任务时按本轮加载",
+				capabilities: browserPack?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
+				removable: false,
+			},
 			{
 				id: "officecli",
 				internalName: "officecli",
