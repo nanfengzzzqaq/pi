@@ -1958,10 +1958,15 @@ function createCard(item, options) {
 	return card;
 }
 
+function installDispatcher(tool) {
+	return tool.id === "redteam" ? installRedTeam : installOfficeCli;
+}
+
 function renderTools(query) {
 	const tools = (catalogCache?.tools || []).filter((tool) => {
 		if (catalogFilter === "已安装" && !tool.installed) return false;
 		if (catalogFilter === "文档办公" && tool.category !== "文档办公") return false;
+		if (catalogFilter === "安全测试" && tool.category !== "安全测试") return false;
 		return catalogMatches(tool, query);
 	});
 	const grid = document.createElement("div");
@@ -1972,7 +1977,7 @@ function renderTools(query) {
 				kind: "tool",
 				icon: tool.icon,
 				onOpen: () => openToolDetail(tool),
-				onInstall: installOfficeCli,
+				onInstall: installDispatcher(tool),
 			}),
 		);
 	}
@@ -2037,7 +2042,7 @@ function renderCatalog() {
 	catalogSearchInputEl.placeholder = toolsMode ? "搜索工具" : "搜索技能";
 	catalogToolsTabEl.classList.toggle("active", toolsMode);
 	catalogSkillsTabEl.classList.toggle("active", !toolsMode);
-	renderCatalogFilters(toolsMode ? ["全部", "已安装", "文档办公"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"]);
+	renderCatalogFilters(toolsMode ? ["全部", "已安装", "文档办公", "安全测试"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"]);
 	catalogContentEl.innerHTML = "";
 	const query = catalogSearchInputEl.value.trim().toLocaleLowerCase("zh-CN");
 	if (toolsMode) renderTools(query);
@@ -2072,6 +2077,36 @@ async function pollOfficeCliInstall() {
 	}
 	await refreshCatalog();
 	showInfo(`OfficeCLI 已安装${progress.version ? `，版本 ${progress.version}` : ""}`);
+}
+
+async function installRedTeam(button) {
+	button.disabled = true;
+	button.textContent = "准备安装…";
+	try {
+		await api("/api/tools/redteam/install", { method: "POST", body: "{}" });
+		showInfo("promptfoo 正在从 npm 官方源安装");
+		clearInterval(catalogDownloadTimer);
+		catalogDownloadTimer = setInterval(pollRedTeamInstall, 1500);
+		await pollRedTeamInstall();
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`promptfoo 安装失败：${error.message}`);
+	}
+}
+
+async function pollRedTeamInstall() {
+	const progress = await api("/api/tools/redteam/progress");
+	if (progress.running) return;
+	clearInterval(catalogDownloadTimer);
+	catalogDownloadTimer = null;
+	if (progress.error) {
+		showError(`promptfoo 安装失败：${progress.error}`);
+		await refreshCatalog();
+		return;
+	}
+	await refreshCatalog();
+	showInfo(`红队引擎已安装${progress.version ? `，promptfoo ${progress.version}` : ""}`);
 }
 
 async function installOfficeCliSkill(skill, button) {
@@ -2134,10 +2169,10 @@ function openToolDetail(tool) {
 	source.rel = "noreferrer";
 	source.textContent = tool.sourceName;
 	appendDrawerDetails([
-		["文件类型", tool.formats.join("、")],
+		[tool.category === "安全测试" ? "覆盖能力" : "文件类型", tool.formats.join("、")],
 		["运行环境", tool.platform],
 		["安装位置", tool.installPath],
-		["技能", `${tool.installedSkillCount}/${tool.skillCount} 个已安装`],
+		...(tool.skillCount > 0 ? [["技能", `${tool.installedSkillCount}/${tool.skillCount} 个已安装`]] : []),
 		["来源", source],
 	]);
 	const toolsTitle = document.createElement("div");
@@ -2157,8 +2192,8 @@ function openToolDetail(tool) {
 		actions.className = "drawer-actions";
 		const install = document.createElement("button");
 		install.className = "primary-btn";
-		install.textContent = "安装 OfficeCLI";
-		install.addEventListener("click", () => installOfficeCli(install));
+		install.textContent = tool.id === "redteam" ? "安装红队引擎" : "安装 OfficeCLI";
+		install.addEventListener("click", () => installDispatcher(tool)(install));
 		actions.appendChild(install);
 		drawerContentEl.appendChild(actions);
 	}
