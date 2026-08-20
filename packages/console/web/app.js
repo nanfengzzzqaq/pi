@@ -28,6 +28,7 @@ const attachBtnEl = $("attach-btn");
 const attachmentsEl = $("attachments");
 const settingsBtnEl = $("settings-btn");
 const themeBtnEl = $("theme-btn");
+const agentBrowserBtnEl = $("agent-browser-btn");
 const settingsModalEl = $("settings-modal");
 const settingsCloseEl = $("settings-close");
 const keyProviderEl = $("key-provider");
@@ -50,6 +51,7 @@ const githubTokenSaveBtnEl = $("github-token-save-btn");
 const githubTokenClearBtnEl = $("github-token-clear-btn");
 const fsRootSelectEl = $("fs-root-select");
 const fsTreeEl = $("fs-tree");
+const filesPanelEl = $("files-panel");
 const fsRefreshBtnEl = $("fs-refresh");
 const fsUpBtnEl = $("fs-up");
 const fsPathInputEl = $("fs-path-input");
@@ -104,6 +106,18 @@ const officePreviewFrameEl = $("office-preview-frame");
 const officePreviewRefreshEl = $("office-preview-refresh");
 const officePreviewExternalEl = $("office-preview-external");
 const officePreviewCloseEl = $("office-preview-close");
+const agentBrowserPaneEl = $("agent-browser-pane");
+const agentBrowserResizerEl = $("agent-browser-resizer");
+const agentBrowserTitleEl = $("agent-browser-title");
+const agentBrowserStatusEl = $("agent-browser-status");
+const agentBrowserStageEl = $("agent-browser-stage");
+const agentBrowserAddressEl = $("agent-browser-address");
+const agentBrowserBackEl = $("agent-browser-back");
+const agentBrowserForwardEl = $("agent-browser-forward");
+const agentBrowserRefreshEl = $("agent-browser-refresh");
+const agentBrowserGoEl = $("agent-browser-go");
+const agentBrowserExternalEl = $("agent-browser-external");
+const agentBrowserCloseEl = $("agent-browser-close");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
@@ -124,8 +138,10 @@ let codexOAuthTimer = null;
 let officePreview = null;
 let officePreviewRequest = 0;
 const officeToolCalls = new Map();
+let agentBrowserState = null;
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
+const AGENT_BROWSER_WIDTH_KEY = "pi-console-agent-browser-width";
 const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
 const TEXT_FILE_RE = /\.(?:bat|c|cc|cfg|cmd|conf|cpp|cs|css|csv|env|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|json5|jsonl|jsx|kt|kts|less|log|lua|md|mdx|mjs|php|properties|ps1|psm1|py|pyw|rb|rs|rst|scss|sh|sql|svelte|swift|tex|toml|ts|tsv|tsx|txt|vue|xml|yaml|yml|zsh)$/i;
 const DELIVERABLE_FILE_RE = /\.[A-Za-z0-9]{1,16}$/i;
@@ -209,6 +225,7 @@ async function closeOfficePreview() {
 
 async function openOfficePreview(path, source = "manual") {
 	if (!isOfficeFilePath(path)) return false;
+	if (!agentBrowserPaneEl.hidden) await hideAgentBrowser();
 	const cleanPath = cleanOfficeFilePath(path);
 	const request = ++officePreviewRequest;
 	const shownName = cleanPath.split(/[\\/]/).pop() || cleanPath;
@@ -329,6 +346,128 @@ officePreviewResizerEl.addEventListener("pointerdown", (event) => {
 });
 
 // ---------------------------------------------------------------------------
+// 客户端独立浏览器（agent_browser）
+// ---------------------------------------------------------------------------
+
+function applyAgentBrowserWidth(width) {
+	const bounds = conversationWorkbenchEl.getBoundingClientRect();
+	const max = Math.max(360, bounds.width - 340);
+	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.56), max));
+	agentBrowserPaneEl.style.width = `${next}px`;
+}
+
+function syncAgentBrowserBounds() {
+	if (agentBrowserPaneEl.hidden || !window.piDesktop?.setBrowserBounds) return;
+	const bounds = agentBrowserStageEl.getBoundingClientRect();
+	window.piDesktop.setBrowserBounds({
+		x: Math.round(bounds.left),
+		y: Math.round(bounds.top),
+		width: Math.round(bounds.width),
+		height: Math.round(bounds.height),
+	});
+}
+
+function renderAgentBrowserState(state) {
+	if (!state) return;
+	agentBrowserState = state;
+	agentBrowserPaneEl.hidden = !state.open;
+	agentBrowserResizerEl.hidden = !state.open;
+	agentBrowserBtnEl.classList.toggle("active", state.open);
+	agentBrowserTitleEl.textContent = state.title || "独立浏览器";
+	agentBrowserTitleEl.title = state.url || "";
+	agentBrowserStatusEl.textContent = state.status || (state.loading ? "正在加载网页" : "网页已加载");
+	agentBrowserBackEl.disabled = !state.canGoBack;
+	agentBrowserForwardEl.disabled = !state.canGoForward;
+	if (document.activeElement !== agentBrowserAddressEl) agentBrowserAddressEl.value = state.url || "";
+	if (state.open) requestAnimationFrame(syncAgentBrowserBounds);
+	if (state.downloadPath) {
+		showInfo(`浏览器下载完成：${state.downloadPath}`);
+		if (currentFsPath) void loadFsDir(currentFsPath);
+	}
+}
+
+async function openAgentBrowser(url) {
+	if (!window.piDesktop?.openBrowser) {
+		if (url) window.open(url, "_blank", "noopener");
+		else showInfo("客户端独立浏览器只在 Windows 桌面版中可用");
+		return;
+	}
+	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
+	applyAgentBrowserWidth(localStorage.getItem(AGENT_BROWSER_WIDTH_KEY));
+	try {
+		renderAgentBrowserState(await window.piDesktop.openBrowser(url));
+	} catch (error) {
+		showError(`打开客户端浏览器失败：${error.message}`);
+	}
+}
+
+async function hideAgentBrowser() {
+	if (!window.piDesktop?.hideBrowser) return;
+	try {
+		renderAgentBrowserState(await window.piDesktop.hideBrowser());
+	} catch (error) {
+		showError(`隐藏客户端浏览器失败：${error.message}`);
+	}
+}
+
+async function navigateAgentBrowser() {
+	const target = agentBrowserAddressEl.value.trim();
+	if (!target || !window.piDesktop?.navigateBrowser) return;
+	try {
+		renderAgentBrowserState(await window.piDesktop.navigateBrowser(target));
+	} catch (error) {
+		showError(`网页打开失败：${error.message}`);
+	}
+}
+
+agentBrowserBtnEl.addEventListener("click", () => {
+	if (agentBrowserState?.open) void hideAgentBrowser();
+	else void openAgentBrowser();
+});
+agentBrowserCloseEl.addEventListener("click", () => void hideAgentBrowser());
+agentBrowserGoEl.addEventListener("click", () => void navigateAgentBrowser());
+agentBrowserAddressEl.addEventListener("keydown", (event) => {
+	if (event.key !== "Enter") return;
+	event.preventDefault();
+	void navigateAgentBrowser();
+});
+agentBrowserBackEl.addEventListener("click", async () => {
+	if (window.piDesktop?.browserBack) renderAgentBrowserState(await window.piDesktop.browserBack());
+});
+agentBrowserForwardEl.addEventListener("click", async () => {
+	if (window.piDesktop?.browserForward) renderAgentBrowserState(await window.piDesktop.browserForward());
+});
+agentBrowserRefreshEl.addEventListener("click", async () => {
+	if (window.piDesktop?.browserReload) renderAgentBrowserState(await window.piDesktop.browserReload());
+});
+agentBrowserExternalEl.addEventListener("click", () => {
+	if (agentBrowserState?.url) openExternalUrl(agentBrowserState.url);
+});
+
+agentBrowserResizerEl.addEventListener("pointerdown", (event) => {
+	event.preventDefault();
+	agentBrowserResizerEl.setPointerCapture(event.pointerId);
+	const resize = (moveEvent) => {
+		const bounds = conversationWorkbenchEl.getBoundingClientRect();
+		applyAgentBrowserWidth(bounds.right - moveEvent.clientX);
+		syncAgentBrowserBounds();
+	};
+	const finish = () => {
+		agentBrowserResizerEl.removeEventListener("pointermove", resize);
+		localStorage.setItem(AGENT_BROWSER_WIDTH_KEY, String(Math.round(agentBrowserPaneEl.getBoundingClientRect().width)));
+		syncAgentBrowserBounds();
+	};
+	agentBrowserResizerEl.addEventListener("pointermove", resize);
+	agentBrowserResizerEl.addEventListener("pointerup", finish, { once: true });
+	agentBrowserResizerEl.addEventListener("pointercancel", finish, { once: true });
+});
+
+if (window.ResizeObserver) new ResizeObserver(syncAgentBrowserBounds).observe(agentBrowserStageEl);
+window.addEventListener("resize", syncAgentBrowserBounds);
+if (window.piDesktop?.onBrowserState) window.piDesktop.onBrowserState(renderAgentBrowserState);
+if (window.piDesktop?.browserState) void window.piDesktop.browserState().then(renderAgentBrowserState);
+
+// ---------------------------------------------------------------------------
 // 会话初始化与恢复
 // ---------------------------------------------------------------------------
 
@@ -407,7 +546,7 @@ function renderHistory(history) {
 			if (item.text) container.appendHistoryText(item.text);
 			if (Array.isArray(item.toolCalls)) {
 				for (const call of item.toolCalls) {
-					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
+					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"), call.name, call.args);
 					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
 					if (path) container.addArtifactPath(path);
 				}
@@ -443,7 +582,7 @@ function addCapabilitySelectionStep(container, event) {
 		"done",
 	);
 	updateToolBlock(block, false, formatCapabilitySelection(event));
-	container.addTool(block);
+	container.addTool(block, "capability_search", event);
 }
 
 function addModelUsageStep(container, usage, id) {
@@ -454,7 +593,7 @@ function addModelUsageStep(container, usage, id) {
 		"done",
 	);
 	updateToolBlock(block, false, formatModelUsage(usage));
-	container.addTool(block);
+	container.addTool(block, "model_usage", usage);
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +939,8 @@ function handleEvent(event) {
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
 			ensureAssistant().addTool(
 				appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running"),
+				event.toolName,
+				event.args,
 			);
 			break;
 		case "tool_execution_end": {
@@ -900,6 +1041,45 @@ function formatModelUsage(usage) {
 	return lines.join("\n");
 }
 
+/**
+ * 本地把工具步骤归入可理解的执行阶段。规则只读取工具名和参数，不调用模型，
+ * 因此复杂任务的阶段导航不会增加 token。
+ */
+function executionStageFor(toolName, args) {
+	const name = String(toolName || "").toLocaleLowerCase("en-US");
+	const serializedArgs = (() => {
+		try {
+			return JSON.stringify(args ?? {}).toLocaleLowerCase("en-US");
+		} catch {
+			return String(args ?? "").toLocaleLowerCase("en-US");
+		}
+	})();
+	if (name === "capability_search") return { key: "prepare", label: "准备与能力选择" };
+	if (name === "model_usage") return { key: "finish", label: "完成与用量" };
+	if (
+		["read", "find", "grep", "ls", "browser_snapshot", "browser_extract", "office_view", "office_get", "office_query", "office_help", "archive_list"].includes(name)
+	) {
+		return { key: "inspect", label: "调查与读取" };
+	}
+	if (
+		name === "archive_test" ||
+		name === "browser_screenshot" ||
+		((name === "bash" || name === "powershell") &&
+			/\b(test|check|verify|build|lint|vitest|pytest|npm run check|git diff|status)\b/.test(serializedArgs))
+	) {
+		return { key: "verify", label: "验证结果" };
+	}
+	if (name.startsWith("browser_")) return { key: "browser", label: "浏览器操作" };
+	if (
+		["edit", "write", "bash", "powershell"].includes(name) ||
+		name.startsWith("office_") ||
+		name.startsWith("archive_")
+	) {
+		return { key: "act", label: "执行操作" };
+	}
+	return { key: "act", label: "执行操作" };
+}
+
 // ---------------------------------------------------------------------------
 // Claude 风格消息渲染
 // ---------------------------------------------------------------------------
@@ -924,15 +1104,41 @@ function startPathDrag(event, path) {
 	event.dataTransfer.setData("text/plain", path);
 	// Electron 使用真实本地路径启动 Windows 原生拖放，因此可直接放到桌面或系统资源管理器。
 	if (window.piDesktop?.startFileDrag) {
-		event.preventDefault();
-		window.piDesktop.startFileDrag(path);
+		const nativeStarted = window.piDesktop.startFileDrag(path);
+		if (nativeStarted) event.preventDefault();
 	}
 }
 
 function renderArtifactCards(container, files) {
 	container.innerHTML = "";
-	container.hidden = !Array.isArray(files) || files.length === 0;
-	for (const file of files || []) {
+	const items = Array.isArray(files) ? files : [];
+	container.hidden = items.length === 0;
+	if (items.length === 0) return;
+	let list = container;
+	if (!container.classList.contains("sent-attachments") && items.length > 2) {
+		const expanded = container.dataset.expanded === "true";
+		const toggle = document.createElement("button");
+		toggle.type = "button";
+		toggle.className = "artifact-group-toggle";
+		toggle.setAttribute("aria-expanded", String(expanded));
+		toggle.textContent = `${expanded ? "▾" : "▸"} 本轮生成文件（${items.length}）`;
+		const hint = document.createElement("span");
+		hint.textContent = expanded ? "收起文件" : "展开查看、预览或拖到桌面";
+		toggle.appendChild(hint);
+		list = document.createElement("div");
+		list.className = "artifact-group-list";
+		list.hidden = !expanded;
+		toggle.addEventListener("click", () => {
+			const next = list.hidden;
+			list.hidden = !next;
+			container.dataset.expanded = String(next);
+			toggle.setAttribute("aria-expanded", String(next));
+			toggle.firstChild.textContent = `${next ? "▾" : "▸"} 本轮生成文件（${items.length}）`;
+			hint.textContent = next ? "收起文件" : "展开查看、预览或拖到桌面";
+		});
+		container.append(toggle, list);
+	}
+	for (const file of items) {
 		const presentation = artifactPresentation(file);
 		const card = document.createElement("article");
 		card.className = "artifact-card";
@@ -972,7 +1178,7 @@ function renderArtifactCards(container, files) {
 		download.dataset.downloadName = file.name;
 		actions.appendChild(download);
 		card.append(icon, info, actions);
-		container.appendChild(card);
+		list.appendChild(card);
 	}
 }
 
@@ -1009,6 +1215,9 @@ function appendMessage(role, text, attachmentPaths = []) {
 	let processWrap = null;
 	let processBody = null;
 	let processCount = 0;
+	let processStage = null;
+	let processStageCount = 0;
+	let processCurrentEl = null;
 	if (role === "assistant") {
 		processWrap = document.createElement("div");
 		processWrap.className = "process-block";
@@ -1075,9 +1284,10 @@ function appendMessage(role, text, attachmentPaths = []) {
 			}
 		},
 		/** 挂载工具块到执行过程区 */
-		addTool(toolBlock) {
+		addTool(toolBlock, toolName, args) {
 			if (!processWrap) return;
 			processCount++;
+			const stage = executionStageFor(toolName, args);
 			// 首个工具：构建容器头（运行中展开）
 			if (processCount === 1) {
 				processWrap.innerHTML = "";
@@ -1091,7 +1301,10 @@ function appendMessage(role, text, attachmentPaths = []) {
 				label.textContent = "⚙ 执行过程";
 				const countEl = document.createElement("span");
 				countEl.className = "process-count";
-				countEl.textContent = "1 步";
+				countEl.textContent = "1 步 · 1 阶段";
+				processCurrentEl = document.createElement("span");
+				processCurrentEl.className = "process-current";
+				processCurrentEl.textContent = stage.label;
 				const copyAll = document.createElement("button");
 				copyAll.className = "copy-btn";
 				copyAll.textContent = "⧉";
@@ -1100,6 +1313,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 				head.appendChild(chevron);
 				head.appendChild(label);
 				head.appendChild(countEl);
+				head.appendChild(processCurrentEl);
 				head.appendChild(copyAll);
 				head.addEventListener("click", () => {
 					processBody.hidden = !processBody.hidden;
@@ -1110,11 +1324,50 @@ function appendMessage(role, text, attachmentPaths = []) {
 				processBody.className = "process-body";
 				processWrap.appendChild(processBody);
 				processWrap.hidden = false;
-			} else {
-				const countEl = processWrap.querySelector(".process-count");
-				if (countEl) countEl.textContent = `${processCount} 步`;
 			}
-			processBody.appendChild(toolBlock);
+
+			if (!processStage || processStage.dataset.stageKey !== stage.key) {
+				if (processStage) {
+					processStage.querySelector(".process-stage-body").hidden = true;
+					processStage.querySelector(".process-stage-chevron").textContent = "▸";
+					processStage.querySelector(".process-stage-status").textContent = "已完成";
+				}
+				processStageCount++;
+				processStage = document.createElement("section");
+				processStage.className = "process-stage";
+				processStage.dataset.stageKey = stage.key;
+				const stageHead = document.createElement("div");
+				stageHead.className = "process-stage-head";
+				const stageChevron = document.createElement("span");
+				stageChevron.className = "process-stage-chevron";
+				stageChevron.textContent = "▾";
+				const stageLabel = document.createElement("span");
+				stageLabel.className = "process-stage-label";
+				stageLabel.textContent = `阶段 ${processStageCount} · ${stage.label}`;
+				const stageCount = document.createElement("span");
+				stageCount.className = "process-stage-count";
+				stageCount.textContent = "1 步";
+				const stageStatus = document.createElement("span");
+				stageStatus.className = "process-stage-status";
+				stageStatus.textContent = "进行中";
+				const stageBody = document.createElement("div");
+				stageBody.className = "process-stage-body";
+				stageHead.append(stageChevron, stageLabel, stageCount, stageStatus);
+				stageHead.addEventListener("click", () => {
+					stageBody.hidden = !stageBody.hidden;
+					stageChevron.textContent = stageBody.hidden ? "▸" : "▾";
+				});
+				processStage.append(stageHead, stageBody);
+				processBody.appendChild(processStage);
+			} else {
+				const stageCount = processStage.querySelector(".process-stage-count");
+				const count = processStage.querySelectorAll(".tool-block").length + 1;
+				if (stageCount) stageCount.textContent = `${count} 步`;
+			}
+			processStage.querySelector(".process-stage-body").appendChild(toolBlock);
+			const countEl = processWrap.querySelector(".process-count");
+			if (countEl) countEl.textContent = `${processCount} 步 · ${processStageCount} 阶段`;
+			if (processCurrentEl) processCurrentEl.textContent = stage.label;
 			scrollToBottom();
 		},
 		/** 一轮结束：执行过程默认折叠（用户可点开），思考块从"思考中"落定 */
@@ -1123,6 +1376,15 @@ function appendMessage(role, text, attachmentPaths = []) {
 			const thinkingLabel = thinking.querySelector(".thinking-label");
 			if (thinkingLabel) thinkingLabel.textContent = "思考过程";
 			if (!processWrap || processWrap.hidden) return;
+			for (const stage of processWrap.querySelectorAll(".process-stage")) {
+				const stageBody = stage.querySelector(".process-stage-body");
+				const stageChevron = stage.querySelector(".process-stage-chevron");
+				const stageStatus = stage.querySelector(".process-stage-status");
+				if (stageBody) stageBody.hidden = true;
+				if (stageChevron) stageChevron.textContent = "▸";
+				if (stageStatus) stageStatus.textContent = "已完成";
+			}
+			if (processCurrentEl) processCurrentEl.textContent = "已完成";
 			const body = processWrap.querySelector(".process-body");
 			const chevron = processWrap.querySelector(".tool-chevron");
 			if (body && !body.hidden) {
@@ -1226,7 +1488,7 @@ function renderInline(text) {
 			`<button type="button" class="inline-file-link" data-download-path="${escapeAttribute(path.trim())}" data-download-name="${escapeAttribute(label)}" title="下载文件（file_download）">📎 ${escapeHtml(label)}</button>`,
 		);
 	});
-	source = source.replace(/https?:\/\/[^\s<\u0000]+/g, (matched) => {
+	source = source.replace(/https?:\/\/[^\s<>"'\u0000，。；：！？、（）【】]+/gu, (matched) => {
 		let url = matched;
 		let trailing = "";
 		while (/[，。；：！？,;:!?)）\]}]$/u.test(url)) {
@@ -1458,12 +1720,28 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 
 /** 结果文本里的文件路径渲染为可点击链接（点击下载/预览，Shift+点击加入对话） */
 function renderResultText(resultText) {
-	const escaped = escapeHtml(resultText);
-	// 常见路径形态：绝对路径 / 相对路径 + 常见文件扩展名
-	return escaped.replace(
-		/((?:[A-Za-z]:[\\/]|\.{0,2}[\\/])[\w\-. \\/\\()（）【】\[\]]+\.[A-Za-z0-9]{1,16})/g,
-		'<a class="file-link" data-path="$1" title="点击下载或预览；Shift+点击加入对话">📄 $1</a>',
+	const fragments = [];
+	const hold = (html) => `\u0000${fragments.push(html) - 1}\u0000`;
+	let source = String(resultText ?? "");
+	// 必须先保护完整网址，否则 https:// 中的 s:/ 会被后面的 Windows 路径规则误判为盘符。
+	source = source.replace(/https?:\/\/[^\s<>"'\u0000，。；：！？、（）【】]+/giu, (matched) => {
+		let url = matched;
+		let trailing = "";
+		while (/[，。；：！？,;:!?)）\]}]$/u.test(url)) {
+			trailing = url.slice(-1) + trailing;
+			url = url.slice(0, -1);
+		}
+		return `${hold(`<a class="external-link" href="${escapeAttribute(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`)}${trailing}`;
+	});
+	const filePattern = /(?:[A-Za-z]:[\\/]|\.{1,2}[\\/])[^<>\n\r|?*"\u0000]+?\.[A-Za-z0-9]{1,16}(?=$|[\s，。；：！？,;:!?)\]】}])/gu;
+	source = source.replace(filePattern, (path) =>
+		hold(
+			`<a class="file-link" data-path="${escapeAttribute(path)}" title="点击下载或预览；Shift+点击加入对话">📄 ${escapeHtml(path)}</a>`,
+		),
 	);
+	let html = escapeHtml(source);
+	html = html.replace(/\u0000(\d+)\u0000/g, (_match, index) => fragments[Number(index)] || "");
+	return html;
 }
 
 function updateToolBlock(block, isError, resultText) {
@@ -1475,6 +1753,13 @@ function updateToolBlock(block, isError, resultText) {
 	if (resultEl && resultText) {
 		resultEl.innerHTML = renderResultText(resultText);
 		resultEl.hidden = false;
+	}
+	const stage = block.closest(".process-stage");
+	if (stage) {
+		const stageStatus = stage.querySelector(".process-stage-status");
+		const hasRunning = stage.querySelector(".tool-block.running");
+		const hasError = stage.querySelector(".tool-block.error");
+		if (stageStatus) stageStatus.textContent = hasRunning ? "进行中" : hasError ? "含失败步骤" : "已完成";
 	}
 }
 
@@ -1499,7 +1784,7 @@ function copyTextFrom(btn) {
 	} else if (mode === "process") {
 		const body = btn.closest(".process-block")?.querySelector(".process-body");
 		if (body) {
-			text = body.innerText;
+			text = body.textContent;
 		}
 	}
 	if (!text) return false;
@@ -1666,6 +1951,12 @@ collapseBtnEl.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 messagesEl.addEventListener("click", (e) => {
+	const externalLink = e.target.closest("a.external-link");
+	if (externalLink) {
+		e.preventDefault();
+		void openAgentBrowser(externalLink.href);
+		return;
+	}
 	const previewLink = e.target.closest("[data-preview-path]");
 	if (previewLink) {
 		e.preventDefault();
@@ -1766,7 +2057,7 @@ fileInputEl.addEventListener("change", () => {
 let dragDepth = 0;
 window.addEventListener("dragenter", (e) => {
 	if (![...(e.dataTransfer?.types ?? [])].some((type) => type === "Files" || type === LOCAL_FILE_DRAG_TYPE)) return;
-	if (fsTreeEl.contains(e.target)) return;
+	if (filesPanelEl.contains(e.target)) return;
 	e.preventDefault();
 	dragDepth++;
 	dropOverlayEl.hidden = false;
@@ -1781,7 +2072,7 @@ window.addEventListener("dragleave", (e) => {
 	if (dragDepth === 0) dropOverlayEl.hidden = true;
 });
 window.addEventListener("drop", (e) => {
-	if (fsTreeEl.contains(e.target)) return;
+	if (filesPanelEl.contains(e.target)) return;
 	e.preventDefault();
 	dragDepth = 0;
 	dropOverlayEl.hidden = true;
@@ -2179,6 +2470,7 @@ function renderTools(query) {
 		if (catalogFilter === "文档办公" && tool.category !== "文档办公") return false;
 		if (catalogFilter === "文件处理" && tool.category !== "文件处理") return false;
 		if (catalogFilter === "安全测试" && tool.category !== "安全测试") return false;
+		if (catalogFilter === "效率工具" && tool.category !== "效率工具") return false;
 		return catalogMatches(tool, query);
 	});
 	const grid = document.createElement("div");
@@ -2192,7 +2484,7 @@ function renderTools(query) {
 				iconText: tool.iconText,
 				onOpen: () => openToolDetail(tool),
 				onInstall: installDispatcher(tool),
-				onUninstall: (button) => uninstallTool(tool, button),
+				onUninstall: tool.removable === false ? undefined : (button) => uninstallTool(tool, button),
 				...installState,
 			}),
 		);
@@ -2259,7 +2551,9 @@ function renderCatalog() {
 	catalogToolsTabEl.classList.toggle("active", toolsMode);
 	catalogSkillsTabEl.classList.toggle("active", !toolsMode);
 	renderCatalogFilters(
-		toolsMode ? ["全部", "已安装", "文件处理", "文档办公", "安全测试"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"],
+		toolsMode
+			? ["全部", "已安装", "效率工具", "文件处理", "文档办公", "安全测试"]
+			: ["全部", "已安装", "Word", "PowerPoint", "Excel"],
 	);
 	catalogContentEl.innerHTML = "";
 	const query = catalogSearchInputEl.value.trim().toLocaleLowerCase("zh-CN");
@@ -2497,7 +2791,7 @@ function openToolDetail(tool) {
 		install.addEventListener("click", () => installDispatcher(tool)(install));
 		actions.appendChild(install);
 		drawerContentEl.appendChild(actions);
-	} else {
+	} else if (tool.removable !== false) {
 		const actions = document.createElement("div");
 		actions.className = "drawer-actions";
 		const uninstall = document.createElement("button");
@@ -2937,6 +3231,27 @@ fsTreeEl.addEventListener("drop", (event) => {
 	if (event.dataTransfer) void copyDroppedFilesToCurrentDirectory(event.dataTransfer);
 });
 
+// 文件面板的工具栏、路径栏和空白区域也属于当前文件夹投放区，避免只有列表行能接收桌面文件。
+filesPanelEl.addEventListener("dragover", (event) => {
+	if (!event.dataTransfer || fsTreeEl.contains(event.target)) return;
+	event.preventDefault();
+	event.stopPropagation();
+	event.dataTransfer.dropEffect = "copy";
+	fsTreeEl.classList.add("drag-target");
+});
+filesPanelEl.addEventListener("dragleave", (event) => {
+	if (!filesPanelEl.contains(event.relatedTarget)) fsTreeEl.classList.remove("drag-target");
+});
+filesPanelEl.addEventListener("drop", (event) => {
+	if (fsTreeEl.contains(event.target)) return;
+	event.preventDefault();
+	event.stopPropagation();
+	fsTreeEl.classList.remove("drag-target");
+	dragDepth = 0;
+	dropOverlayEl.hidden = true;
+	if (event.dataTransfer) void copyDroppedFilesToCurrentDirectory(event.dataTransfer);
+});
+
 function releasePreviewObjectUrl() {
 	if (!previewObjectUrl) return;
 	URL.revokeObjectURL(previewObjectUrl);
@@ -3093,7 +3408,7 @@ settingsModalEl.addEventListener("click", (e) => {
 });
 
 function openExternalUrl(url) {
-	if (!/^https:\/\//i.test(url || "")) return;
+	if (!/^https?:\/\//i.test(url || "")) return;
 	if (window.piDesktop?.openExternal) window.piDesktop.openExternal(url);
 	else window.open(url, "_blank", "noopener");
 }

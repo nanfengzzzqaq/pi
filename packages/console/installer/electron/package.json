@@ -1,6 +1,6 @@
 {
 	"name": "pi-console-electron",
-	"version": "0.3.19",
+	"version": "0.3.20",
 	"private": true,
 	"description": "Pi 控制台 Electron 壳（主进程）",
 	"main": "main.js",
@@ -29,6 +29,8 @@
 		"files": [
 			"main.js",
 			"preload.js",
+			"preload.cjs",
+			"browser-controller.js",
 			"icon.png",
 			"src/**",
 			"web/**",

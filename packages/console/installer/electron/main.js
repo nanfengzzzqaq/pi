@@ -9,6 +9,8 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createServer as createProbeServer } from "node:net";
+import { AgentBrowserController } from "./browser-controller.js";
+import { registerAgentBrowserRuntime } from "./src/agent-browser-runtime.ts";
 
 // 数据位置指针固定留在 AppData；实际数据目录可由用户在设置中整体迁移到其他磁盘。
 const storageConfigPath = join(app.getPath("appData"), "pi-console", "storage-location.json");
@@ -29,9 +31,11 @@ process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? configuredDataPath(
 process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(process.env.PI_CONSOLE_DATA, "agent");
 process.env.PORT = process.env.PORT ?? "3200";
 
-const APP_URL = "http://127.0.0.1:3200/";
+const APP_PORT = Number(process.env.PORT);
+const APP_URL = `http://127.0.0.1:${APP_PORT}/`;
 
 let win = null;
+let agentBrowser = null;
 
 /** 检测端口是否被占用（旧版服务仍在跑） */
 function portInUse(port) {
@@ -90,6 +94,7 @@ function createWindow() {
 	win = new BrowserWindow({
 		width: 1280,
 		height: 860,
+		show: process.env.PI_CONSOLE_HEADLESS !== "1",
 		minWidth: 960,
 		minHeight: 600,
 		title: "Pi 控制台",
@@ -97,7 +102,7 @@ function createWindow() {
 		autoHideMenuBar: true,
 		backgroundColor: "#0b1220",
 		webPreferences: {
-			preload: join(import.meta.dirname, "preload.js"),
+			preload: join(import.meta.dirname, "preload.cjs"),
 			contextIsolation: true,
 			nodeIntegration: false,
 		},
@@ -122,11 +127,20 @@ ipcMain.on("pi:file-drag-start", (event, path) => {
 		const file = resolve(String(path));
 		if (!existsSync(file) || !statSync(file).isFile()) return;
 		const icon = nativeImage.createFromPath(join(import.meta.dirname, "icon.png")).resize({ width: 32, height: 32 });
-		event.sender.startDrag({ file, icon });
+		event.sender.startDrag({ file, files: [file], icon });
 	} catch {
 		/* 文件在拖动开始前被移动时忽略。 */
 	}
 });
+
+ipcMain.handle("pi:browser-open", (_event, url) => agentBrowser?.open(typeof url === "string" ? url : undefined));
+ipcMain.handle("pi:browser-hide", () => agentBrowser?.hide());
+ipcMain.handle("pi:browser-state", () => agentBrowser?.state());
+ipcMain.handle("pi:browser-navigate", (_event, url) => agentBrowser?.navigate(String(url ?? "")));
+ipcMain.handle("pi:browser-back", () => agentBrowser?.back());
+ipcMain.handle("pi:browser-forward", () => agentBrowser?.forward());
+ipcMain.handle("pi:browser-reload", () => agentBrowser?.reload());
+ipcMain.on("pi:browser-bounds", (_event, bounds) => agentBrowser?.setBounds(bounds));
 
 ipcMain.handle("pi:choose-directory", async () => {
 	const options = {
@@ -139,7 +153,7 @@ ipcMain.handle("pi:choose-directory", async () => {
 
 ipcMain.handle("pi:open-external", async (_event, url) => {
 	const target = String(url);
-	if (!/^https:\/\//i.test(target)) return false;
+	if (!/^https?:\/\//i.test(target)) return false;
 	await shell.openExternal(target);
 	return true;
 });
@@ -152,15 +166,23 @@ ipcMain.on("pi:relaunch", () => {
 app.whenReady().then(async () => {
 	// 升级衔接：改写旧版启动器为 Electron 优先（需在旧服务可能启动前完成）
 	upgradeLegacyLauncher();
-	if (await portInUse(3200)) {
+	if (await portInUse(APP_PORT)) {
 		dialog.showErrorBox(
 			"Pi 控制台",
-			"端口 3200 已被占用——可能有旧版本正在后台运行。\n\n请先关闭旧版本（或重启电脑）后再启动。",
+			`端口 ${APP_PORT} 已被占用——可能有旧版本正在后台运行。\n\n请先关闭旧版本（或重启电脑）后再启动。`,
 		);
 		app.quit();
 		return;
 	}
 	try {
+		agentBrowser = new AgentBrowserController({
+			getWindow: () => win,
+			dataDir: process.env.PI_CONSOLE_DATA,
+			onState: (state) => {
+				if (win && !win.isDestroyed()) win.webContents.send("pi:browser-state-changed", state);
+			},
+		});
+		registerAgentBrowserRuntime(agentBrowser);
 		// 启动内嵌后端（server.ts 顶层 listen；同一进程，窗口关闭即整体退出）
 		await import("./src/server.ts");
 	} catch (error) {

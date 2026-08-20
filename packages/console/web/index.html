@@ -16,6 +16,7 @@
 		<span class="logo">Pi 控制台</span>
 		<span id="conn-state" class="conn-state">连接中…</span>
 		<div class="topbar-right">
+			<button id="agent-browser-btn" class="secondary-btn small" type="button" title="打开客户端独立浏览器（agent_browser）">浏览器</button>
 			<button id="theme-btn" class="icon-btn" title="切换主题">🌙</button>
 			<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新 / MCP）">⚙</button>
 		</div>
@@ -177,6 +178,31 @@
 					<div class="office-preview-stage">
 						<div id="office-preview-loading" class="office-preview-loading">正在启动 OfficeCLI 实时渲染…</div>
 						<iframe id="office-preview-frame" class="office-preview-frame" title="OfficeCLI 实时渲染画面"></iframe>
+					</div>
+				</section>
+
+				<div id="agent-browser-resizer" class="office-preview-resizer" title="拖动调整浏览器宽度" hidden></div>
+				<section id="agent-browser-pane" class="agent-browser-pane" hidden>
+					<header class="agent-browser-header">
+						<div class="agent-browser-heading">
+							<span class="office-preview-kicker">智能体浏览器（agent_browser）</span>
+							<strong id="agent-browser-title" class="office-preview-title">独立浏览器</strong>
+							<span id="agent-browser-status" class="office-preview-status">浏览器已准备</span>
+						</div>
+						<div class="office-preview-actions">
+							<button id="agent-browser-external" class="icon-btn small" type="button" title="在系统浏览器中打开当前网页">↗</button>
+							<button id="agent-browser-close" class="icon-btn small" type="button" title="隐藏客户端浏览器，后台任务不会停止">×</button>
+						</div>
+					</header>
+					<div class="agent-browser-toolbar">
+						<button id="agent-browser-back" class="icon-btn small" type="button" title="后退" disabled>←</button>
+						<button id="agent-browser-forward" class="icon-btn small" type="button" title="前进" disabled>→</button>
+						<button id="agent-browser-refresh" class="icon-btn small" type="button" title="刷新">⟳</button>
+						<input id="agent-browser-address" type="text" aria-label="浏览器地址" placeholder="输入网址或搜索内容" autocomplete="off">
+						<button id="agent-browser-go" class="secondary-btn small" type="button">打开</button>
+					</div>
+					<div id="agent-browser-stage" class="agent-browser-stage">
+						<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>
 					</div>
 				</section>
 			</div>

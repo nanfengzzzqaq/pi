@@ -26,10 +26,23 @@ describe("按本轮选择能力", () => {
 		expect(match?.toolNames).not.toContain("office_create");
 	});
 
+	it("网页任务只加载客户端浏览器所需分组", () => {
+		expect(baseToolNames(["agent-browser"])).not.toContain("browser_navigate");
+		const [navigate] = selectCapabilities("请打开 https://example.com", ["agent-browser"]);
+		expect(navigate?.groupNames).toEqual(["navigate"]);
+		expect(navigate?.toolNames).toEqual(["browser_navigate", "browser_snapshot", "browser_wait"]);
+
+		const [interact] = selectCapabilities("请在这个网站登录并填写表单", ["agent-browser"]);
+		expect(interact?.groupNames).toEqual(["navigate", "interact"]);
+		expect(interact?.toolNames).toContain("browser_type");
+		expect(interact?.toolNames).toContain("browser_click");
+	});
+
 	it("面向用户显示中文名称和内部代码名", () => {
 		expect(toolDisplayName("office_view")).toBe("查看文档（office_view）");
 		expect(toolDisplayName("read")).toBe("读取文件（read）");
 		expect(toolDisplayName("bash")).toBe("运行 Bash 命令（bash）");
 		expect(toolDisplayName("powershell")).toBe("运行 Windows 命令（powershell）");
+		expect(toolDisplayName("browser_snapshot")).toBe("获取页面状态（browser_snapshot）");
 	});
 });
