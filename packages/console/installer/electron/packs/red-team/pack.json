@@ -2,7 +2,47 @@
 	"name": "red-team",
 	"displayName": "红队演练",
 	"description": "基于 promptfoo 的 AI 红队测试与评估：自动生成攻击样本、扫描 LLM 应用漏洞、运行 eval 与模型对比",
-	"version": "0.1.0",
-	"deferred": true,
-	"metaTool": "redteam_enable"
+	"version": "0.2.0",
+	"activation": {
+		"keywords": [
+			"红队",
+			"渗透",
+			"漏洞扫描",
+			"越狱",
+			"提示词注入",
+			"攻击样本",
+			"安全测试",
+			"安全评估",
+			"promptfoo",
+			"redteam",
+			"red team",
+			"jailbreak",
+			"模型对比"
+		],
+		"minimumScore": 2,
+		"defaultGroups": ["manage"]
+	},
+	"toolGroups": [
+		{
+			"name": "manage",
+			"displayName": "环境与结果管理",
+			"description": "安装/检查 promptfoo 环境，列出攻击插件与策略，查看历史评估结果",
+			"tools": ["redteam_setup", "redteam_plugins", "redteam_results"],
+			"keywords": ["安装", "环境", "状态", "插件", "策略", "清单", "结果", "历史", "版本", "更新"]
+		},
+		{
+			"name": "scan",
+			"displayName": "红队扫描",
+			"description": "生成红队配置与攻击样本，对目标 AI 应用执行完整漏洞扫描",
+			"tools": ["redteam_init", "redteam_generate", "redteam_run", "redteam_results"],
+			"keywords": ["红队", "扫描", "攻击", "漏洞", "越狱", "渗透", "注入", "样本"]
+		},
+		{
+			"name": "eval",
+			"displayName": "评估与模型对比",
+			"description": "运行标准评估、提示词回归测试与多模型横向对比",
+			"tools": ["eval_run", "redteam_results"],
+			"keywords": ["评估", "对比", "eval", "回归", "打分", "基准"]
+		}
+	]
 }

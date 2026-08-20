@@ -1,9 +1,13 @@
 /**
  * 红队演练能力包：把 promptfoo（开源 LLM 红队/评估框架）装进 Pi 控制台。
  *
- * 设计对齐 Office 助手的 OfficeCLI 管理模式：
+ * 加载方式：按本轮需求加载（pack.json 的 activation + toolGroups）——
+ * 本地关键词路由命中"红队/扫描/评估"类需求时才把对应最小工具组注入当轮上下文，
+ * 日常闲聊零 token 成本。
+ *
+ * 引擎管理对齐 OfficeCLI 模式：
  * - promptfoo 按需安装到 data/redteam/（npm --prefix），只检查、不自动安装；
- *   安装/更新完全由用户通过 redteam_setup 触发，默认锁定官方版本
+ *   安装/更新由用户通过目录页"安装"按钮或 redteam_setup 工具触发，默认锁定官方版本
  * - 执行时定位 data/redteam/node_modules/promptfoo 的 bin，用当前 Node 直接跑，
  *   Electron 环境下自动补 ELECTRON_RUN_AS_NODE=1
  * - cwd = 当前会话工作目录（ctx.getWorkspaceRoot()），攻击样本与报告都落在工作区
@@ -131,20 +135,6 @@ export default function definePack(ctx: PackContext) {
 	const root = () => ctx.getWorkspaceRoot();
 
 	const tools: ToolDefinition[] = [
-		{
-			// 元工具（触发式加载）：挂载后上下文里只有它，用户要做红队/评估时才激活完整工具组
-			name: "redteam_enable",
-			label: "启用红队演练能力",
-			description:
-				"当用户要求对 AI 应用/大模型做红队测试、漏洞扫描、越狱测试、prompt 评估或模型对比时，先调用本工具一次以启用完整红队工具组。纯聊天或无关请求不要调用。",
-			parameters: Type.Object({}),
-			execute: async () => {
-				ctx.activatePack?.("red-team");
-				return ok(
-					"红队工具组已启用，本会话现在可用：redteam_setup（环境检查/安装/更新）、redteam_plugins（列出攻击插件与策略）、redteam_init（生成测试配置）、redteam_generate（只生成攻击样本）、redteam_run（完整扫描）、redteam_results（查看历史结果）、eval_run（通用评估/模型对比）。典型流程：redteam_setup 确认环境 → redteam_init 写配置 → redteam_run 开打 → redteam_results 看结果。",
-				);
-			},
-		},
 		{
 			name: "redteam_setup",
 			label: "红队环境管理",

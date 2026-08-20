@@ -41,6 +41,7 @@ import {
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
+import * as redteam from "./redteam.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -193,13 +194,13 @@ function touchSessionIndex(
 }
 
 /**
- * “安装工具”替代旧的“给某个会话添加助手”：OfficeCLI 一旦可用，就绑定到全部会话；
+ * “安装工具”替代旧的“给某个会话添加助手”：工具一旦可用，就绑定到全部会话；
  * 每轮仍由本地能力路由只注入命中的最小工具组。
  */
-function activateOfficeCliForAllSessions(): void {
-	mountPack(OFFICECLI_PACK_NAME);
+function activatePackForAllSessions(packName: string): void {
+	mountPack(packName);
 	for (const cs of sessions.values()) {
-		cs.enabledPacks.add(OFFICECLI_PACK_NAME);
+		cs.enabledPacks.add(packName);
 		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	}
 	const enabled = mountedPacks();
@@ -208,6 +209,10 @@ function activateOfficeCliForAllSessions(): void {
 		entry.enabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...enabled])];
 	}
 	writeSessionIndex(index);
+}
+
+function activateOfficeCliForAllSessions(): void {
+	activatePackForAllSessions(OFFICECLI_PACK_NAME);
 }
 
 async function reloadInstalledSkillsInSessions(): Promise<number> {
@@ -644,6 +649,8 @@ async function buildCapabilityCatalog() {
 	const status = await officecli.getLocalStatus();
 	const pack = listPacks().find((item) => item.name === OFFICECLI_PACK_NAME);
 	const skills = listOfficeCliSkills(CONSOLE_AGENT_DIR);
+	const redteamStatus = await redteam.getLocalStatus();
+	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
 	return {
 		tools: [
 			{
@@ -665,6 +672,26 @@ async function buildCapabilityCatalog() {
 				skillCount: skills.length,
 				installedSkillCount: skills.filter((skill) => skill.installed).length,
 			},
+			{
+				id: "redteam",
+				internalName: "redteam",
+				displayName: "红队演练",
+				description:
+					"对你的 AI 应用做自动化红队测试：生成攻击样本、执行越狱/注入/数据泄露等扫描、运行评估与模型对比，输出漏洞报告。",
+				category: "安全测试",
+				formats: ["promptfoo", "越狱", "注入", "漏洞扫描", "模型评估"],
+				installed: redteamStatus.installed,
+				version: redteamStatus.version,
+				installPath: redteamStatus.path,
+				platform: `${process.platform}-${process.arch}`,
+				icon: "/redteam.svg",
+				sourceName: "promptfoo 官方项目",
+				sourceUrl: "https://github.com/promptfoo/promptfoo",
+				activation: "按本轮需求加载",
+				capabilities: redteamPack?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
+			},
 		],
 		skillGroups: [
 			{
@@ -677,6 +704,7 @@ async function buildCapabilityCatalog() {
 			},
 		],
 		download: officecli.getDownloadProgress(),
+		redteamDownload: redteam.getInstallProgress(),
 	};
 }
 
@@ -863,6 +891,7 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
+	"/redteam.svg": { file: "redteam.svg", contentType: "image/svg+xml" },
 };
 
 function serveStatic(pathname: string, res: ServerResponse): boolean {
@@ -1066,6 +1095,32 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	}
 	if (pathname === "/api/officecli/progress" && req.method === "GET") {
 		sendJson(res, 200, officecli.getDownloadProgress());
+		return;
+	}
+	if (pathname === "/api/tools/redteam/install" && req.method === "POST") {
+		const progress = redteam.getInstallProgress();
+		if (progress.running) {
+			sendJson(res, 409, { error: "安装已在进行中" });
+			return;
+		}
+		// 异步安装，进度通过轮询 /api/tools/redteam/progress 获取
+		const started = redteam.startInstall(false);
+		if (started) {
+			// 安装成功后把红队包绑定到全部会话（每轮仍按需命中最小工具组）
+			void (async () => {
+				while (redteam.getInstallProgress().running) {
+					await new Promise((resolve) => setTimeout(resolve, 1000));
+				}
+				if (!redteam.getInstallProgress().error) {
+					activatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
+				}
+			})();
+		}
+		sendJson(res, 202, { ok: started });
+		return;
+	}
+	if (pathname === "/api/tools/redteam/progress" && req.method === "GET") {
+		sendJson(res, 200, redteam.getInstallProgress());
 		return;
 	}
 	if (pathname === "/api/office-preview/start" && req.method === "POST") {
