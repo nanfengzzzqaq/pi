@@ -372,9 +372,8 @@ function summarizeToolResult(result: unknown): string {
 	return text.length > 300 ? `${text.slice(0, 300)}…` : text;
 }
 
-/** 记录真正送入当前模型调用的工具定义，便于在客户端核对 token 优化是否生效。 */
-function activeToolSnapshot(session: AgentSession): ToolSnapshot {
-	const names = session.getActiveToolNames();
+/** 记录一组工具定义，便于实时显示及历史恢复时核对 token 优化是否生效。 */
+function toolSnapshot(session: AgentSession, names: string[]): ToolSnapshot {
 	const schemas = names.map((name) => {
 		const definition = session.getToolDefinition(name);
 		return {
@@ -391,6 +390,34 @@ function activeToolSnapshot(session: AgentSession): ToolSnapshot {
 		toolCount: names.length,
 		schemaBytes: Buffer.byteLength(serialized, "utf8"),
 		schemaFingerprint: createHash("sha256").update(serialized).digest("hex").slice(0, 12),
+	};
+}
+
+function activeToolSnapshot(session: AgentSession): ToolSnapshot {
+	return toolSnapshot(session, session.getActiveToolNames());
+}
+
+/**
+ * capability_search 是本地确定性路由，不属于 Pi 原生消息；切换会话时按当时的用户消息重新生成，
+ * 这样无需再次调用模型，也不会让实时执行过程在历史中消失。
+ */
+function historicalCapabilityTrace(
+	session: AgentSession,
+	text: string,
+	timestamp: number,
+	enabledPacks: Set<string>,
+): CapabilityTrace {
+	const selectedCapabilities = selectCapabilities(text, enabledPacks);
+	const selectedTools = new Map<string, Set<string>>();
+	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
+	const names = effectiveToolNames(enabledPacks, selectedTools);
+	return {
+		stepId: `history-capability-${timestamp}`,
+		stepName: "capability_search",
+		stepDisplayName: "查找可用能力（capability_search）",
+		enabledCapabilities: packSummaries(enabledPacks),
+		selectedCapabilities,
+		...toolSnapshot(session, names),
 	};
 }
 
@@ -604,7 +631,7 @@ interface HistoryItem {
 }
 
 /** 从 session.messages 生成消息快照（user/assistant 文本 + 工具调用记录），供页面刷新恢复 */
-function buildHistory(session: AgentSession): HistoryItem[] {
+function buildHistory(session: AgentSession, enabledPacks: Set<string>): HistoryItem[] {
 	const items: HistoryItem[] = [];
 	for (const message of session.messages) {
 		if (message.role === "user") {
@@ -625,7 +652,11 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 				parsed.text = `${parsed.text}${parsed.text ? "\n" : ""}[图片]`;
 			}
 			if (parsed.text || parsed.attachments.length > 0) {
-				items.push({ role: "user", text: parsed.text, attachments: parsed.attachments });
+				const item: HistoryItem = { role: "user", text: parsed.text, attachments: parsed.attachments };
+				if (enabledPacks.size > 0) {
+					item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
+				}
+				items.push(item);
 			}
 		} else if (message.role === "assistant") {
 			const text = message.content
@@ -642,6 +673,8 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 				.filter((call) => call !== undefined);
 			const item: HistoryItem = { role: "assistant", text };
 			if (toolCalls.length > 0) item.toolCalls = toolCalls;
+			item.usage = message.usage;
+			item.timestamp = message.timestamp;
 			if (message.stopReason === "error" && message.errorMessage) item.errorMessage = message.errorMessage;
 			if (text.trim() || toolCalls.length > 0 || item.errorMessage) items.push(item);
 		} else if (message.role === "toolResult") {
@@ -1610,7 +1643,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 200, {
 				sessionId: cs.sessionId,
 				streaming: cs.session.isStreaming,
-				messages: buildHistory(cs.session),
+				messages: buildHistory(cs.session, cs.enabledPacks),
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
