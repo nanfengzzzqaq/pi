@@ -375,14 +375,16 @@ function renderHistory(history) {
 	let latestAssistant = null;
 	for (const item of history.messages) {
 		if (item.role === "user") {
-			appendMessage("user", item.text);
+			if (latestAssistant) latestAssistant.foldProcess();
+			latestAssistant = null;
+			appendMessage("user", item.text || (item.attachments?.length ? `发送了 ${item.attachments.length} 个文件` : ""), item.attachments);
 		} else if (item.role === "assistant") {
-			const container = appendMessage("assistant", item.text || "");
+			const container = latestAssistant || appendMessage("assistant", "");
 			latestAssistant = container;
+			if (item.text) container.appendHistoryText(item.text);
 			if (Array.isArray(item.toolCalls)) {
-				// 历史恢复：工具块直接挂消息体（无执行过程容器）
 				for (const call of item.toolCalls) {
-					container.el.appendChild(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
+					container.addTool(appendToolBlock(call.id, call.displayName || call.name, call.args, "done"));
 					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
 					if (path) container.addArtifactPath(path);
 				}
@@ -399,6 +401,7 @@ function renderHistory(history) {
 			}
 		}
 	}
+	if (latestAssistant) latestAssistant.foldProcess();
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +482,7 @@ async function loadSessions() {
 			row.addEventListener("contextmenu", (e) => {
 				e.preventDefault();
 				e.stopPropagation(); // 阻止冒泡到 document 层，避免菜单被立即隐藏
-				showSessionContextMenu(e.clientX, e.clientY, session.id);
+				showSessionContextMenu(e.clientX, e.clientY, session.id, session.title);
 			});
 			sessionsListEl.appendChild(row);
 		}
@@ -539,19 +542,46 @@ async function deleteSession(id) {
 	}
 }
 
-/** 右键菜单：删除当前会话 */
-function showSessionContextMenu(x, y, id) {
+async function renameSession(id, currentTitle) {
+	const requested = window.prompt("请输入新的会话名称：", currentTitle || "");
+	if (requested === null) return;
+	const title = requested.replace(/\s+/g, " ").trim();
+	if (!title) {
+		showError("会话名称不能为空");
+		return;
+	}
+	try {
+		await api(`/api/sessions/${id}`, {
+			method: "PATCH",
+			body: JSON.stringify({ title }),
+		});
+		await loadSessions();
+		showInfo("会话名称已修改");
+	} catch (error) {
+		showError(`修改会话名称失败：${error.message}`);
+	}
+}
+
+/** 右键菜单：修改名称或删除会话 */
+function showSessionContextMenu(x, y, id, currentTitle) {
 	hideSessionContextMenu();
 	const menu = document.createElement("div");
 	menu.className = "session-context-menu";
-	const item = document.createElement("div");
-	item.className = "session-context-item danger";
-	item.textContent = "删除当前会话";
-	item.addEventListener("click", async () => {
+	const renameItem = document.createElement("div");
+	renameItem.className = "session-context-item";
+	renameItem.textContent = "修改会话名称";
+	renameItem.addEventListener("click", async () => {
+		hideSessionContextMenu();
+		await renameSession(id, currentTitle);
+	});
+	const deleteItem = document.createElement("div");
+	deleteItem.className = "session-context-item danger";
+	deleteItem.textContent = "删除当前会话";
+	deleteItem.addEventListener("click", async () => {
 		hideSessionContextMenu();
 		await deleteSession(id);
 	});
-	menu.appendChild(item);
+	menu.append(renameItem, deleteItem);
 	menu.style.left = `${x}px`;
 	menu.style.top = `${y}px`;
 	document.body.appendChild(menu);
@@ -730,15 +760,14 @@ function handleEvent(event) {
 				updateToolBlock(block, false, formatModelUsage(event.usage));
 				currentAssistant.addTool(block);
 			}
+			if (currentAssistant) void currentAssistant.finalizeArtifacts();
+			setIndicator(false);
+			break;
+		case "agent_settled":
 			if (currentAssistant) {
 				currentAssistant.foldProcess();
 				void currentAssistant.finalizeArtifacts();
 			}
-			currentAssistant = null;
-			setIndicator(false);
-			break;
-		case "agent_settled":
-			if (currentAssistant) currentAssistant.foldProcess();
 			setRunning(false);
 			setIndicator(false);
 			break;
@@ -761,7 +790,10 @@ function handleEvent(event) {
 		case "error":
 			showError(event.message || "发生错误");
 			setIndicator(false);
-			if (!event.fatal) setRunning(false);
+			if (!event.fatal) {
+				if (currentAssistant) currentAssistant.foldProcess();
+				setRunning(false);
+			}
 			break;
 	}
 }
@@ -880,7 +912,7 @@ function renderArtifactCards(container, files) {
 	}
 }
 
-function appendMessage(role, text) {
+function appendMessage(role, text, attachmentPaths = []) {
 	messagesEmptyEl.hidden = true;
 	const messageSessionId = sessionId;
 	const wrap = document.createElement("div");
@@ -929,11 +961,28 @@ function appendMessage(role, text) {
 	artifactsEl.className = "message-artifacts";
 	artifactsEl.hidden = true;
 	if (role === "assistant") bubble.appendChild(artifactsEl);
+	const sentAttachmentsEl = document.createElement("div");
+	sentAttachmentsEl.className = "message-artifacts sent-attachments";
+	sentAttachmentsEl.hidden = true;
+	if (role === "user" && attachmentPaths.length > 0) bubble.appendChild(sentAttachmentsEl);
 
 	wrap.appendChild(bubble);
 	messagesEl.appendChild(wrap);
 	applyCollapse();
 	scrollToBottom();
+	if (role === "user" && attachmentPaths.length > 0 && messageSessionId) {
+		void api(`/api/sessions/${messageSessionId}/artifacts`, {
+			method: "POST",
+			body: JSON.stringify({ paths: attachmentPaths }),
+		})
+			.then((result) => {
+				renderArtifactCards(sentAttachmentsEl, result.files);
+				scrollToBottom();
+			})
+			.catch(() => {
+				// 附件被移动或删除时保留消息正文，不阻断历史恢复。
+			});
+	}
 
 	return {
 		el: bubble,
@@ -1060,6 +1109,11 @@ function appendMessage(role, text) {
 				renderMarkdownInto(this.textEl, this._textBuffer, { streaming: true });
 				scrollToBottom();
 			}, 60);
+		},
+		appendHistoryText(value) {
+			const separator = this._textBuffer && value ? "\n\n" : "";
+			this._textBuffer = `${this._textBuffer ?? ""}${separator}${value}`;
+			renderMarkdownInto(this.textEl, this._textBuffer);
 		},
 		appendThinking(delta) {
 			this._appendThinking(delta);
@@ -1679,33 +1733,34 @@ window.addEventListener("paste", (e) => {
 async function sendMessage() {
 	const text = inputEl.value.trim();
 	if ((!text && pendingAttachments.length === 0) || running || !sessionId) return;
+	const attachmentsToSend = [...pendingAttachments];
 	inputEl.value = "";
 	resizeComposerInput();
 	errorBarEl.hidden = true;
-	appendMessage("user", text || `发送了 ${pendingAttachments.length} 个文件`);
 	setRunning(true);
 	setIndicator(true, "思考中…");
 
 	try {
 		const images = [];
-		for (const attachment of pendingAttachments) {
+		for (const attachment of attachmentsToSend) {
 			if (attachment.isImage) images.push({ data: attachment.dataBase64, mimeType: attachment.mimeType });
 		}
-		let attachmentLine = "";
-		if (pendingAttachments.length > 0) {
+		let savedPaths = [];
+		if (attachmentsToSend.length > 0) {
 			const saved = await api(`/api/sessions/${sessionId}/files`, {
 				method: "POST",
 				body: JSON.stringify({
-					files: pendingAttachments.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })),
+					files: attachmentsToSend.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })),
 				}),
 			});
+			savedPaths = saved.files;
 			pendingAttachments = [];
 			renderAttachments();
-			attachmentLine = `\n[附件: ${saved.files.join(", ")}]`;
 		}
+		appendMessage("user", text || `发送了 ${attachmentsToSend.length} 个文件`, savedPaths);
 		await api(`/api/sessions/${sessionId}/messages`, {
 			method: "POST",
-			body: JSON.stringify({ text: text + attachmentLine, images }),
+			body: JSON.stringify({ text, images, attachments: savedPaths }),
 		});
 		loadSessions(); // 首条消息后标题更新，刷新左侧对话列表
 	} catch (error) {
