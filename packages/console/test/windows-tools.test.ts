@@ -1,7 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { getWindowsPowerShellPath, instantiateWindowsTools } from "../src/windows-tools.ts";
+import {
+	bundledWindowsRuntimeCandidates,
+	getWindowsPowerShellPath,
+	instantiateWindowsTools,
+} from "../src/windows-tools.ts";
 
 describe("Windows 原生命令工具", () => {
+	it.runIf(process.platform === "win32")("安装版优先读取 app.asar.unpacked 物理目录", () => {
+		expect(bundledWindowsRuntimeCandidates("C:\\PiConsole\\resources\\app.asar")).toEqual([
+			"C:\\PiConsole\\resources\\app.asar.unpacked\\data\\runtime\\mingit",
+			"C:\\PiConsole\\resources\\app.asar\\data\\runtime\\mingit",
+		]);
+	});
+
 	it.runIf(process.platform === "win32")("使用系统 PowerShell 的绝对路径", () => {
 		const path = getWindowsPowerShellPath();
 		expect(path).toMatch(/^[A-Za-z]:\\.*\\powershell\.exe$/i);
