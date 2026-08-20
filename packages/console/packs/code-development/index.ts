@@ -75,6 +75,34 @@ export default function definePack(ctx: PackContext) {
 			},
 		},
 		{
+			name: "git_log",
+			label: "查看提交历史",
+			description: "查看提交历史：默认最近 20 条，可指定分支、作者、文件路径或关键词搜索。",
+			parameters: Type.Object({
+				limit: Type.Optional(Type.Number({ description: "返回的提交数量，默认 20，最大 200" })),
+				branch: Type.Optional(Type.String({ description: "可选的分支、标签或修订范围" })),
+				path: Type.Optional(Type.String({ description: "可选：只看某个文件的提交" })),
+				grep: Type.Optional(Type.String({ description: "可选：按提交说明关键词过滤" })),
+				author: Type.Optional(Type.String({ description: "可选：按作者过滤" })),
+			}),
+			execute: async (_id, params) => {
+				const limit = Math.max(1, Math.min(Math.round(params.limit ?? 20), 200));
+				const args = [
+					"log",
+					`--max-count=${limit}`,
+					"--date=format-local:%Y-%m-%d %H:%M",
+					"--pretty=format:%h %ad %an%d%n%s%n",
+				];
+				if (params.branch?.trim()) args.push(params.branch.trim());
+				if (params.grep?.trim()) args.push(`--grep=${params.grep.trim()}`, "-i");
+				if (params.author?.trim()) args.push(`--author=${params.author.trim()}`);
+				args.push("--");
+				if (params.path?.trim()) args.push(params.path.trim());
+				const output = await runGit(args, cwd());
+				return textResult(output === "（无输出）" ? "没有匹配的提交" : output);
+			},
+		},
+		{
 			name: "git_commit",
 			label: "提交代码",
 			description: "只暂存指定文件并创建 Git 提交；不会自动推送。只有用户明确要求提交时使用。",
@@ -145,29 +173,125 @@ export default function definePack(ctx: PackContext) {
 		{
 			name: "github_pull_request",
 			label: "管理拉取请求",
-			description: "列出、创建拉取请求或查看当前分支的自动化检查。",
+			description:
+				"列出、查看、创建、评论、关闭或合并拉取请求；创建时默认草稿，合并属于不可逆操作，只在用户明确要求时执行。",
 			parameters: Type.Object({
-				action: Type.Union([Type.Literal("list"), Type.Literal("create"), Type.Literal("checks")]),
+				action: Type.Union([
+					Type.Literal("list"),
+					Type.Literal("view"),
+					Type.Literal("create"),
+					Type.Literal("comment"),
+					Type.Literal("close"),
+					Type.Literal("merge"),
+					Type.Literal("checks"),
+				]),
+				number: Type.Optional(Type.Number({ description: "查看、评论、关闭或合并时的拉取请求编号" })),
 				title: Type.Optional(Type.String({ description: "创建拉取请求时的标题" })),
-				body: Type.Optional(Type.String({ description: "创建拉取请求时的说明" })),
+				body: Type.Optional(Type.String({ description: "创建时的说明或评论内容" })),
 				base: Type.Optional(Type.String({ description: "目标分支" })),
+				head: Type.Optional(Type.String({ description: "创建时指定的来源分支，默认当前分支" })),
 				draft: Type.Optional(Type.Boolean({ description: "是否创建草稿，默认是" })),
+				mergeMethod: Type.Optional(
+					Type.Union([
+						Type.Literal("merge"),
+						Type.Literal("squash"),
+						Type.Literal("rebase"),
+					]),
+				),
 			}),
 			execute: async (_id, params) => {
-				if (params.action === "list") return textResult(await runGithub(["pr", "list", "--json", "number,title,state,url,headRefName,baseRefName"], cwd()));
+				if (params.action === "list")
+					return textResult(
+						await runGithub(["pr", "list", "--json", "number,title,state,url,headRefName,baseRefName"], cwd()),
+					);
 				if (params.action === "checks") return textResult(await runGithub(["pr", "checks"], cwd()));
-				if (!params.title?.trim()) throw new Error("创建拉取请求时必须提供标题");
-				const args = [
-					"pr",
-					"create",
-					"--title",
-					params.title,
-					"--body",
-					params.body || "",
-					...(params.base ? ["--base", params.base] : []),
-					...(params.draft === false ? [] : ["--draft"]),
-				];
-				return textResult(await runGithub(args, cwd()));
+				if (params.action === "create") {
+					// 未提供标题时用当前分支最新提交的说明，减少来回确认。
+					let title = params.title?.trim() || "";
+					if (!title) {
+						const lastCommit = await runGit(["log", "-1", "--pretty=%s"], cwd());
+						if (lastCommit !== "（无输出）") title = lastCommit.trim();
+					}
+					if (!title) throw new Error("创建拉取请求时必须提供标题（或先在分支上产生提交）");
+					const args = [
+						"pr",
+						"create",
+						"--title",
+						title,
+						"--body",
+						params.body || "",
+						...(params.base ? ["--base", params.base] : []),
+						...(params.head ? ["--head", params.head] : []),
+						...(params.draft === false ? [] : ["--draft"]),
+					];
+					return textResult(await runGithub(args, cwd()));
+				}
+				if (!params.number || params.number <= 0) throw new Error("此操作必须提供拉取请求编号（number）");
+				if (params.action === "view")
+					return textResult(
+						await runGithub(["pr", "view", String(params.number), "--json", "number,title,state,url,body,headRefName,baseRefName"], cwd()),
+					);
+				if (params.action === "comment") {
+					if (!params.body?.trim()) throw new Error("评论时必须提供内容（body）");
+					return textResult(await runGithub(["pr", "comment", String(params.number), "--body", params.body], cwd()));
+				}
+				if (params.action === "close")
+					return textResult(await runGithub(["pr", "close", String(params.number)], cwd()));
+				const method = params.mergeMethod ?? "squash";
+				return textResult(
+					await runGithub(["pr", "merge", String(params.number), `--${method}`], cwd()),
+				);
+			},
+		},
+		{
+			name: "github_issue",
+			label: "管理仓库议题",
+			description:
+				"列出、查看、创建或评论 GitHub 议题（issue）。议题标题支持 [bug]/[feat] 前缀标记类型。",
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("list"), Type.Literal("view"), Type.Literal("create"), Type.Literal("comment")]),
+				repository: Type.Optional(Type.String({ description: "可选的 owner/repo；默认当前仓库" })),
+				number: Type.Optional(Type.Number({ description: "查看或评论时的议题编号" })),
+				title: Type.Optional(Type.String({ description: "创建议题时的标题" })),
+				body: Type.Optional(Type.String({ description: "创建时的说明或评论内容" })),
+				labels: Type.Optional(Type.Array(Type.String()), { description: "创建时附加的标签" }),
+			}),
+			execute: async (_id, params) => {
+				const repoArgs = params.repository?.trim() ? ["--repo", params.repository.trim()] : [];
+				if (params.action === "list") {
+					return textResult(
+						await runGithub(
+							["issue", "list", "--limit", "50", "--json", "number,title,state,url,labels", ...repoArgs],
+							cwd(),
+						),
+					);
+				}
+				if (params.action === "create") {
+					if (!params.title?.trim()) throw new Error("创建议题时必须提供标题");
+					const args = [
+						"issue",
+						"create",
+						"--title",
+						params.title,
+						"--body",
+						params.body || "",
+						...repoArgs,
+					];
+					for (const label of params.labels ?? []) {
+						if (label.trim()) args.push("--label", label.trim());
+					}
+					return textResult(await runGithub(args, cwd()));
+				}
+				if (!params.number || params.number <= 0) throw new Error("查看或评论议题时必须提供编号（number）");
+				if (params.action === "view") {
+					return textResult(
+						await runGithub(["issue", "view", String(params.number), "--json", "number,title,state,url,body,labels", ...repoArgs], cwd()),
+					);
+				}
+				if (!params.body?.trim()) throw new Error("评论议题时必须提供内容（body）");
+				return textResult(
+					await runGithub(["issue", "comment", String(params.number), "--body", params.body, ...repoArgs], cwd()),
+				);
 			},
 		},
 		{
