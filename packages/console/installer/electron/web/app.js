@@ -54,6 +54,9 @@ const fsRefreshBtnEl = $("fs-refresh");
 const fsUpBtnEl = $("fs-up");
 const fsPathInputEl = $("fs-path-input");
 const fsPathGoBtnEl = $("fs-path-go");
+const fsSearchModeEl = $("fs-search-mode");
+const fsSearchInputEl = $("fs-search-input");
+const fsSearchClearEl = $("fs-search-clear");
 const fsLocationStateEl = $("fs-location-state");
 const fsWorkspacePathEl = $("fs-workspace-path");
 const fsSetWorkspaceBtnEl = $("fs-set-workspace");
@@ -116,6 +119,7 @@ let catalogMode = "tools";
 let catalogFilter = "全部";
 let officeInstallTimer = null;
 let redTeamInstallTimer = null;
+const managedInstallTimers = new Map();
 let codexOAuthTimer = null;
 let officePreview = null;
 let officePreviewRequest = 0;
@@ -123,6 +127,7 @@ const officeToolCalls = new Map();
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
 const OFFICE_FILE_RE = /\.(?:docx|xlsx|pptx)$/i;
+const TEXT_FILE_RE = /\.(?:bat|c|cc|cfg|cmd|conf|cpp|cs|css|csv|env|go|gql|graphql|h|hpp|htm|html|ini|java|js|json|json5|jsonl|jsx|kt|kts|less|log|lua|md|mdx|mjs|php|properties|ps1|psm1|py|pyw|rb|rs|rst|scss|sh|sql|svelte|swift|tex|toml|ts|tsv|tsx|txt|vue|xml|yaml|yml|zsh)$/i;
 const DELIVERABLE_FILE_RE = /\.[A-Za-z0-9]{1,16}$/i;
 
 // ---------------------------------------------------------------------------
@@ -1972,6 +1977,11 @@ async function refreshCatalog() {
 	if (catalogCache.redteamDownload?.running && !redTeamInstallTimer) {
 		redTeamInstallTimer = setInterval(() => void pollRedTeamInstall(), 1500);
 	}
+	for (const [id, progress] of Object.entries(catalogCache.toolProgress || {})) {
+		if (progress?.running && !managedInstallTimers.has(id)) {
+			managedInstallTimers.set(id, setInterval(() => void pollManagedToolInstall(id), 900));
+		}
+	}
 }
 
 async function openCatalog(mode) {
@@ -2031,7 +2041,7 @@ function catalogMatches(item, query) {
 		.includes(query);
 }
 
-function createCatalogIcon(kind, icon) {
+function createCatalogIcon(kind, icon, iconText) {
 	const wrap = document.createElement("div");
 	wrap.className = `catalog-card-icon ${String(kind || "").toLocaleLowerCase("en-US")}`;
 	if (icon) {
@@ -2039,6 +2049,8 @@ function createCatalogIcon(kind, icon) {
 		image.src = icon;
 		image.alt = "";
 		wrap.appendChild(image);
+	} else if (iconText) {
+		wrap.textContent = iconText;
 	} else {
 		wrap.textContent = kind === "PowerPoint" ? "P" : kind === "Excel" ? "X" : "W";
 	}
@@ -2048,7 +2060,7 @@ function createCatalogIcon(kind, icon) {
 function createCard(item, options) {
 	const card = document.createElement("article");
 	card.className = "catalog-card";
-	card.appendChild(createCatalogIcon(options.kind, options.icon));
+	card.appendChild(createCatalogIcon(options.kind, options.icon, options.iconText));
 	const main = document.createElement("div");
 	main.className = "catalog-card-main";
 	const titleRow = document.createElement("div");
@@ -2101,14 +2113,18 @@ function createCard(item, options) {
 }
 
 function installDispatcher(tool) {
-	return tool.id === "redteam" ? installRedTeam : installOfficeCli;
+	if (tool.id === "officecli") return installOfficeCli;
+	if (tool.id === "redteam") return installRedTeam;
+	return (button) => installManagedTool(tool, button);
 }
 
 async function uninstallTool(tool, button) {
 	const extra =
 		tool.id === "officecli"
 			? "同时会删除客户端安装的 OfficeCLI 官方技能；已生成的文档不会删除。"
-			: "已生成的红队配置和工作区报告不会删除。";
+			: tool.id === "redteam"
+				? "已生成的红队配置和工作区报告不会删除。"
+				: "只删除 Pi 私有目录中的工具文件，不影响电脑上已安装的软件或工作区文件。";
 	if (!window.confirm(`卸载 ${tool.displayName}？\n\n${extra}`)) return;
 	button.disabled = true;
 	button.textContent = "卸载中…";
@@ -2132,7 +2148,12 @@ function installDuration(elapsedMs) {
 }
 
 function installUi(tool) {
-	const progress = tool.id === "redteam" ? catalogCache?.redteamDownload : catalogCache?.download;
+	const progress =
+		tool.id === "officecli"
+			? catalogCache?.download
+			: tool.id === "redteam"
+				? catalogCache?.redteamDownload
+				: catalogCache?.toolProgress?.[tool.id];
 	if (!progress?.running) return { installing: false, installText: "安装", installTitle: "" };
 	if (tool.id === "redteam") {
 		const elapsed = installDuration(progress.elapsedMs);
@@ -2147,8 +2168,8 @@ function installUi(tool) {
 		: null;
 	return {
 		installing: true,
-		installText: percent === null ? "下载中…" : `下载中 ${percent}%`,
-		installTitle: "正在下载并校验 OfficeCLI",
+		installText: percent === null ? "安装中…" : `安装中 ${percent}%`,
+		installTitle: progress.log || `正在安装 ${tool.displayName}`,
 	};
 }
 
@@ -2156,6 +2177,7 @@ function renderTools(query) {
 	const tools = (catalogCache?.tools || []).filter((tool) => {
 		if (catalogFilter === "已安装" && !tool.installed) return false;
 		if (catalogFilter === "文档办公" && tool.category !== "文档办公") return false;
+		if (catalogFilter === "文件处理" && tool.category !== "文件处理") return false;
 		if (catalogFilter === "安全测试" && tool.category !== "安全测试") return false;
 		return catalogMatches(tool, query);
 	});
@@ -2167,6 +2189,7 @@ function renderTools(query) {
 			createCard(tool, {
 				kind: "tool",
 				icon: tool.icon,
+				iconText: tool.iconText,
 				onOpen: () => openToolDetail(tool),
 				onInstall: installDispatcher(tool),
 				onUninstall: (button) => uninstallTool(tool, button),
@@ -2235,7 +2258,9 @@ function renderCatalog() {
 	catalogSearchInputEl.placeholder = toolsMode ? "搜索工具" : "搜索技能";
 	catalogToolsTabEl.classList.toggle("active", toolsMode);
 	catalogSkillsTabEl.classList.toggle("active", !toolsMode);
-	renderCatalogFilters(toolsMode ? ["全部", "已安装", "文档办公", "安全测试"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"]);
+	renderCatalogFilters(
+		toolsMode ? ["全部", "已安装", "文件处理", "文档办公", "安全测试"] : ["全部", "已安装", "Word", "PowerPoint", "Excel"],
+	);
 	catalogContentEl.innerHTML = "";
 	const query = catalogSearchInputEl.value.trim().toLocaleLowerCase("zh-CN");
 	if (toolsMode) renderTools(query);
@@ -2323,6 +2348,55 @@ async function pollRedTeamInstall() {
 		clearInterval(redTeamInstallTimer);
 		redTeamInstallTimer = null;
 		showError(`读取红队引擎安装进度失败：${error.message}`);
+	}
+}
+
+async function installManagedTool(tool, button) {
+	button.disabled = true;
+	button.textContent = "准备安装…";
+	try {
+		await api(`/api/tools/${tool.id}/install`, { method: "POST", body: "{}" });
+		showInfo(`${tool.displayName} 正在从官方来源下载并安装到 Pi 私有目录`);
+		const oldTimer = managedInstallTimers.get(tool.id);
+		if (oldTimer) clearInterval(oldTimer);
+		managedInstallTimers.set(tool.id, setInterval(() => void pollManagedToolInstall(tool.id), 900));
+		await pollManagedToolInstall(tool.id);
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "安装";
+		showError(`${tool.displayName} 安装失败：${error.message}`);
+	}
+}
+
+async function pollManagedToolInstall(id) {
+	try {
+		const progress = await api(`/api/tools/${id}/progress`);
+		if (catalogCache) {
+			catalogCache.toolProgress ||= {};
+			catalogCache.toolProgress[id] = progress;
+		}
+		if (progress.running) {
+			renderCatalog();
+			return;
+		}
+		const timer = managedInstallTimers.get(id);
+		if (timer) clearInterval(timer);
+		managedInstallTimers.delete(id);
+		if (progress.error) {
+			showError(`工具安装失败：${progress.error}`);
+			await refreshCatalog();
+			return;
+		}
+		const toolName = catalogCache?.tools?.find((tool) => tool.id === id)?.displayName || id;
+		closeDrawer();
+		await refreshCatalog();
+		await loadSessions();
+		showInfo(`${toolName} 已安装${progress.version ? `，版本 ${progress.version}` : ""}`);
+	} catch (error) {
+		const timer = managedInstallTimers.get(id);
+		if (timer) clearInterval(timer);
+		managedInstallTimers.delete(id);
+		showError(`读取工具安装进度失败：${error.message}`);
 	}
 }
 
@@ -2415,7 +2489,9 @@ function openToolDetail(tool) {
 			? installState.installText
 			: tool.id === "redteam"
 				? "安装红队引擎"
-				: "安装 OfficeCLI";
+				: tool.id === "officecli"
+					? "安装 OfficeCLI"
+					: `安装${tool.displayName}`;
 		install.disabled = installState.installing;
 		install.title = installState.installTitle;
 		install.addEventListener("click", () => installDispatcher(tool)(install));
@@ -2507,6 +2583,7 @@ function renderSessionCapabilities(capabilities) {
 let fsRoots = [];
 let currentFsPath = null; // 内置 Windows 资源管理器当前浏览目录
 let currentFsParent = null;
+let fsSearchTimer = null;
 
 async function loadFsRoots(preferredPath = currentFsPath) {
 	try {
@@ -2655,6 +2732,7 @@ storageMigrateBtnEl.addEventListener("click", async () => {
 
 async function loadFsDir(path) {
 	try {
+		fsSearchInputEl.value = "";
 		const result = await api(`/api/fs/list?path=${encodeURIComponent(path)}`);
 		currentFsPath = result.path;
 		currentFsParent = result.parent;
@@ -2679,6 +2757,65 @@ async function loadFsDir(path) {
 	} catch (error) {
 		fsTreeEl.textContent = `加载失败：${error.message}`;
 	}
+}
+
+async function runFsSearch() {
+	const query = fsSearchInputEl.value.trim();
+	if (!query || !currentFsPath) {
+		if (currentFsPath) await loadFsDir(currentFsPath);
+		return;
+	}
+	fsTreeEl.textContent = "正在本地搜索…";
+	try {
+		const mode = fsSearchModeEl.value === "content" ? "content" : "name";
+		const result = await api(
+			`/api/fs/search?path=${encodeURIComponent(currentFsPath)}&q=${encodeURIComponent(query)}&mode=${mode}`,
+		);
+		fsTreeEl.innerHTML = "";
+		fsLocationStateEl.textContent = `本地搜索 · 找到 ${result.results.length} 项${result.truncated ? "（结果已截断）" : ""}`;
+		if (result.results.length === 0) {
+			fsTreeEl.textContent = "没有找到匹配文件";
+			return;
+		}
+		for (const entry of result.results) fsTreeEl.appendChild(createFsSearchRow(entry));
+	} catch (error) {
+		fsTreeEl.textContent = `搜索失败：${error.message}`;
+	}
+}
+
+function createFsSearchRow(entry) {
+	const row = document.createElement("div");
+	row.className = `fs-row${entry.isWorkspace ? " workspace-item" : ""}`;
+	row.dataset.path = entry.path;
+	row.dataset.type = "file";
+	row.dataset.name = entry.name;
+	row.draggable = true;
+	row.title = "双击预览；可拖入对话或拖到桌面";
+	const icon = document.createElement("span");
+	icon.className = "fs-icon";
+	icon.textContent = "📄";
+	const detail = document.createElement("span");
+	detail.className = "fs-search-detail";
+	const name = document.createElement("span");
+	name.className = "fs-name";
+	name.textContent = entry.name;
+	const path = document.createElement("span");
+	path.className = "fs-search-path";
+	path.textContent = entry.path;
+	detail.append(name, path);
+	if (entry.preview) {
+		const preview = document.createElement("span");
+		preview.className = "fs-search-preview";
+		preview.textContent = `${entry.line ? `第 ${entry.line} 行 · ` : ""}${entry.preview}`;
+		detail.appendChild(preview);
+	}
+	const size = document.createElement("span");
+	size.className = "fs-size";
+	size.textContent = formatSize(entry.size);
+	row.append(icon, detail, size);
+	row.addEventListener("dblclick", () => void openFilePreview(entry.path, entry.name, "file"));
+	row.addEventListener("dragstart", (event) => startPathDrag(event, entry.path));
+	return row;
 }
 
 function createFsRow(directory, entry) {
@@ -2718,7 +2855,8 @@ fsRootSelectEl.addEventListener("change", () => {
 	if (fsRootSelectEl.value) loadFsDir(fsRootSelectEl.value);
 });
 fsRefreshBtnEl.addEventListener("click", () => {
-	if (currentFsPath) void loadFsDir(currentFsPath);
+	if (fsSearchInputEl.value.trim()) void runFsSearch();
+	else if (currentFsPath) void loadFsDir(currentFsPath);
 });
 fsUpBtnEl.addEventListener("click", () => {
 	if (currentFsParent) void loadFsDir(currentFsParent);
@@ -2731,6 +2869,17 @@ fsPathInputEl.addEventListener("keydown", (event) => {
 		event.preventDefault();
 		if (fsPathInputEl.value.trim()) void loadFsDir(fsPathInputEl.value.trim());
 	}
+});
+fsSearchInputEl.addEventListener("input", () => {
+	if (fsSearchTimer) clearTimeout(fsSearchTimer);
+	fsSearchTimer = setTimeout(() => void runFsSearch(), 300);
+});
+fsSearchModeEl.addEventListener("change", () => {
+	if (fsSearchInputEl.value.trim()) void runFsSearch();
+});
+fsSearchClearEl.addEventListener("click", () => {
+	fsSearchInputEl.value = "";
+	if (currentFsPath) void loadFsDir(currentFsPath);
 });
 
 async function copyDroppedFilesToCurrentDirectory(dataTransfer) {
@@ -2813,9 +2962,39 @@ async function openFilePreview(path, name, source = "file") {
 			await openOfficePreview(path, source);
 			return;
 		}
+		const shownName = name || path.split(/[\\/]/).pop() || "文件预览";
+		if (/\.pdf$/i.test(path)) {
+			if (!catalogCache) catalogCache = await api("/api/catalog");
+			const token = localStorage.getItem(TOKEN_KEY);
+			const rawUrl = `/api/fs/raw?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
+			const pdfJsInstalled = catalogCache?.tools?.some((tool) => tool.id === "pdfjs" && tool.installed);
+			previewFile = { path, name: shownName, mimeType: "application/pdf", size: 0, isImage: false };
+			previewTitleEl.textContent = `${shownName}${pdfJsInstalled ? " · PDF.js" : " · 浏览器预览"}`;
+			previewContentEl.innerHTML = "";
+			const frame = document.createElement("iframe");
+			frame.className = "preview-document";
+			frame.src = pdfJsInstalled ? `/pdfjs/web/viewer.html?file=${encodeURIComponent(rawUrl)}` : rawUrl;
+			frame.title = `${shownName} PDF 预览`;
+			previewContentEl.appendChild(frame);
+			previewModalEl.hidden = false;
+			return;
+		}
+		if (TEXT_FILE_RE.test(path)) {
+			const file = await api(`/api/fs/text?path=${encodeURIComponent(path)}`);
+			previewFile = { path, name: shownName, mimeType: file.mimeType, size: file.size, isImage: false };
+			previewTitleEl.textContent = `${shownName} · ${file.encoding}`;
+			previewContentEl.innerHTML = "";
+			const pre = document.createElement("pre");
+			pre.className = "preview-text";
+			pre.textContent = file.text;
+			previewContentEl.appendChild(pre);
+			previewModalEl.hidden = false;
+			return;
+		}
 		const file = await api(`/api/fs/read?path=${encodeURIComponent(path)}`);
 		previewFile = {
-			name: name || path.split(/[\\/]/).pop() || "文件预览",
+			path,
+			name: shownName,
 			mimeType: file.mimeType,
 			dataBase64: file.dataBase64,
 			size: file.size,
@@ -2829,18 +3008,6 @@ async function openFilePreview(path, name, source = "file") {
 			img.src = `data:${previewFile.mimeType};base64,${previewFile.dataBase64}`;
 			img.className = "preview-image";
 			previewContentEl.appendChild(img);
-		} else if (file.mimeType.startsWith("text/") || file.mimeType.includes("json") || file.mimeType.includes("javascript")) {
-			const pre = document.createElement("pre");
-			pre.className = "preview-text";
-			pre.textContent = decodeBase64(previewFile.dataBase64);
-			previewContentEl.appendChild(pre);
-		} else if (file.mimeType === "application/pdf") {
-			previewObjectUrl = base64ObjectUrl(previewFile.dataBase64, previewFile.mimeType);
-			const frame = document.createElement("iframe");
-			frame.className = "preview-document";
-			frame.src = previewObjectUrl;
-			frame.title = `${previewFile.name} PDF 预览`;
-			previewContentEl.appendChild(frame);
 		} else {
 			const empty = document.createElement("div");
 			empty.className = "context-empty";
@@ -2872,12 +3039,20 @@ previewCloseEl.addEventListener("click", closeFilePreview);
 previewModalEl.addEventListener("click", (e) => {
 	if (e.target === previewModalEl) closeFilePreview();
 });
-previewAttachBtnEl.addEventListener("click", () => {
+previewAttachBtnEl.addEventListener("click", async () => {
 	if (!previewFile) return;
-	pendingAttachments.push({ ...previewFile });
-	renderAttachments();
-	closeFilePreview();
-	showInfo("已添加到对话附件");
+	const file = previewFile;
+	if (file.dataBase64) {
+		pendingAttachments.push({ ...file });
+		renderAttachments();
+		closeFilePreview();
+		showInfo("已添加到对话附件");
+		return;
+	}
+	if (file.path) {
+		closeFilePreview();
+		await attachPathLink(file.path);
+	}
 });
 
 // ---------------------------------------------------------------------------

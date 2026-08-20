@@ -89,6 +89,9 @@ function availableBuiltinToolNames(): string[] {
 		...(hasUsableBash() ? ["bash"] : []),
 		"edit",
 		"write",
+		"grep",
+		"find",
+		"ls",
 		...(isWindowsPowerShellAvailable() ? ["powershell"] : []),
 	];
 }
@@ -99,6 +102,9 @@ const BUILTIN_TOOL_LABELS: Record<string, string> = {
 	edit: "编辑文件",
 	powershell: "运行 Windows 命令",
 	write: "写入文件",
+	grep: "搜索文件内容",
+	find: "查找文件",
+	ls: "浏览目录",
 };
 
 const PACKS_DIR = join(import.meta.dirname, "..", "packs");

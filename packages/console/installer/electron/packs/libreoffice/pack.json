@@ -1,0 +1,21 @@
+{
+	"name": "legacy-documents",
+	"displayName": "兼容文档转换",
+	"description": "使用私有 LibreOffice 转换旧版 Office 与 OpenDocument 文件",
+	"version": "1.0.0",
+	"activation": {
+		"extensions": [".doc", ".xls", ".ppt", ".odt", ".ods", ".odp", ".rtf"],
+		"keywords": ["旧版文档", "OpenDocument", "兼容转换", "转换为 PDF", "格式转换"],
+		"minimumScore": 2,
+		"defaultGroups": ["convert"]
+	},
+	"toolGroups": [
+		{
+			"name": "convert",
+			"displayName": "兼容转换",
+			"description": "转换旧版 Office 与 OpenDocument 格式",
+			"tools": ["document_convert"],
+			"keywords": ["转换", "兼容", "导出", "PDF", "旧版", "OpenDocument"]
+		}
+	]
+}

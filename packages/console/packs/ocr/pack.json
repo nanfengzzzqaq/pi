@@ -1,0 +1,21 @@
+{
+	"name": "image-ocr",
+	"displayName": "图片文字识别",
+	"description": "使用私有 Tesseract OCR 识别图片中的中英文文字",
+	"version": "1.0.0",
+	"activation": {
+		"extensions": [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"],
+		"keywords": ["OCR", "文字识别", "识别图片", "扫描件", "提取文字"],
+		"minimumScore": 2,
+		"defaultGroups": ["recognize"]
+	},
+	"toolGroups": [
+		{
+			"name": "recognize",
+			"displayName": "识别文字",
+			"description": "从图片中提取中英文文字",
+			"tools": ["ocr_extract_text"],
+			"keywords": ["OCR", "识别", "文字", "扫描件", "提取"]
+		}
+	]
+}

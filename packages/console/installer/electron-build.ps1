@@ -85,6 +85,41 @@ if (-not (Test-Path -LiteralPath $BusyBoxPath) -or -not (Test-Path -LiteralPath 
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BundledMinGitDir "pi-runtime.json") -Encoding utf8
 Write-Host "已预置 Pi 私有 Bash/Git：Git for Windows MinGit $MinGitVersion"
 
+# 2.7 预置 Pi 官方 grep/find 所需的 rg/fd。只复制到私有 agent/bin，
+# 不修改系统 PATH，也不覆盖电脑已有的同名命令。
+$BundledAgentBin = Join-Path $ElectronDir "data\agent\bin"
+if (Test-Path -LiteralPath $BundledAgentBin) { Remove-Item -LiteralPath $BundledAgentBin -Recurse -Force }
+New-Item -ItemType Directory -Path $BundledAgentBin -Force | Out-Null
+$SearchTools = @(
+    @{
+        Name = "rg.exe"
+        Version = "15.2.0"
+        Url = "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip"
+        Sha256 = "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5"
+        Inner = "ripgrep-15.2.0-x86_64-pc-windows-msvc\rg.exe"
+    },
+    @{
+        Name = "fd.exe"
+        Version = "10.4.2"
+        Url = "https://github.com/sharkdp/fd/releases/download/v10.4.2/fd-v10.4.2-x86_64-pc-windows-msvc.zip"
+        Sha256 = "b2816e506390a89941c63c9187d58a3cc10e9a55f2ef0685f9ea0eccaf7c98c8"
+        Inner = "fd-v10.4.2-x86_64-pc-windows-msvc\fd.exe"
+    }
+)
+foreach ($Tool in $SearchTools) {
+    $Archive = Join-Path $env:TEMP "pi-console-$($Tool.Name)-$($Tool.Version).zip"
+    $Ready = Test-Path -LiteralPath $Archive
+    if ($Ready) { $Ready = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant() -eq $Tool.Sha256 }
+    if (-not $Ready) { Invoke-WebRequest -UseBasicParsing -Uri $Tool.Url -OutFile $Archive }
+    $Actual = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Actual -ne $Tool.Sha256) { throw "$($Tool.Name) 校验失败：期望 $($Tool.Sha256)，实际 $Actual" }
+    $Extracted = Join-Path $env:TEMP "pi-console-$($Tool.Name)-$($Tool.Version)"
+    if (Test-Path -LiteralPath $Extracted) { Remove-Item -LiteralPath $Extracted -Recurse -Force }
+    Expand-Archive -LiteralPath $Archive -DestinationPath $Extracted -Force
+    Copy-Item -LiteralPath (Join-Path $Extracted $Tool.Inner) (Join-Path $BundledAgentBin $Tool.Name)
+    Write-Host "已预置文件搜索工具：$($Tool.Name) $($Tool.Version)"
+}
+
 # 3. 生产依赖（registry 发布版 SDK；发布版自带 bundle 依赖，但显式声明 typebox 供 packs 引用）
 Push-Location $ElectronDir
 try {

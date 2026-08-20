@@ -26,6 +26,7 @@ function configuredDataPath() {
 
 process.env.PI_CONSOLE_STORAGE_CONFIG = storageConfigPath;
 process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? configuredDataPath();
+process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(process.env.PI_CONSOLE_DATA, "agent");
 process.env.PORT = process.env.PORT ?? "3200";
 
 const APP_URL = "http://127.0.0.1:3200/";
