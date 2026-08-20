@@ -34,6 +34,10 @@ const keyProviderEl = $("key-provider");
 const keyInputEl = $("key-input");
 const keyAddBtnEl = $("key-add-btn");
 const keyListEl = $("key-list");
+const codexOAuthStatusEl = $("codex-oauth-status");
+const codexOAuthLoginBtnEl = $("codex-oauth-login-btn");
+const codexOAuthLogoutBtnEl = $("codex-oauth-logout-btn");
+const codexOAuthCodeEl = $("codex-oauth-code");
 const appVersionEl = $("app-version");
 const updateCheckBtnEl = $("update-check-btn");
 const updateRunBtnEl = $("update-run-btn");
@@ -112,6 +116,7 @@ let catalogMode = "tools";
 let catalogFilter = "全部";
 let officeInstallTimer = null;
 let redTeamInstallTimer = null;
+let codexOAuthTimer = null;
 let officePreview = null;
 let officePreviewRequest = 0;
 const officeToolCalls = new Map();
@@ -2900,6 +2905,7 @@ applyTheme(localStorage.getItem("pi-console-theme") || "dark");
 settingsBtnEl.addEventListener("click", () => {
 	settingsModalEl.hidden = false;
 	loadKeysSection();
+	loadCodexOAuthSection();
 	loadVersionSection();
 	loadWorkspaceState();
 	loadStorageState();
@@ -2909,6 +2915,87 @@ settingsCloseEl.addEventListener("click", () => {
 });
 settingsModalEl.addEventListener("click", (e) => {
 	if (e.target === settingsModalEl) settingsModalEl.hidden = true;
+});
+
+function openExternalUrl(url) {
+	if (!/^https:\/\//i.test(url || "")) return;
+	if (window.piDesktop?.openExternal) window.piDesktop.openExternal(url);
+	else window.open(url, "_blank", "noopener");
+}
+
+function renderCodexOAuthStatus(status) {
+	const connected = status?.connected === true;
+	const waiting = status?.phase === "waiting" || status?.phase === "starting";
+	codexOAuthStatusEl.textContent = connected
+		? "已登录"
+		: status?.phase === "error"
+			? `登录失败：${status.error || "未知错误"}`
+			: waiting
+				? status.message || "等待登录"
+				: "未登录";
+	codexOAuthLoginBtnEl.hidden = connected;
+	codexOAuthLoginBtnEl.textContent = status?.verificationUrl ? "打开登录网页" : waiting ? "正在准备…" : "使用订阅登录";
+	codexOAuthLoginBtnEl.disabled = status?.phase === "starting" && !status?.verificationUrl;
+	codexOAuthLoginBtnEl.dataset.url = status?.verificationUrl || "";
+	codexOAuthLogoutBtnEl.hidden = !connected;
+	codexOAuthCodeEl.hidden = !status?.userCode;
+	codexOAuthCodeEl.textContent = status?.userCode ? `设备码：${status.userCode}（点击复制）` : "";
+
+	if (waiting) {
+		if (!codexOAuthTimer) codexOAuthTimer = setInterval(() => void loadCodexOAuthSection(), 1200);
+	} else if (codexOAuthTimer) {
+		clearInterval(codexOAuthTimer);
+		codexOAuthTimer = null;
+	}
+	if (connected) void loadModels();
+}
+
+async function loadCodexOAuthSection() {
+	try {
+		renderCodexOAuthStatus(await api("/api/oauth/openai-codex/status"));
+	} catch (error) {
+		codexOAuthStatusEl.textContent = `读取失败：${error.message}`;
+	}
+}
+
+codexOAuthLoginBtnEl.addEventListener("click", async () => {
+	const currentUrl = codexOAuthLoginBtnEl.dataset.url;
+	if (currentUrl) {
+		openExternalUrl(currentUrl);
+		return;
+	}
+	codexOAuthLoginBtnEl.disabled = true;
+	codexOAuthStatusEl.textContent = "正在申请设备码…";
+	try {
+		const status = await api("/api/oauth/openai-codex/start", { method: "POST", body: "{}" });
+		renderCodexOAuthStatus(status);
+		if (status.verificationUrl) openExternalUrl(status.verificationUrl);
+	} catch (error) {
+		showError(`Codex 订阅登录失败：${error.message}`);
+		await loadCodexOAuthSection();
+	} finally {
+		if (!codexOAuthLoginBtnEl.hidden) codexOAuthLoginBtnEl.disabled = false;
+	}
+});
+
+codexOAuthLogoutBtnEl.addEventListener("click", async () => {
+	if (!window.confirm("退出 Codex 订阅登录？\n已保存的 openai-codex OAuth 凭据会从当前 Pi 客户端删除。")) return;
+	codexOAuthLogoutBtnEl.disabled = true;
+	try {
+		renderCodexOAuthStatus(await api("/api/oauth/openai-codex", { method: "DELETE" }));
+		await loadModels();
+		showInfo("已退出 Codex 订阅登录（openai-codex-oauth）");
+	} catch (error) {
+		showError(`退出失败：${error.message}`);
+	} finally {
+		codexOAuthLogoutBtnEl.disabled = false;
+	}
+});
+
+codexOAuthCodeEl.addEventListener("click", () => {
+	const code = codexOAuthCodeEl.textContent.match(/设备码：([^（]+)/)?.[1]?.trim();
+	if (!code) return;
+	navigator.clipboard.writeText(code).then(() => showInfo("Codex 设备码已复制")).catch(() => showError("复制设备码失败"));
 });
 
 async function loadKeysSection() {

@@ -8,8 +8,9 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { getShellConfig, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { DATA_DIR } from "./paths.ts";
+import { isPrivateBashAvailable, isWindowsPowerShellAvailable } from "./windows-tools.ts";
 
 /** 注入给能力包的上下文 */
 export interface PackContext {
@@ -71,12 +72,32 @@ interface LoadedPack {
 	define: PackDefinition;
 }
 
-export const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write"];
+function hasUsableBash(): boolean {
+	if (isPrivateBashAvailable()) return true;
+	try {
+		getShellConfig();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** 只把当前电脑上确实可执行的命令工具交给模型，避免“看得到但调用必失败”。 */
+function availableBuiltinToolNames(): string[] {
+	return [
+		"read",
+		...(hasUsableBash() ? ["bash"] : []),
+		"edit",
+		"write",
+		...(isWindowsPowerShellAvailable() ? ["powershell"] : []),
+	];
+}
 
 const BUILTIN_TOOL_LABELS: Record<string, string> = {
 	read: "读取文件",
-	bash: "运行命令",
+	bash: "运行 Bash 命令",
 	edit: "编辑文件",
+	powershell: "运行 Windows 命令",
 	write: "写入文件",
 };
 
@@ -228,7 +249,7 @@ export function listPacks(): Array<PackInfo & { toolNames: string[]; mounted: bo
 
 /** 会话基础工具：原生工具 + 未声明按本轮加载规则的旧能力包工具。 */
 export function baseToolNames(enabledPackNames: Iterable<string> = []): string[] {
-	const names = [...BUILTIN_TOOL_NAMES];
+	const names = availableBuiltinToolNames();
 	for (const name of enabledPackNames) {
 		const pack = findPack(name);
 		if (!pack || pack.info.activation) continue;

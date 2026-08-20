@@ -7,7 +7,9 @@ describe("按本轮选择能力", () => {
 	});
 
 	it("普通问候不注入 Office 工具", () => {
-		expect(baseToolNames(["office-assistant"])).toEqual(["read", "bash", "edit", "write"]);
+		const tools = baseToolNames(["office-assistant"]);
+		expect(tools).toEqual(expect.arrayContaining(["read", "edit", "write"]));
+		if (process.platform === "win32") expect(tools).toContain("powershell");
 		expect(selectCapabilities("你好", ["office-assistant"])).toEqual([]);
 	});
 
@@ -27,5 +29,7 @@ describe("按本轮选择能力", () => {
 	it("面向用户显示中文名称和内部代码名", () => {
 		expect(toolDisplayName("office_view")).toBe("查看文档（office_view）");
 		expect(toolDisplayName("read")).toBe("读取文件（read）");
+		expect(toolDisplayName("bash")).toBe("运行 Bash 命令（bash）");
+		expect(toolDisplayName("powershell")).toBe("运行 Windows 命令（powershell）");
 	});
 });

@@ -136,6 +136,13 @@ ipcMain.handle("pi:choose-directory", async () => {
 	return result.canceled ? null : result.filePaths[0];
 });
 
+ipcMain.handle("pi:open-external", async (_event, url) => {
+	const target = String(url);
+	if (!/^https:\/\//i.test(target)) return false;
+	await shell.openExternal(target);
+	return true;
+});
+
 ipcMain.on("pi:relaunch", () => {
 	app.relaunch();
 	app.exit(0);
