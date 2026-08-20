@@ -1,11 +1,24 @@
 Rem Pi Console launcher (upgrade-aware): prefer Electron build, fallback to legacy node+Edge app
-Dim fso, sh, electron, base, listening, line, exec, i, ready, http, edge
+Dim fso, sh, electron, electronDir, base, listening, line, exec, i, ready, http, edge
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 
+Rem Read the actual Electron install directory written by the NSIS installer.
+electronDir = ""
+On Error Resume Next
+electronDir = sh.RegRead("HKCU\Software\pi-console\ElectronInstallDir")
+On Error Goto 0
+If electronDir <> "" Then
+  electron = electronDir & "\PiConsole.exe"
+Else
+  electron = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\PiConsole\PiConsole.exe"
+  If Not fso.FileExists(electron) Then
+    electron = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\pi-console\PiConsole.exe"
+  End If
+End If
+
 Rem If Electron build is installed, launch it (upgrade path)
-electron = sh.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\Programs\PiConsole\PiConsole.exe"
 If fso.FileExists(electron) Then
   sh.Run """" & electron & """", 1, False
   WScript.Quit

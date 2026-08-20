@@ -2,12 +2,22 @@
  * 应用自更新（用户触发）：从 GitHub Release 拉取最新 Setup exe，
  * 静默重装（NSIS /S 覆盖安装目录）后自动重启客户端。
  *
- * 更新链：下载到 <DATA_DIR>/update/ → 校验大小 → 派生独立 cmd 进程
- * （等 2 秒让本进程退出释放 node.exe → 运行 Setup /S → 重启 vbs 启动器）
+ * 更新链：下载到 <DATA_DIR>/update/ → 校验大小和 SHA256 → 派生独立 PowerShell 进程
+ * （等 2 秒让本进程退出释放文件 → 运行 Setup /S → 重启当前客户端）
  * → 本进程 exit。
  */
 import { execFileSync, spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	createReadStream,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
@@ -42,6 +52,7 @@ export interface UpdateInfo {
 	assetApiUrl: string | null;
 	assetName: string | null;
 	assetSize: number | null;
+	assetDigest: string | null;
 	notes: string | null;
 	error: "authentication" | "network" | "github" | null;
 	httpStatus: number | null;
@@ -179,6 +190,7 @@ export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<Upd
 		assetApiUrl: null,
 		assetName: null,
 		assetSize: null,
+		assetDigest: null,
 		notes: null,
 		error: null,
 		httpStatus: null,
@@ -222,9 +234,10 @@ export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<Upd
 		info.assetApiUrl = asset.url ?? null;
 		info.assetName = asset.name;
 		info.assetSize = asset.size ?? null;
+		info.assetDigest = asset.digest ?? null;
 	} else {
-		// 降级：资产名可推导（Pi控制台-Setup-<version>.exe）
-		info.assetName = `Pi控制台-Setup-${info.latest}.exe`;
+		// 降级：发布资产统一使用 ASCII 名称，避免 URL 和 Windows 代码页差异。
+		info.assetName = `PiConsole-Setup-${info.latest}.exe`;
 		info.assetUrl = `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(info.assetName)}`;
 	}
 
@@ -248,6 +261,96 @@ let progress: UpdateProgress = { running: false, receivedBytes: 0, totalBytes: n
 
 export function getUpdateProgress(): UpdateProgress {
 	return { ...progress };
+}
+
+export interface UpdateRelaunchTarget {
+	path: string;
+	source: "current-electron" | "default-electron" | "legacy-launcher";
+}
+
+interface RelaunchTargetOptions {
+	electronRuntime?: boolean;
+	currentExecutable?: string;
+	localAppData?: string;
+	packageRoot?: string;
+	pathExists?: (path: string) => boolean;
+}
+
+/**
+ * 确定安装完成后的真实启动目标。Electron 必须优先使用当前进程路径，
+ * 因为安装器允许用户把客户端安装到任意磁盘。
+ */
+export function resolveUpdateRelaunchTarget(options: RelaunchTargetOptions = {}): UpdateRelaunchTarget | null {
+	const pathExists = options.pathExists ?? existsSync;
+	const electronRuntime = options.electronRuntime ?? Boolean(process.versions.electron);
+	const currentExecutable = options.currentExecutable ?? process.execPath;
+	if (electronRuntime && pathExists(currentExecutable)) {
+		return { path: currentExecutable, source: "current-electron" };
+	}
+
+	const localAppData = options.localAppData ?? process.env.LOCALAPPDATA;
+	if (localAppData) {
+		const defaultElectron = join(localAppData, "Programs", "PiConsole", "PiConsole.exe");
+		if (pathExists(defaultElectron)) return { path: defaultElectron, source: "default-electron" };
+	}
+
+	const legacyLauncher = join(options.packageRoot ?? PACKAGE_ROOT, "..", "launcher.vbs");
+	if (pathExists(legacyLauncher)) return { path: legacyLauncher, source: "legacy-launcher" };
+	return null;
+}
+
+function powerShellLiteral(value: string): string {
+	if (/[\0\r\n]/.test(value)) throw new Error("更新路径包含不支持的控制字符");
+	return `'${value.replaceAll("'", "''")}'`;
+}
+
+/** 生成带 UTF-8 BOM 的更新辅助脚本，确保中文和自定义磁盘路径不会被 cmd 代码页破坏。 */
+export function buildUpdateHelperScript(
+	setupPath: string,
+	relaunchTarget: UpdateRelaunchTarget,
+	errorLogPath: string,
+): string {
+	return (
+		"\uFEFF" +
+		[
+			"$ErrorActionPreference = 'Stop'",
+			`$setupPath = ${powerShellLiteral(setupPath)}`,
+			`$relaunchPath = ${powerShellLiteral(relaunchTarget.path)}`,
+			`$errorLogPath = ${powerShellLiteral(errorLogPath)}`,
+			"Remove-Item -LiteralPath $errorLogPath -Force -ErrorAction SilentlyContinue",
+			"Start-Sleep -Seconds 2",
+			"try {",
+			"\t$installer = Start-Process -FilePath $setupPath -ArgumentList '/S' -PassThru -Wait",
+			'\tif ($installer.ExitCode -ne 0) { throw "安装程序退出码：$($installer.ExitCode)" }',
+			'\tif (-not (Test-Path -LiteralPath $relaunchPath -PathType Leaf)) { throw "更新完成，但启动文件不存在：$relaunchPath" }',
+			"\tStart-Process -FilePath $relaunchPath",
+			"} catch {",
+			"\t($_ | Out-String) | Set-Content -LiteralPath $errorLogPath -Encoding UTF8",
+			"}",
+			"",
+		].join("\r\n")
+	);
+}
+
+/** 对下载结果同时校验传输长度和 GitHub Release 返回的 SHA256。 */
+export async function verifyDownloadedInstaller(
+	path: string,
+	receivedBytes: number,
+	expectedBytes: number | null,
+	expectedDigest: string | null,
+): Promise<void> {
+	if (expectedBytes !== null && receivedBytes !== expectedBytes) {
+		throw new Error(`下载不完整（${receivedBytes}/${expectedBytes} 字节）`);
+	}
+	if (!expectedDigest) return;
+	const match = expectedDigest.match(/^sha256:([0-9a-f]{64})$/i);
+	if (!match) throw new Error(`更新包校验算法不受支持：${expectedDigest.split(":", 1)[0]}`);
+	const hash = createHash("sha256");
+	for await (const chunk of createReadStream(path)) hash.update(chunk);
+	const actual = hash.digest("hex");
+	if (actual.toLowerCase() !== match[1].toLowerCase()) {
+		throw new Error(`更新包 SHA256 校验失败（期望 ${match[1]}，实际 ${actual}）`);
+	}
 }
 
 export async function runUpdate(): Promise<void> {
@@ -274,9 +377,12 @@ export async function runUpdate(): Promise<void> {
 			signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
 		});
 		if (!res.ok || !res.body) throw new Error(`下载失败：HTTP ${res.status}`);
-		progress.totalBytes = res.headers.has("content-length")
-			? Number(res.headers.get("content-length"))
-			: (info.assetSize ?? null);
+		const responseLengthHeader = res.headers.get("content-length");
+		const responseLength = responseLengthHeader === null ? null : Number(responseLengthHeader);
+		progress.totalBytes =
+			typeof responseLength === "number" && Number.isSafeInteger(responseLength) && responseLength >= 0
+				? responseLength
+				: info.assetSize;
 
 		await new Promise<void>((resolve, reject) => {
 			const writer = createWriteStream(setupPath);
@@ -299,10 +405,11 @@ export async function runUpdate(): Promise<void> {
 			writer.on("error", reject);
 		});
 
-		// 简单完整性检查：实收字节数与 content-length 一致
-		if (progress.totalBytes && progress.receivedBytes !== progress.totalBytes) {
+		try {
+			await verifyDownloadedInstaller(setupPath, progress.receivedBytes, progress.totalBytes, info.assetDigest);
+		} catch (error) {
 			if (existsSync(setupPath)) unlinkSync(setupPath);
-			throw new Error(`下载不完整（${progress.receivedBytes}/${progress.totalBytes} 字节）`);
+			throw error;
 		}
 
 		progress.phase = "installing";
@@ -320,33 +427,40 @@ export async function runUpdate(): Promise<void> {
 }
 
 /**
- * 派生独立进程执行更新收尾：等 2 秒（本进程退出、node.exe 解锁）→ 静默安装 →
- * 重新启动客户端（优先 Electron 版 exe，否则回退 vbs 启动器）。
- * 用 .cmd 文件中转，避免 spawn 参数里多层引号被 cmd 吃掉。
+ * 派生独立 PowerShell 进程执行更新收尾：等 2 秒释放当前程序 → 静默安装 →
+ * 从原安装位置重新启动。VBS 仅用于确实存在的旧版客户端。
  */
 function installAndRestart(setupPath: string): void {
-	// PACKAGE_ROOT = <安装目录>\app
-	// 启动器用 ASCII 文件名（launcher.vbs）：更新收尾由 cmd 调用，
-	// 中文文件名在 GBK 控制台下会被读成乱码导致 wscript 找不到文件
-	const launcher = join(PACKAGE_ROOT, "..", "launcher.vbs");
-	// Electron 版安装到 %LOCALAPPDATA%\Programs\pi-console（ASCII 目录，cmd 无代码页问题）
-	const electronExe = join(process.env.LOCALAPPDATA ?? "", "Programs", "PiConsole", "PiConsole.exe");
-	const relaunch = existsSync(electronExe) ? `"${electronExe}"` : `wscript.exe "${launcher}"`;
-	const batPath = join(DATA_DIR, "update", "apply-update.cmd");
-	const content = [
-		"@echo off",
-		"timeout /t 2 /nobreak >nul",
-		// cmd 调用 GUI 程序（NSIS Setup）默认不等待；必须 start /wait 等安装真正完成，
-		// 否则会在 app 目录被覆盖途中启动，导致服务起不来
-		`start "" /wait "${setupPath}" /S`,
-		relaunch,
-		"",
-	].join("\r\n");
-	writeFileSync(batPath, content, "utf8");
-	spawn("cmd.exe", ["/d", "/c", batPath], {
-		detached: true,
-		stdio: "ignore",
-		windowsHide: true,
+	const relaunchTarget = resolveUpdateRelaunchTarget();
+	if (!relaunchTarget) throw new Error("无法确定更新后的客户端启动位置，请下载最新安装包手动更新");
+	const updateDir = join(DATA_DIR, "update");
+	const helperPath = join(updateDir, "apply-update.ps1");
+	const errorLogPath = join(updateDir, "update-error.log");
+	const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+	if (!systemRoot) throw new Error("无法定位 Windows PowerShell");
+	const powerShell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+	if (!existsSync(powerShell)) throw new Error(`Windows PowerShell 不存在：${powerShell}`);
+	writeFileSync(helperPath, buildUpdateHelperScript(setupPath, relaunchTarget, errorLogPath), "utf8");
+	const child = spawn(
+		powerShell,
+		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helperPath],
+		{
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+		},
+	);
+	child.once("spawn", () => {
+		child.unref();
+		setTimeout(() => process.exit(0), 1500);
 	});
-	setTimeout(() => process.exit(0), 1500);
+	child.once("error", (error) => {
+		progress = {
+			running: false,
+			receivedBytes: 0,
+			totalBytes: null,
+			error: `无法启动更新辅助程序：${error.message}`,
+			phase: "idle",
+		};
+	});
 }

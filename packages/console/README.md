@@ -37,13 +37,13 @@ npx tsx packages/console/src/server.ts
 
 - **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
-- **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup 静默重装并自动重启；私有仓库需在设置里填写 GitHub Token；启动器为 ASCII 文件名 launcher.vbs 以规避控制台代码页问题）
+- **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup，校验 SHA256 后静默重装，并从用户实际安装位置自动重启；私有仓库需在设置里填写 GitHub Token）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
 
 ## 客户端形态
 
 - **v0.3.0 起为 Electron 桌面客户端**（独立窗口、自带运行时、数据目录不变）。旧版（vbs + Edge 模式）点击更新后会自动进入 Electron，无需额外操作。
-- 更新链路不变：设置 → 关于与更新 → 立即更新（从 GitHub Release 拉取 Setup 静默重装并自动重启）。
+- 更新链路：设置 → 关于与更新 → 立即更新（从 GitHub Release 拉取 Setup，校验后静默重装，并支持从自定义安装目录自动重启）。
 - 新增：会话删除（左侧对话列表 ×）、主题切换（顶栏 🌙/☀️，亮/暗双主题）。
 
 ## Windows 安装包（installer/）
@@ -74,7 +74,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 |---|---|
 | `PORT` | 监听端口，默认 `3200`（仅绑定 `127.0.0.1`） |
 | `PI_CONSOLE_MODEL` | 可选。`provider/model-id`。未设置时走 Pi 默认解析（settings / 上次选择） |
-| `PI_CONSOLE_DATA` | 可选。数据目录外置（默认 `<包>/data`；安装版由启动器设为 `%APPDATA%pi-consoledata`） |
+| `PI_CONSOLE_DATA` | 可选。数据目录外置（默认 `<包>/data`；Electron 安装版由主进程读取保存位置并设置） |
 | `PI_CONSOLE_TOKEN` | 可选。设置后所有 `/api/*` 请求必须带 `Authorization: Bearer <token>`（SSE 额外接受 `?token=`），静态页面放行 |
 
 模型/思考等级选择通过控制台专属 agent 目录（`packages/console/data/agent/settings.json`）持久化，新会话自动沿用，不污染全局 `~/.pi/agent/`。
