@@ -8,7 +8,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR } from "./paths.ts";
 
@@ -202,4 +202,21 @@ export function startInstall(update: boolean): boolean {
 		}
 	})();
 	return true;
+}
+
+/** 删除客户端专属的 promptfoo 安装目录；工作区中的配置和报告不在此目录，不会被删除。 */
+export function uninstall(installDir = INSTALL_DIR): boolean {
+	if (progress.running) throw new Error("红队引擎正在安装，暂时不能卸载");
+	const existed = existsSync(installDir);
+	rmSync(installDir, { recursive: true, force: true });
+	progress = {
+		running: false,
+		error: null,
+		version: null,
+		log: "",
+		phase: "idle",
+		startedAt: null,
+		elapsedMs: 0,
+	};
+	return existed;
 }

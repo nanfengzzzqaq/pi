@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import defineRedTeamPack, { parseStrategyIds } from "../packs/red-team/index.ts";
 import { loadPacks, selectCapabilities } from "../src/packs.ts";
+import { uninstall } from "../src/redteam.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -43,6 +44,16 @@ describe("parseStrategyIds", () => {
 });
 
 describe("red-team pack", () => {
+	it("卸载时删除客户端专属安装目录", () => {
+		const installDir = mkdtempSync(join(tmpdir(), "pi-redteam-install-"));
+		temporaryDirectories.push(installDir);
+		writeFileSync(join(installDir, "owned.txt"), "installed");
+
+		expect(uninstall(installDir)).toBe(true);
+		expect(existsSync(installDir)).toBe(false);
+		expect(uninstall(installDir)).toBe(false);
+	});
+
 	it("uses the ToolDefinition call signature and writes a valid DeepSeek provider target", async () => {
 		const workspace = mkdtempSync(join(tmpdir(), "pi-redteam-"));
 		temporaryDirectories.push(workspace);

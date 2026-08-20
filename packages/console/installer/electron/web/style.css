@@ -405,6 +405,15 @@ body {
 	background: var(--panel-2);
 }
 
+.secondary-btn.danger {
+	border-color: color-mix(in srgb, var(--error) 42%, var(--border));
+	color: var(--error);
+}
+
+.secondary-btn.danger:hover {
+	background: var(--error-bg);
+}
+
 .secondary-btn.small,
 .primary-btn.small {
 	padding: 3px 10px;
@@ -2122,6 +2131,10 @@ body {
 .session-meta {
 	font-size: 11px;
 	color: var(--muted);
+}
+
+.session-meta.running {
+	color: var(--ok);
 }
 
 /* 执行过程容器（一轮里的工具调用） */
