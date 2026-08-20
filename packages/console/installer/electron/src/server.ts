@@ -42,6 +42,7 @@ import {
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
 import * as redteam from "./redteam.ts";
+import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -237,6 +238,18 @@ function updateSessionTitle(sessionId: string, text: string): void {
 	entry.title = text.replace(/\s+/g, " ").slice(0, 40);
 	entry.updatedAt = Date.now();
 	writeSessionIndex(index);
+}
+
+function renameSession(sessionId: string, title: string): string | null {
+	const index = readSessionIndex();
+	const entry = index[sessionId];
+	if (!entry) return null;
+	const normalized = title.replace(/\s+/g, " ").trim().slice(0, 80);
+	if (!normalized) return null;
+	entry.title = normalized;
+	entry.updatedAt = Date.now();
+	writeSessionIndex(index);
+	return normalized;
 }
 
 /** API Key 存储文件（控制台专属，与 agent settings 同目录；格式 Record<provider, {type:"api_key",key}>） */
@@ -606,9 +619,14 @@ function buildHistory(session: AgentSession): HistoryItem[] {
 					else if (block.type === "image") hasImage = true;
 				}
 				text = parts.join("\n");
-				if (hasImage) text = `${text}${text ? "\n" : ""}[图片]`;
 			}
-			if (text.trim()) items.push({ role: "user", text });
+			const parsed = parseUserMessage(text);
+			if (hasImage && parsed.attachments.length === 0) {
+				parsed.text = `${parsed.text}${parsed.text ? "\n" : ""}[图片]`;
+			}
+			if (parsed.text || parsed.attachments.length > 0) {
+				items.push({ role: "user", text: parsed.text, attachments: parsed.attachments });
+			}
 		} else if (message.role === "assistant") {
 			const text = message.content
 				.filter((block) => block.type === "text")
@@ -1364,10 +1382,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// POST /api/sessions/:id/messages — 发送用户消息（支持 images）
 		case "POST messages": {
-			const body = (await readBodyJson(req)) as { text?: unknown; images?: unknown };
+			const body = (await readBodyJson(req)) as { text?: unknown; images?: unknown; attachments?: unknown };
 			const text = typeof body?.text === "string" ? body.text.trim() : "";
-			if (!text) {
-				sendJson(res, 400, { error: '请求体需为 {"text": "..."} 且不能为空' });
+			const attachments = Array.isArray(body?.attachments)
+				? body.attachments
+						.filter((path): path is string => typeof path === "string" && path.trim().length > 0)
+						.slice(0, 32)
+				: [];
+			if (body?.attachments !== undefined && !Array.isArray(body.attachments)) {
+				sendJson(res, 400, { error: "attachments 需为文件路径数组" });
+				return;
+			}
+			if (!text && attachments.length === 0) {
+				sendJson(res, 400, { error: "消息正文和附件不能同时为空" });
 				return;
 			}
 			if (cs.session.isStreaming) {
@@ -1379,14 +1406,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
 				return;
 			}
-			const capabilityTrace = prepareTurnCapabilities(cs, text);
+			const promptText = appendAttachmentAnnotation(text, attachments);
+			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
 			if (cs.enabledPacks.size > 0) {
 				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			}
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
-			updateSessionTitle(cs.sessionId, text);
-			cs.session.prompt(text, { images }).catch((error) => {
+			updateSessionTitle(cs.sessionId, text || attachments.map((path) => path.split(/[\\/]/).pop()).join("、"));
+			cs.session.prompt(promptText, { images }).catch((error) => {
 				releaseTurnCapabilities(cs);
 				bufferAndBroadcast(cs, {
 					type: "error",
@@ -1590,6 +1618,22 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
 			});
+			return;
+		}
+
+		// PATCH /api/sessions/:id — 修改左侧历史会话名称
+		case "PATCH ": {
+			const body = (await readBodyJson(req)) as { title?: unknown };
+			if (typeof body?.title !== "string") {
+				sendJson(res, 400, { error: '请求体需为 {"title": "..."}' });
+				return;
+			}
+			const title = renameSession(sessionId, body.title);
+			if (!title) {
+				sendJson(res, 400, { error: "会话名称不能为空" });
+				return;
+			}
+			sendJson(res, 200, { ok: true, title });
 			return;
 		}
 
