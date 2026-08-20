@@ -50,6 +50,41 @@ if (Test-Path -LiteralPath $OfficeCliRecord) {
 }
 Write-Host "已预置 OfficeCLI：$OfficeCliSource"
 
+# 2.6 预置 Pi 私有 Bash/Git 运行时。
+# 使用 Git for Windows 官方 MinGit BusyBox 发行包：它专为第三方应用内嵌，
+# 提供 Git、sh 和常用 Unix 命令。只解压进安装包，绝不运行安装器或修改系统 PATH。
+$MinGitVersion = "2.55.0.4"
+$MinGitSha256 = "255a8d6f43e330817ae1eb2599e153835383cdfb17759c5251318242b03ad3db"
+$MinGitUrl = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.4/MinGit-2.55.0.4-busybox-64-bit.zip"
+$MinGitArchive = Join-Path $env:TEMP "pi-console-MinGit-$MinGitVersion-busybox-64-bit.zip"
+$BundledMinGitDir = Join-Path $ElectronDir "data\runtime\mingit"
+$ArchiveReady = Test-Path -LiteralPath $MinGitArchive
+if ($ArchiveReady) {
+    $ArchiveReady = (Get-FileHash -LiteralPath $MinGitArchive -Algorithm SHA256).Hash.ToLowerInvariant() -eq $MinGitSha256
+}
+if (-not $ArchiveReady) {
+    Invoke-WebRequest -UseBasicParsing -Uri $MinGitUrl -OutFile $MinGitArchive
+}
+$ActualMinGitHash = (Get-FileHash -LiteralPath $MinGitArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($ActualMinGitHash -ne $MinGitSha256) {
+    throw "MinGit 校验失败：期望 $MinGitSha256，实际 $ActualMinGitHash"
+}
+if (Test-Path -LiteralPath $BundledMinGitDir) { Remove-Item -LiteralPath $BundledMinGitDir -Recurse -Force }
+New-Item -ItemType Directory -Path $BundledMinGitDir -Force | Out-Null
+Expand-Archive -LiteralPath $MinGitArchive -DestinationPath $BundledMinGitDir -Force
+$BusyBoxPath = Join-Path $BundledMinGitDir "mingw64\bin\busybox.exe"
+$PrivateGitPath = Join-Path $BundledMinGitDir "cmd\git.exe"
+if (-not (Test-Path -LiteralPath $BusyBoxPath) -or -not (Test-Path -LiteralPath $PrivateGitPath)) {
+    throw "MinGit 解压结果不完整：缺少 busybox.exe 或 git.exe"
+}
+@{
+    version = $MinGitVersion
+    source = $MinGitUrl
+    sha256 = $MinGitSha256
+    distribution = "Git for Windows MinGit BusyBox"
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BundledMinGitDir "pi-runtime.json") -Encoding utf8
+Write-Host "已预置 Pi 私有 Bash/Git：Git for Windows MinGit $MinGitVersion"
+
 # 3. 生产依赖（registry 发布版 SDK；发布版自带 bundle 依赖，但显式声明 typebox 供 packs 引用）
 Push-Location $ElectronDir
 try {

@@ -233,7 +233,14 @@
 
 			<section class="modal-section">
 				<h3>模型服务</h3>
-				<p class="modal-hint">添加模型厂商的 API Key 后，对应模型即可在输入框右下角选择使用（与设置一起持久保存）。</p>
+				<p class="modal-hint">可以使用 Codex 订阅登录，也可以添加模型厂商的 API Key；凭据只保存在当前 Pi 客户端的数据目录。</p>
+				<div class="key-row" id="codex-oauth-row">
+					<span class="key-name">Codex 订阅登录（openai-codex-oauth）</span>
+					<span class="key-masked" id="codex-oauth-status">读取中…</span>
+					<button id="codex-oauth-login-btn" type="button">登录</button>
+					<button id="codex-oauth-logout-btn" class="key-delete" type="button" hidden>退出</button>
+				</div>
+				<div class="workspace-current" id="codex-oauth-code" title="点击复制设备码" hidden></div>
 				<div class="key-add-row">
 					<select id="key-provider"></select>
 					<input type="password" id="key-input" placeholder="粘贴 API Key（sk-…）" autocomplete="off">

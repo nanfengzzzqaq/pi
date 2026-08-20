@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld("piDesktop", {
 	chooseDirectory() {
 		return ipcRenderer.invoke("pi:choose-directory");
 	},
+	openExternal(url) {
+		return ipcRenderer.invoke("pi:open-external", url);
+	},
 	relaunch() {
 		ipcRenderer.send("pi:relaunch");
 	},

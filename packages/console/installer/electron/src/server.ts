@@ -1,7 +1,7 @@
 /**
  * Pi Web 控制台 — 通用能力包 + 按会话/按本轮工具加载
  *
- * 默认形态仍是纯净原生 Pi（read/bash/edit/write + 官方系统提示词）；
+ * 默认形态仍是纯净原生 Pi；Windows 安装版额外提供私有 Bash 与系统 PowerShell，
  * 能力包只在内部注册；每轮先读取 pack.json 的通用规则，再用
  * setActiveToolsByName 只注入真正命中的最小工具组。
  *
@@ -18,8 +18,10 @@ import {
 	createAgentSession,
 	ModelRuntime,
 	SessionManager,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { extractFileReferences } from "./artifacts.ts";
+import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import * as fsExplorer from "./fs.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
@@ -51,6 +53,7 @@ import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
+import { instantiateWindowsTools, seedBundledWindowsRuntime } from "./windows-tools.ts";
 import * as workspace from "./workspace.ts";
 
 // ---------------------------------------------------------------------------
@@ -273,13 +276,24 @@ function renameSession(sessionId: string, title: string): string | null {
 	return normalized;
 }
 
-/** API Key 存储文件（控制台专属，与 agent settings 同目录；格式 Record<provider, {type:"api_key",key}>） */
+/** 模型凭据存储文件（控制台专属，与 agent settings 同目录；同时保存 API Key 与 OAuth） */
 const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+const codexOAuth = new CodexOAuthCoordinator({
+	isConnected: () => modelRuntime.isUsingOAuth("openai-codex"),
+	login: async (interaction) => {
+		await modelRuntime.login("openai-codex", "oauth", interaction);
+	},
+	logout: () => modelRuntime.logout("openai-codex"),
+});
 if (await registerDetectedWhiteRabbitNeo(modelRuntime)) {
 	console.log("本地模型：已连接 WhiteRabbitNeo V3");
+}
+
+if (seedBundledWindowsRuntime()) {
+	console.log("Windows 工具：已把 Pi 私有 Bash/Git 运行时复制到数据目录");
 }
 
 // 加载能力包（新加的包重启服务后生效）
@@ -512,21 +526,24 @@ async function buildSession(
 		sessionManager: SessionManager;
 		agentDir: string;
 		model?: SessionModel;
-		customTools: ReturnType<typeof instantiatePackTools>;
+		customTools: ToolDefinition<any, any, any>[];
 	} = {
 		cwd,
 		modelRuntime,
 		sessionManager,
 		agentDir: CONSOLE_AGENT_DIR,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
-		customTools: instantiatePackTools({
-			getWorkspaceRoot: () => cwd,
-			activatePack: (packName) => {
-				if (!enabledPacks.has(packName)) return;
-				activePackTools.set(packName, new Set(fullPackToolNames(packName)));
-				sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
-			},
-		}),
+		customTools: [
+			...instantiateWindowsTools({ getWorkspaceRoot: () => cwd }),
+			...instantiatePackTools({
+				getWorkspaceRoot: () => cwd,
+				activatePack: (packName) => {
+					if (!enabledPacks.has(packName)) return;
+					activePackTools.set(packName, new Set(fullPackToolNames(packName)));
+					sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
+				},
+			}),
+		],
 		model: modelOverride,
 	};
 
@@ -805,7 +822,8 @@ function listModels(): Array<{ provider: string; modelId: string; label: string;
 // 模型服务 Key 管理（auth.json：Record<provider, {type:"api_key",key}>）
 // ---------------------------------------------------------------------------
 
-type AuthFile = Record<string, { type: "api_key"; key: string }>;
+type AuthFileEntry = { type: "api_key"; key: string } | { type: "oauth"; [key: string]: unknown };
+type AuthFile = Record<string, AuthFileEntry>;
 
 function readAuthFile(): AuthFile {
 	try {
@@ -830,7 +848,7 @@ function writeAuthEntry(provider: string, key: string): void {
 
 function deleteAuthEntry(provider: string): boolean {
 	const data = readAuthFile();
-	if (!(provider in data)) return false;
+	if (data[provider]?.type !== "api_key") return false;
 	delete data[provider];
 	writeAuthFile(data);
 	return true;
@@ -840,7 +858,9 @@ function deleteAuthEntry(provider: string): boolean {
 function listKeys(): Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> {
 	const entries: Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> = [];
 	const names = new Map(modelRuntime.getProviders().map((p) => [p.id, p.name ?? p.id]));
-	for (const [provider, entry] of Object.entries(readAuthFile())) {
+	const authFile = readAuthFile();
+	for (const [provider, entry] of Object.entries(authFile)) {
+		if (entry.type !== "api_key") continue;
 		entries.push({
 			provider,
 			displayName: names.get(provider) ?? provider,
@@ -849,7 +869,7 @@ function listKeys(): Array<{ provider: string; displayName: string; masked: stri
 		});
 	}
 	for (const provider of modelRuntime.getProviders()) {
-		if (provider.id in readAuthFile()) continue;
+		if (provider.id in authFile) continue;
 		if (modelRuntime.hasConfiguredAuth(provider.id)) {
 			entries.push({
 				provider: provider.id,
@@ -1229,6 +1249,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// 模型枚举
 	if (pathname === "/api/models" && req.method === "GET") {
 		sendJson(res, 200, listModels());
+		return;
+	}
+
+	// Codex 订阅登录（Pi 官方 openai-codex OAuth；使用设备码避免占用本地回调端口）
+	if (pathname === "/api/oauth/openai-codex/status" && req.method === "GET") {
+		sendJson(res, 200, codexOAuth.status());
+		return;
+	}
+	if (pathname === "/api/oauth/openai-codex/start" && req.method === "POST") {
+		sendJson(res, 202, await codexOAuth.start());
+		return;
+	}
+	if (pathname === "/api/oauth/openai-codex" && req.method === "DELETE") {
+		sendJson(res, 200, await codexOAuth.logout());
 		return;
 	}
 
@@ -1734,6 +1768,7 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 });
 
 server.on("close", () => {
+	codexOAuth.cancel();
 	void officePreview.stopAllOfficePreviews();
 });
 process.once("exit", officePreview.terminateAllOfficePreviewsNow);
