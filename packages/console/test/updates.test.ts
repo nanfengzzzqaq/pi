@@ -141,6 +141,10 @@ describe("更新安装与重启", () => {
 			"utf8",
 		);
 		expect(installerScript).toContain('"ElectronInstallDir" "$INSTDIR"');
+		expect(installerScript).toContain(
+			'"$INSTDIR\\resources\\app.asar.unpacked\\extra\\launcher-upgrade.vbs" "$INSTDIR\\resources\\launcher.vbs"',
+		);
+		expect(installerScript).not.toContain('CopyFiles "$INSTDIR\\extra\\launcher-upgrade.vbs"');
 		expect(legacyLauncher).toContain("HKCU\\Software\\pi-console\\ElectronInstallDir");
 	});
 
