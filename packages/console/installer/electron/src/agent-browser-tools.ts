@@ -1,10 +1,62 @@
 /** Pi 智能体可调用的客户端内置浏览器工具。 */
+import { readFileSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type AgentBrowserTarget, getAgentBrowserRuntime } from "./agent-browser-runtime.ts";
+import {
+	type AgentBrowserTarget,
+	type AgentBrowserUploadFile,
+	getAgentBrowserRuntime,
+} from "./agent-browser-runtime.ts";
+
+const UPLOAD_MIME_TYPES: Record<string, string> = {
+	".bmp": "image/bmp",
+	".doc": "application/msword",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".gif": "image/gif",
+	".jpeg": "image/jpeg",
+	".jpg": "image/jpeg",
+	".json": "application/json",
+	".ofd": "application/ofd",
+	".pdf": "application/pdf",
+	".png": "image/png",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".txt": "text/plain",
+	".webp": "image/webp",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".zip": "application/zip",
+};
+const MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
+
+/** 读取要上传的本地文件：支持工作区相对路径与绝对路径，限制单文件与总体积。 */
+function readUploadFiles(cwd: string, paths: string[]): AgentBrowserUploadFile[] {
+	const files: AgentBrowserUploadFile[] = [];
+	let total = 0;
+	for (const requested of paths) {
+		if (typeof requested !== "string" || !requested.trim()) throw new Error("上传路径不能为空");
+		const file = isAbsolute(requested) ? resolve(requested) : resolve(cwd, requested);
+		const stats = statSync(file);
+		if (!stats.isFile()) throw new Error(`不是可上传的文件：${file}`);
+		if (stats.size > MAX_UPLOAD_FILE_BYTES) {
+			throw new Error(`文件 ${basename(file)} 超过 ${MAX_UPLOAD_FILE_BYTES / 1024 / 1024}MB 上传上限`);
+		}
+		total += stats.size;
+		if (total > MAX_UPLOAD_TOTAL_BYTES) {
+			throw new Error(`上传附件总量超过 ${MAX_UPLOAD_TOTAL_BYTES / 1024 / 1024}MB 上限`);
+		}
+		const extension = file.slice(file.lastIndexOf(".")).toLocaleLowerCase("en-US");
+		files.push({
+			name: basename(file),
+			mimeType: UPLOAD_MIME_TYPES[extension] ?? "application/octet-stream",
+			dataBase64: readFileSync(file).toString("base64"),
+		});
+	}
+	if (files.length === 0) throw new Error("请至少提供一个要上传的文件路径");
+	return files;
+}
 
 function result(text: string): AgentToolResult<unknown> {
 	return { content: [{ type: "text", text }], details: {} };
@@ -129,6 +181,22 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 				text: Type.Optional(Type.String({ description: "可选；等待此文字在页面中出现" })),
 			}),
 			execute: async (_id, params) => result(await browser().wait(params.milliseconds ?? 2000, params.text)),
+		}),
+		defineTool({
+			name: "browser_upload",
+			label: "上传附件",
+			description:
+				"把本地文件作为附件上传到当前网页的文件上传框（如报销单的火车票附件）。路径可写工作区内相对路径或绝对路径；单文件 ≤20MB，总量 ≤50MB。",
+			parameters: Type.Object({
+				paths: Type.Array(Type.String(), {
+					minItems: 1,
+					description: '要上传的本地文件路径列表，如 ["tickets/去程票.png", "tickets/查验.png"]',
+				}),
+			}),
+			execute: async (_id, params) => {
+				const files = readUploadFiles(cwd, params.paths);
+				return result(await browser().upload(files));
+			},
 		}),
 	];
 }

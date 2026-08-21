@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -95,7 +95,27 @@ process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
 const AGENT_BROWSER_PACK_NAME = "agent-browser";
+const TRAVEL_EXPENSE_PACK_NAME = "travel-expense";
 const CODE_DEVELOPMENT_PACK_NAME = "code-development";
+
+/** 差旅报销技能：安装包内置 → 数据目录（幂等，内容变化时覆盖更新）。 */
+function seedTravelExpenseSkill(): boolean {
+	const source = join(PACKAGE_ROOT, "skills", "travel-expense", "SKILL.md");
+	if (!existsSync(source)) return false;
+	const destination = join(DATA_DIR, "agent", "skills", "travel-expense", "SKILL.md");
+	try {
+		const content = readFileSync(source, "utf8");
+		if (existsSync(destination) && readFileSync(destination, "utf8") === content) {
+			return true;
+		}
+		mkdirSync(dirname(destination), { recursive: true });
+		writeFileSync(destination, content, "utf8");
+		return true;
+	} catch (error) {
+		console.warn(`差旅报销技能安装失败：${error instanceof Error ? error.message : String(error)}`);
+		return false;
+	}
+}
 const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
 	sevenzip: "archive-files",
 	ocr: "image-ocr",
@@ -329,8 +349,15 @@ await loadPacks();
 if (codeDevelopment.isCodeDevelopmentInstalled()) activatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
 else deactivatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
 // 桌面版主进程注册运行时后才挂载；纯网页模式不向模型暴露不可执行的浏览器工具。
-if (isAgentBrowserRuntimeAvailable()) activatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
-else deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
+if (isAgentBrowserRuntimeAvailable()) {
+	activatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
+	// 差旅报销依赖内置浏览器；把技能种到数据目录，会话即可发现。
+	if (seedTravelExpenseSkill()) console.log("差旅报销：技能已就绪");
+	activatePackForAllSessions(TRAVEL_EXPENSE_PACK_NAME);
+} else {
+	deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
+	deactivatePackForAllSessions(TRAVEL_EXPENSE_PACK_NAME);
+}
 for (const [id, packName] of Object.entries(MANAGED_TOOL_PACKS) as Array<[managedFileTools.ManagedToolId, string]>) {
 	if (managedFileTools.getManagedToolStatus(id).installed) activatePackForAllSessions(packName);
 	else deactivatePackForAllSessions(packName);
@@ -806,6 +833,7 @@ async function buildCapabilityCatalog() {
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
 	const browserPack = listPacks().find((item) => item.name === AGENT_BROWSER_PACK_NAME);
+	const travelExpensePack = listPacks().find((item) => item.name === TRAVEL_EXPENSE_PACK_NAME);
 	const codeDevelopmentStatus = codeDevelopment.getCodeDevelopmentStatus();
 	const codeDevelopmentPack = listPacks().find((item) => item.name === CODE_DEVELOPMENT_PACK_NAME);
 	const codeDevelopmentCwd = workspace.getWorkspacePath() ?? DATA_DIR;
@@ -864,6 +892,27 @@ async function buildCapabilityCatalog() {
 				capabilities: browserPack?.tools ?? [],
 				skillCount: 0,
 				installedSkillCount: 0,
+				removable: false,
+			},
+			{
+				id: "travel-expense",
+				internalName: "travel-expense",
+				displayName: "差旅报销",
+				description:
+					"在客户端内置浏览器中自动填报易快报（合思）差旅费用报销单：关联出差申请、按规则填写字段与费用明细、上传票据附件，最后保存草稿；绝不提交送审。",
+				category: "效率工具",
+				formats: ["差旅报销", "易快报", "合思", "火车票", "住宿费", "出差补贴"],
+				installed: isAgentBrowserRuntimeAvailable(),
+				version: travelExpensePack?.version ?? "1.0.0",
+				installPath: "Pi 控制台内置",
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "报",
+				sourceName: "Pi 控制台内置能力",
+				sourceUrl: "https://ekuaibao.com/",
+				activation: "识别到报销 / 差旅任务时按本轮加载",
+				capabilities: travelExpensePack?.tools ?? [],
+				skillCount: 1,
+				installedSkillCount: seedTravelExpenseSkill() ? 1 : 0,
 				removable: false,
 			},
 			{

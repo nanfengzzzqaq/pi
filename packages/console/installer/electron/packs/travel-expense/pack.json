@@ -1,0 +1,21 @@
+{
+	"name": "travel-expense",
+	"displayName": "差旅报销",
+	"description": "在客户端内置浏览器中自动填报易快报（合思）差旅费用报销单：关联出差申请、按规则填写字段与费用明细、上传票据附件，最后保存草稿",
+	"version": "1.0.0",
+	"activation": {
+		"extensions": [],
+		"keywords": ["报销", "差旅", "差旅费", "差旅报销", "出差报销", "费用报销", "报销单", "易快报", "合思", "ekuaibao", "飞书审批", "出差补贴", "出差补助", "住宿费", "火车票", "高铁票", "报销草稿"],
+		"minimumScore": 2,
+		"defaultGroups": ["reimburse"]
+	},
+	"toolGroups": [
+		{
+			"name": "reimburse",
+			"displayName": "差旅报销填报",
+			"description": "差旅费用报销单的规则速查与费用明细计划",
+			"tools": ["travel_reimbursement_guide", "travel_plan_details"],
+			"keywords": ["报销", "差旅", "费用", "补贴", "住宿", "火车", "高铁", "草稿", "易快报", "合思"]
+		}
+	]
+}

@@ -22,15 +22,21 @@ export interface AgentBrowserTarget {
 	text?: string;
 }
 
+export interface AgentBrowserUploadFile {
+	name: string;
+	mimeType: string;
+	dataBase64: string;
+}
+
 export interface AgentBrowserRuntime {
 	setDownloadDirectory(path: string): void;
 	open(url?: string): Promise<AgentBrowserState>;
 	hide(): AgentBrowserState;
 	state(): AgentBrowserState;
 	navigate(url: string): Promise<AgentBrowserState>;
-	back(): Promise<AgentBrowserState>;
-	forward(): Promise<AgentBrowserState>;
-	reload(): Promise<AgentBrowserState>;
+	back(): AgentBrowserState;
+	forward(): AgentBrowserState;
+	reload(): AgentBrowserState;
 	snapshot(maxChars: number): Promise<string>;
 	click(target: AgentBrowserTarget): Promise<string>;
 	type(target: AgentBrowserTarget, value: string, submit: boolean): Promise<string>;
@@ -38,6 +44,7 @@ export interface AgentBrowserRuntime {
 	extract(selector: string | undefined, maxChars: number): Promise<string>;
 	screenshot(path: string): Promise<string>;
 	wait(milliseconds: number, text?: string): Promise<string>;
+	upload(files: AgentBrowserUploadFile[]): Promise<string>;
 }
 
 let runtime: AgentBrowserRuntime | null = null;
