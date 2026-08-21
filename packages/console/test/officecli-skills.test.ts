@@ -20,7 +20,9 @@ afterEach(() => {
 
 describe("OfficeCLI 官方技能目录", () => {
 	it("按工具目录保存技能", () => {
-		expect(officeCliSkillPath("C:\\pi-agent", "word")).toContain("skills\\officecli\\word\\SKILL.md");
+		expect(officeCliSkillPath("C:\\pi-agent", "word")).toBe(
+			join("C:\\pi-agent", "skills", "officecli", "word", "SKILL.md"),
+		);
 	});
 
 	it("场景技能会先安装基础技能", () => {
