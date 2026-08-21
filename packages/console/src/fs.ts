@@ -6,6 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import { copyFileSync, type Dirent, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { DATA_DIR } from "./paths.ts";
 import { decodeTextBuffer, isTextFilePath } from "./text-files.ts";
@@ -232,14 +233,14 @@ export function writeTextFile(path: string, text: string, expectedSha256: string
 }
 
 /** 在当前目录下递归搜索文件名或文本内容；全程本地执行，不调用模型。 */
-export function searchFiles(
+export async function searchFiles(
 	path: string,
 	query: string,
 	mode: "name" | "content",
-): { results: FsSearchResult[]; scanned: number; truncated: boolean } {
+): Promise<{ results: FsSearchResult[]; scanned: number; truncated: boolean }> {
 	const root = resolve(path);
 	if (!withinRoots(root)) throw new Error("路径不在可浏览范围内");
-	if (!statSync(root).isDirectory()) throw new Error("目标不是目录");
+	if (!(await stat(root)).isDirectory()) throw new Error("目标不是目录");
 	const needle = query.trim().toLocaleLowerCase("zh-CN");
 	if (!needle) return { results: [], scanned: 0, truncated: false };
 
@@ -261,12 +262,16 @@ export function searchFiles(
 		if (!directory) break;
 		let entries: Dirent[];
 		try {
-			entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+			entries = await readdir(directory, { withFileTypes: true, encoding: "utf8" });
 		} catch {
 			continue;
 		}
 		for (const entry of entries) {
-			if (results.length >= MAX_SEARCH_RESULTS || scanned >= MAX_SEARCH_FILES) {
+			if (
+				results.length >= MAX_SEARCH_RESULTS ||
+				scanned >= MAX_SEARCH_FILES ||
+				Date.now() - startedAt > SEARCH_TIMEOUT_MS
+			) {
 				truncated = true;
 				break;
 			}
@@ -278,14 +283,14 @@ export function searchFiles(
 			if (!entry.isFile()) continue;
 			scanned++;
 			try {
-				const stat = statSync(entryPath);
+				const fileStat = await stat(entryPath);
 				let line: number | null = null;
 				let preview: string | null = null;
 				let matched = entry.name.toLocaleLowerCase("zh-CN").includes(needle);
 				if (mode === "content") {
 					matched = false;
-					if (stat.size <= MAX_SEARCH_FILE_BYTES && isTextFilePath(entryPath)) {
-						const lines = decodeTextBuffer(readFileSync(entryPath)).text.split(/\r?\n/);
+					if (fileStat.size <= MAX_SEARCH_FILE_BYTES && isTextFilePath(entryPath)) {
+						const lines = decodeTextBuffer(await readFile(entryPath)).text.split(/\r?\n/);
 						const index = lines.findIndex((value) => value.toLocaleLowerCase("zh-CN").includes(needle));
 						if (index >= 0) {
 							matched = true;
@@ -298,8 +303,8 @@ export function searchFiles(
 					results.push({
 						path: entryPath,
 						name: entry.name,
-						size: stat.size,
-						mtime: stat.mtimeMs,
+						size: fileStat.size,
+						mtime: fileStat.mtimeMs,
 						isWorkspace: isWorkspacePath(entryPath),
 						line,
 						preview,

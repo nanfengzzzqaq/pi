@@ -1,8 +1,8 @@
 ﻿# Pi 控制台 Electron 版构建脚本
 #
-# 流程：版本同步（读 console package.json）→ 拷贝 src/web/packs/skills → 安装生产依赖
-#       → electron-builder 打 NSIS 安装包
-# 产物：installer/electron/dist/Pi控制台-Setup-<version>.exe
+# 流程：版本同步（读 console package.json）→ 拷贝 src/web/packs/skills → 编译并安装本地 agent
+#       → 校验本地 agent → electron-builder 打 NSIS 安装包 → 校验 app.asar
+# 产物：中文安装包及供客户端更新使用的 PiConsole-Setup-<version>.exe
 #
 # 用法：powershell -ExecutionPolicy Bypass -File electron-build.ps1
 
@@ -15,6 +15,8 @@ if (-not $env:NODE_USE_ENV_PROXY) { $env:NODE_USE_ENV_PROXY = "1" }
 
 $ElectronDir = Join-Path $PSScriptRoot "electron"
 $ConsoleDir = Split-Path $PSScriptRoot -Parent
+$RepositoryRoot = (Resolve-Path (Join-Path $ConsoleDir "..\..")).Path
+$CodingAgentDir = Join-Path $RepositoryRoot "packages\coding-agent"
 
 Write-Host "== Pi 控制台 Electron 版构建 =="
 
@@ -120,28 +122,73 @@ foreach ($Tool in $SearchTools) {
     Write-Host "已预置文件搜索工具：$($Tool.Name) $($Tool.Version)"
 }
 
-# 3. 生产依赖（registry 发布版 SDK；发布版自带 bundle 依赖，但显式声明 typebox 供 packs 引用）
-Push-Location $ElectronDir
+# 3. 先编译当前仓库，再将本地 coding-agent 压包安装进 Electron 暂存目录。
+# package.json 仍保留 registry 版本用于依赖解析；最终实际装入安装包的 agent 必须来自本仓库。
+$LocalAgentPackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-console-local-agent-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $LocalAgentPackageDir -Force | Out-Null
 try {
-    cmd /c "npm install --no-audit --no-fund"
-    if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
-} finally {
-    Pop-Location
-}
+    Push-Location $RepositoryRoot
+    try {
+        & npm.cmd run build:offline
+        if ($LASTEXITCODE -ne 0) { throw "本地仓库编译失败" }
 
-# 4. 生成图标并打包
-Push-Location $ElectronDir
-try {
-    node scripts/generate-icon.js
-    cmd /c "npx electron-builder --win nsis"
-    if ($LASTEXITCODE -ne 0) { throw "electron-builder 失败" }
+        & npm.cmd pack --workspace=@earendil-works/pi-coding-agent --pack-destination $LocalAgentPackageDir
+        if ($LASTEXITCODE -ne 0) { throw "本地 coding-agent 打包失败" }
+    } finally {
+        Pop-Location
+    }
+
+    $LocalAgentPackages = @(Get-ChildItem -LiteralPath $LocalAgentPackageDir -Filter "*.tgz" -File)
+    if ($LocalAgentPackages.Count -ne 1) {
+        throw "本地 coding-agent 压包数量异常：$($LocalAgentPackages.Count)"
+    }
+    $LocalAgentPackage = $LocalAgentPackages[0].FullName
+
+    Push-Location $ElectronDir
+    try {
+        & npm.cmd install --no-audit --no-fund
+        if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
+
+        & npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage
+        if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
+    } finally {
+        Pop-Location
+    }
+
+    $Verifier = Join-Path $ElectronDir "scripts\verify-local-agent.js"
+    $LocalAgentDist = Join-Path $CodingAgentDir "dist"
+    $InstalledAgentDist = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent\dist"
+    node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
+    if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 coding-agent 与本地构建不一致" }
+    Write-Host "已校验 Electron 暂存目录中的本地 coding-agent"
+
+    # 4. 生成图标并打包，再从 app.asar 读取关键文件做第二次哈希校验。
+    Push-Location $ElectronDir
+    try {
+        node scripts/generate-icon.js
+        & npx.cmd electron-builder --win nsis
+        if ($LASTEXITCODE -ne 0) { throw "electron-builder 失败" }
+    } finally {
+        Pop-Location
+    }
+
+    $PackagedAsar = Join-Path $ElectronDir "dist\win-unpacked\resources\app.asar"
+    if (-not (Test-Path -LiteralPath $PackagedAsar)) { throw "未找到打包结果 $PackagedAsar" }
+    node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
+    if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
+    Write-Host "已校验 app.asar 中的本地 coding-agent"
 } finally {
-    Pop-Location
+	if (Test-Path -LiteralPath $LocalAgentPackageDir) {
+		Remove-Item -LiteralPath $LocalAgentPackageDir -Recurse -Force
+	}
 }
 
 $SetupExe = Join-Path $ElectronDir "dist\Pi控制台-Setup-$Version.exe"
 if (-not (Test-Path $SetupExe)) { throw "未找到产物 $SetupExe" }
+$UpdateAsset = Join-Path $ElectronDir "dist\PiConsole-Setup-$Version.exe"
+Copy-Item -LiteralPath $SetupExe -Destination $UpdateAsset -Force
 $SizeMb = [math]::Round((Get-Item $SetupExe).Length / 1MB, 1)
 Write-Host ""
 Write-Host "== 构建完成 =="
 Write-Host "产物：$SetupExe（$SizeMb MB）"
+Write-Host "更新发布文件：$UpdateAsset"

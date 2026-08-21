@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	applyHttpProxySettings,
 	configureHttpDispatcher,
+	createCachedSystemProxyReader,
 	parseWindowsSystemProxy,
 } from "../src/core/http-dispatcher.ts";
 
@@ -60,6 +61,20 @@ describe("http proxy settings", () => {
 		expect(process.env.HTTPS_PROXY).toBe("http://env-https:8080");
 	});
 
+	it("does not mix WinINET bypass rules into an explicit environment proxy", () => {
+		process.env.HTTPS_PROXY = "http://env-https:8080";
+		process.env.NO_PROXY = "env.internal";
+		const readSystemProxy = vi.fn(() => ({
+			httpsProxy: "http://system:7897",
+			noProxy: ["system.internal"],
+		}));
+
+		applyHttpProxySettings(undefined, readSystemProxy);
+
+		expect(readSystemProxy).not.toHaveBeenCalled();
+		expect(process.env.NO_PROXY).toBe("env.internal,localhost,127.0.0.1,::1");
+	});
+
 	it("ignores empty values", () => {
 		applyHttpProxySettings("   ", () => undefined);
 
@@ -75,6 +90,16 @@ describe("http proxy settings", () => {
 
 		expect(process.env.HTTP_PROXY).toBe("http://127.0.0.1:7897");
 		expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:7897");
+	});
+
+	it("merges safely representable WinINET proxy overrides into NO_PROXY", () => {
+		applyHttpProxySettings(undefined, () => ({
+			httpProxy: "http://127.0.0.1:7897",
+			httpsProxy: "http://127.0.0.1:7897",
+			noProxy: ["internal.example", "*.corp.example"],
+		}));
+
+		expect(process.env.NO_PROXY).toBe("localhost,127.0.0.1,::1,internal.example,*.corp.example");
 	});
 
 	it("preserves existing NO_PROXY entries while adding local model endpoints", () => {
@@ -104,6 +129,34 @@ ProxyServer    REG_SZ    http=proxy.test:8080;https=secure.test:8443
 			httpProxy: "http://proxy.test:8080",
 			httpsProxy: "http://secure.test:8443",
 		});
+	});
+
+	it("parses ProxyOverride without broadening unsupported WinINET patterns", () => {
+		expect(
+			parseWindowsSystemProxy(`
+ProxyEnable      REG_DWORD    0x1
+ProxyServer      REG_SZ       127.0.0.1:7897
+ProxyOverride    REG_SZ       <local>;internal.example;*.corp.example;10.*;https://invalid.example
+`),
+		).toEqual({
+			httpProxy: "http://127.0.0.1:7897",
+			httpsProxy: "http://127.0.0.1:7897",
+			noProxy: ["internal.example", "*.corp.example"],
+		});
+	});
+
+	it("caches a system proxy lookup, including an unavailable result", () => {
+		const availableLookup = vi.fn(() => ({ httpProxy: "http://proxy.test:8080" }));
+		const readAvailable = createCachedSystemProxyReader(availableLookup);
+		expect(readAvailable()).toEqual({ httpProxy: "http://proxy.test:8080" });
+		expect(readAvailable()).toEqual({ httpProxy: "http://proxy.test:8080" });
+		expect(availableLookup).toHaveBeenCalledOnce();
+
+		const unavailableLookup = vi.fn(() => undefined);
+		const readUnavailable = createCachedSystemProxyReader(unavailableLookup);
+		expect(readUnavailable()).toBeUndefined();
+		expect(readUnavailable()).toBeUndefined();
+		expect(unavailableLookup).toHaveBeenCalledOnce();
 	});
 
 	it("ignores disabled WinINET proxy settings", () => {
@@ -169,5 +222,14 @@ describe("http dispatcher", () => {
 		);
 		expect(connectSpy.mock.calls[0]?.[0]).not.toHaveProperty("autoSelectFamily");
 		expect(net.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(originalAttemptTimeoutMs);
+	});
+
+	it("keeps the process dispatcher when its effective configuration is unchanged", () => {
+		configureHttpDispatcher();
+		const firstDispatcher = undici.getGlobalDispatcher();
+
+		configureHttpDispatcher();
+
+		expect(undici.getGlobalDispatcher()).toBe(firstDispatcher);
 	});
 });

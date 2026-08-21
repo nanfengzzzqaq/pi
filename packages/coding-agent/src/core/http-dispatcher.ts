@@ -20,6 +20,7 @@ let installedGlobalFetch: typeof globalThis.fetch | undefined;
 export interface SystemHttpProxySettings {
 	httpProxy?: string;
 	httpsProxy?: string;
+	noProxy?: string[];
 }
 
 const WINDOWS_INTERNET_SETTINGS_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
@@ -31,16 +32,36 @@ function normalizeProxyUrl(value: string | undefined): string | undefined {
 	return /^[a-z][a-z\d+.-]*:\/\//iu.test(proxy) ? proxy : `http://${proxy}`;
 }
 
+function parseWindowsProxyOverrides(output: string): string[] {
+	const value = output.match(/^\s*ProxyOverride\s+REG_SZ\s+(.+?)\s*$/imu)?.[1]?.trim();
+	if (!value) return [];
+
+	return value
+		.split(";")
+		.map((entry) => entry.trim())
+		.filter((entry) => {
+			if (!entry) return false;
+			// WinINET's <local> means every hostname without a dot. NO_PROXY has no
+			// equivalent, so omitting it is safer than bypassing unrelated hosts.
+			if (/^<[^>]+>$/u.test(entry)) return false;
+			if (entry.includes("://") || /[\s/?#]/u.test(entry)) return false;
+			// Undici supports the conventional leading "*." suffix form, but not
+			// arbitrary WinINET wildcards such as 10.* or *-internal.
+			return !entry.includes("*") || /^\*\.[^*]+$/u.test(entry);
+		});
+}
+
 /** Parse the WinINET proxy values emitted by `reg.exe query`. */
 export function parseWindowsSystemProxy(output: string): SystemHttpProxySettings | undefined {
 	const enabledMatch = output.match(/^\s*ProxyEnable\s+REG_DWORD\s+(\S+)\s*$/imu);
 	if (!enabledMatch || Number(enabledMatch[1] ?? 0) !== 1) return undefined;
 	const server = output.match(/^\s*ProxyServer\s+REG_SZ\s+(.+?)\s*$/imu)?.[1]?.trim();
 	if (!server) return undefined;
+	const noProxy = parseWindowsProxyOverrides(output);
 
 	if (!server.includes("=")) {
 		const proxy = normalizeProxyUrl(server);
-		return proxy ? { httpProxy: proxy, httpsProxy: proxy } : undefined;
+		return proxy ? { httpProxy: proxy, httpsProxy: proxy, ...(noProxy.length > 0 ? { noProxy } : {}) } : undefined;
 	}
 
 	const entries = new Map(
@@ -52,10 +73,24 @@ export function parseWindowsSystemProxy(output: string): SystemHttpProxySettings
 	);
 	const httpProxy = normalizeProxyUrl(entries.get("http"));
 	const httpsProxy = normalizeProxyUrl(entries.get("https"));
-	return httpProxy || httpsProxy ? { httpProxy, httpsProxy } : undefined;
+	return httpProxy || httpsProxy ? { httpProxy, httpsProxy, ...(noProxy.length > 0 ? { noProxy } : {}) } : undefined;
 }
 
-function readWindowsSystemProxy(): SystemHttpProxySettings | undefined {
+export function createCachedSystemProxyReader(
+	readSystemProxy: () => SystemHttpProxySettings | undefined,
+): () => SystemHttpProxySettings | undefined {
+	let initialized = false;
+	let cached: SystemHttpProxySettings | undefined;
+	return () => {
+		if (!initialized) {
+			cached = readSystemProxy();
+			initialized = true;
+		}
+		return cached;
+	};
+}
+
+const readWindowsSystemProxy = createCachedSystemProxyReader((): SystemHttpProxySettings | undefined => {
 	if (process.platform !== "win32") return undefined;
 	try {
 		const output = execFileSync("reg.exe", ["query", WINDOWS_INTERNET_SETTINGS_KEY], {
@@ -67,9 +102,9 @@ function readWindowsSystemProxy(): SystemHttpProxySettings | undefined {
 	} catch {
 		return undefined;
 	}
-}
+});
 
-function addLoopbackProxyBypass(): void {
+function addProxyBypass(systemNoProxy: readonly string[] = []): void {
 	const keys = ["NO_PROXY", "no_proxy"] as const;
 	const configuredKeys = keys.filter((key) => process.env[key] !== undefined);
 	for (const key of configuredKeys.length > 0 ? configuredKeys : ["NO_PROXY" as const]) {
@@ -78,8 +113,12 @@ function addLoopbackProxyBypass(): void {
 			.map((entry) => entry.trim())
 			.filter(Boolean);
 		const normalized = new Set(entries.map((entry) => entry.toLowerCase()));
-		for (const host of LOOPBACK_NO_PROXY_HOSTS) {
-			if (!normalized.has(host)) entries.push(host);
+		for (const host of [...LOOPBACK_NO_PROXY_HOSTS, ...systemNoProxy]) {
+			const normalizedHost = host.toLowerCase();
+			if (!normalized.has(normalizedHost)) {
+				entries.push(host);
+				normalized.add(normalizedHost);
+			}
 		}
 		process.env[key] = entries.join(",");
 	}
@@ -114,7 +153,7 @@ export function formatHttpIdleTimeoutMs(timeoutMs: number): string {
 export function applyHttpProxySettings(
 	httpProxy: string | undefined,
 	readSystemProxy: () => SystemHttpProxySettings | undefined = readWindowsSystemProxy,
-): void {
+): SystemHttpProxySettings | undefined {
 	const proxy = normalizeProxyUrl(httpProxy);
 	const hasEnvironmentProxy = Boolean(
 		process.env.HTTP_PROXY ?? process.env.http_proxy ?? process.env.HTTPS_PROXY ?? process.env.https_proxy,
@@ -130,8 +169,9 @@ export function applyHttpProxySettings(
 	}
 
 	if (process.env.HTTP_PROXY ?? process.env.http_proxy ?? process.env.HTTPS_PROXY ?? process.env.https_proxy) {
-		addLoopbackProxyBypass();
+		addProxyBypass(systemProxy?.noProxy);
 	}
+	return systemProxy;
 }
 
 const ignoreUndiciDispatcherError = (_error: unknown): void => {};
@@ -163,10 +203,25 @@ function createUndiciOriginDispatcher(origin: string | URL, options: object): un
 	);
 }
 
+let installedGlobalDispatcher: undici.Dispatcher | undefined;
+let installedDispatcherConfiguration: string | undefined;
+
 export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TIMEOUT_MS): void {
 	const normalizedTimeoutMs = parseHttpIdleTimeoutMs(timeoutMs);
 	if (normalizedTimeoutMs === undefined) {
 		throw new Error(`Invalid HTTP idle timeout: ${String(timeoutMs)}`);
+	}
+	const configuration = JSON.stringify([
+		normalizedTimeoutMs,
+		process.env.http_proxy ?? process.env.HTTP_PROXY ?? "",
+		process.env.https_proxy ?? process.env.HTTPS_PROXY ?? "",
+	]);
+	if (
+		installedGlobalDispatcher !== undefined &&
+		undici.getGlobalDispatcher() === installedGlobalDispatcher &&
+		configuration === installedDispatcherConfiguration
+	) {
+		return;
 	}
 	const dispatcher = withUndiciErrorListener(
 		new undici.EnvHttpProxyAgent({
@@ -181,6 +236,8 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 		}),
 	);
 	undici.setGlobalDispatcher(dispatcher);
+	installedGlobalDispatcher = dispatcher;
+	installedDispatcherConfiguration = configuration;
 	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
 	// bundled fetch can otherwise consume compressed responses through npm undici's
 	// dispatcher without decompressing them, causing response.json() failures.

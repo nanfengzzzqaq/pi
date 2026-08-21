@@ -30,6 +30,20 @@ describe("parseWindowsSystemProxy", () => {
 `),
 		).toBeUndefined();
 	});
+
+	it("uses the shared agent parser for WinINET bypass entries", () => {
+		expect(
+			parseWindowsSystemProxy(`
+    ProxyEnable      REG_DWORD    0x1
+    ProxyServer      REG_SZ       127.0.0.1:7897
+    ProxyOverride    REG_SZ       <local>;internal.example;10.*
+`),
+		).toEqual({
+			httpProxy: "http://127.0.0.1:7897",
+			httpsProxy: "http://127.0.0.1:7897",
+			noProxy: ["internal.example"],
+		});
+	});
 });
 
 describe("applyConsoleProxySettings", () => {
