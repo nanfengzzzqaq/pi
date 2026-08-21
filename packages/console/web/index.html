@@ -16,6 +16,7 @@
 		<span class="logo">Pi 控制台</span>
 		<span id="conn-state" class="conn-state">连接中…</span>
 		<div class="topbar-right">
+			<button id="workbench-btn" class="secondary-btn small" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）">工作台</button>
 			<button id="agent-browser-btn" class="secondary-btn small" type="button" title="打开客户端独立浏览器（agent_browser）">浏览器</button>
 			<button id="theme-btn" class="icon-btn" title="切换主题">🌙</button>
 			<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新 / MCP）">⚙</button>
@@ -214,6 +215,8 @@
 							<div class="office-preview-actions">
 								<button id="review-copy" class="icon-btn small" type="button" title="复制完整差异">⧉</button>
 								<button id="review-refresh" class="icon-btn small" type="button" title="刷新差异">⟳</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台（Ctrl+Alt+B）">×</button>
 							</div>
 						</header>
 						<div id="review-summary" class="review-summary"></div>
@@ -224,15 +227,18 @@
 					<div id="terminal-pane" class="workbench-pane" hidden>
 						<header class="workbench-pane-header">
 							<div class="workbench-pane-heading">
-								<span class="office-preview-kicker">本地终端（bash / powershell）</span>
-								<strong id="terminal-title" class="office-preview-title">执行记录</strong>
+								<span class="office-preview-kicker">统一终端（terminal）</span>
+								<strong id="terminal-title" class="office-preview-title">智能体执行</strong>
 								<span id="terminal-status" class="office-preview-status">空闲</span>
 							</div>
 							<div class="office-preview-actions">
 								<button id="terminal-copy" class="icon-btn small" type="button" title="复制终端输出">⧉</button>
-								<button id="terminal-clear" class="icon-btn small" type="button" title="清空终端记录">×</button>
+								<button id="terminal-clear" class="icon-btn small" type="button" title="清空终端记录">⌫</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台（Ctrl+Alt+B）">×</button>
 							</div>
 						</header>
+						<div class="terminal-shell-note">同一窗口按时间显示；Windows 系统操作由 PowerShell 执行，跨平台命令由 Bash 执行。</div>
 						<div id="terminal-output" class="terminal-output">
 							<div class="terminal-empty">智能体运行本地命令时，这里会实时显示命令与输出。</div>
 						</div>
@@ -247,7 +253,8 @@
 							</div>
 							<div class="office-preview-actions">
 								<button id="side-browser-external" class="icon-btn small" type="button" title="在系统浏览器中打开当前网页">↗</button>
-								<button id="side-browser-close" class="icon-btn small" type="button" title="隐藏客户端浏览器，后台任务不会停止">×</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button id="side-browser-close" class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台；后台网页任务不会停止">×</button>
 							</div>
 						</header>
 						<div class="agent-browser-toolbar">
@@ -256,6 +263,12 @@
 							<button id="side-browser-refresh" class="icon-btn small" type="button" title="刷新">⟳</button>
 							<input id="side-browser-address" type="text" aria-label="浏览器地址" placeholder="输入网址或搜索内容" autocomplete="off">
 							<button id="side-browser-go" class="secondary-btn small" type="button">打开</button>
+						</div>
+						<div class="agent-browser-contextbar">
+							<button id="side-browser-pick" class="secondary-btn small" type="button" title="在网页中点选元素，并把元素信息加入当前输入框">选取元素</button>
+							<button id="side-browser-screenshot" class="secondary-btn small" type="button" title="保存当前网页截图">保存截图</button>
+							<button id="side-browser-devtools" class="secondary-btn small" type="button" title="打开浏览器开发者工具">开发者工具</button>
+							<span id="side-browser-hint" class="agent-browser-hint">智能体只操作此独立浏览器，不影响你的系统浏览器。</span>
 						</div>
 						<div id="side-browser-stage" class="agent-browser-stage">
 							<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>

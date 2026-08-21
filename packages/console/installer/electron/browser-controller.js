@@ -146,7 +146,10 @@ export class AgentBrowserController {
 
 	hide() {
 		this.isOpen = false;
-		if (this.view && !this.view.webContents.isDestroyed()) this.view.setVisible(false);
+		if (this.view && !this.view.webContents.isDestroyed()) {
+			void this.view.webContents.executeJavaScript("window.__piCancelElementPick?.()").catch(() => {});
+			this.view.setVisible(false);
+		}
 		return this.emitState();
 	}
 
@@ -177,6 +180,85 @@ export class AgentBrowserController {
 		const view = this.ensureView();
 		view.webContents.reload();
 		return this.emitState();
+	}
+
+	toggleDevtools() {
+		const view = this.ensureView();
+		if (view.webContents.isDevToolsOpened()) view.webContents.closeDevTools();
+		else view.webContents.openDevTools({ mode: "detach", activate: true });
+		this.status = view.webContents.isDevToolsOpened() ? "开发者工具已打开" : "开发者工具已关闭";
+		return this.emitState();
+	}
+
+	/**
+	 * 让用户直接在独立浏览器里点选网页元素。只返回精简的可验证引用，
+	 * 由渲染进程决定是否加入输入框，不会自动发送给模型。
+	 */
+	async pickElement() {
+		const view = this.ensureView();
+		await this.open();
+		this.status = "请选择网页元素（browser_pick）";
+		this.emitState();
+		const picked = await view.webContents.executeJavaScript(`new Promise((resolve) => {
+			window.__piCancelElementPick?.();
+			const overlay = document.createElement('div');
+			overlay.setAttribute('data-pi-element-picker', '');
+			Object.assign(overlay.style, {
+				position: 'fixed', zIndex: '2147483647', pointerEvents: 'none',
+				border: '2px solid #4f7cff', background: 'rgba(79,124,255,.12)',
+				boxSizing: 'border-box', display: 'none'
+			});
+			document.documentElement.appendChild(overlay);
+			const cssPath = (element) => {
+				if (element.id) return '#' + CSS.escape(element.id);
+				const parts = [];
+				let node = element;
+				while (node && node.nodeType === 1 && node !== document.documentElement) {
+					let part = node.tagName.toLowerCase();
+					const testId = node.getAttribute('data-testid') || node.getAttribute('data-test');
+					if (testId) { part += '[data-testid="' + CSS.escape(testId) + '"]'; parts.unshift(part); break; }
+					const siblings = node.parentElement ? [...node.parentElement.children].filter((item) => item.tagName === node.tagName) : [];
+					if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';
+					parts.unshift(part);
+					node = node.parentElement;
+				}
+				return parts.join(' > ');
+			};
+			const cleanup = (result) => {
+				document.removeEventListener('mouseover', onHover, true);
+				document.removeEventListener('click', onClick, true);
+				document.removeEventListener('keydown', onKey, true);
+				overlay.remove();
+				delete window.__piCancelElementPick;
+				resolve(result);
+			};
+			const onHover = (event) => {
+				const rect = event.target.getBoundingClientRect();
+				Object.assign(overlay.style, {
+					display: 'block', left: rect.left + 'px', top: rect.top + 'px',
+					width: rect.width + 'px', height: rect.height + 'px'
+				});
+			};
+			const onClick = (event) => {
+				event.preventDefault(); event.stopPropagation(); event.stopImmediatePropagation();
+				const element = event.target;
+				const rect = element.getBoundingClientRect();
+				cleanup({
+					title: document.title, url: location.href,
+					text: (element.innerText || element.value || element.getAttribute('aria-label') || element.getAttribute('title') || '').replace(/\\s+/g, ' ').trim().slice(0, 500),
+					selector: cssPath(element),
+					x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height)
+				});
+			};
+			const onKey = (event) => { if (event.key === 'Escape') { event.preventDefault(); cleanup(null); } };
+			window.__piCancelElementPick = () => cleanup(null);
+			document.addEventListener('mouseover', onHover, true);
+			document.addEventListener('click', onClick, true);
+			document.addEventListener('keydown', onKey, true);
+		})`, true);
+		this.status = picked ? "网页元素已加入输入框" : "已取消选取网页元素";
+		this.emitState();
+		return picked;
 	}
 
 	async snapshot(maxChars) {

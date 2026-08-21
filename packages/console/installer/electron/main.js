@@ -161,6 +161,21 @@ ipcMain.handle("pi:browser-navigate", (_event, url) => agentBrowser?.navigate(St
 ipcMain.handle("pi:browser-back", () => agentBrowser?.back());
 ipcMain.handle("pi:browser-forward", () => agentBrowser?.forward());
 ipcMain.handle("pi:browser-reload", () => agentBrowser?.reload());
+ipcMain.handle("pi:browser-devtools", () => agentBrowser?.toggleDevtools());
+ipcMain.handle("pi:browser-pick-element", () => agentBrowser?.pickElement());
+ipcMain.handle("pi:browser-screenshot", async () => {
+	if (!agentBrowser) return null;
+	const title = String(agentBrowser.state().title || "网页截图").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+	const options = {
+		title: "保存网页截图",
+		defaultPath: join(app.getPath("pictures"), `${title || "网页截图"}.png`),
+		filters: [{ name: "PNG 图片", extensions: ["png"] }],
+	};
+	const result = win ? await dialog.showSaveDialog(win, options) : await dialog.showSaveDialog(options);
+	if (result.canceled || !result.filePath) return null;
+	await agentBrowser.screenshot(result.filePath);
+	return { path: result.filePath };
+});
 ipcMain.on("pi:browser-bounds", (_event, bounds) => agentBrowser?.setBounds(bounds));
 
 ipcMain.handle("pi:choose-directory", async () => {
