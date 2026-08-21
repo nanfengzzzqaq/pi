@@ -2,11 +2,10 @@
  * 应用自更新（用户触发）：从 GitHub Release 拉取最新 Setup exe，
  * 静默重装（NSIS /S 覆盖安装目录）后自动重启客户端。
  *
- * 更新链：下载到 <DATA_DIR>/update/ → 校验大小和 SHA256 → 派生独立 PowerShell 进程
- * （等 2 秒让本进程退出释放文件 → 运行 Setup /S → 重启当前客户端）
- * → 本进程 exit。
+ * 更新链：下载到 <DATA_DIR>/update/ → 校验大小和 SHA256 → 记录待更新状态
+ * → Electron 主进程直接启动 NSIS → 优雅退出 → NSIS 覆盖安装并重启客户端。
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	createReadStream,
@@ -15,17 +14,27 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
+import { launchDesktopUpdateInstaller } from "./desktop-update-runtime.ts";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
 const REPO = "nanfengzzzqaq/pi";
 const GITHUB_LATEST_API = `https://api.github.com/repos/${REPO}/releases/latest`;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+const UPDATE_DIR = join(DATA_DIR, "update");
+const PENDING_UPDATE_FILE = join(UPDATE_DIR, "pending-update.json");
+
+/**
+ * electron-builder/NSIS 原生支持的升级参数。直接启动安装包，不再经过容易被
+ * Windows 策略或安全软件静默终止的 PowerShell/VBS 中间层。
+ */
+export const UPDATE_INSTALLER_ARGS = ["--updated", "/S", "--force-run", "/currentuser"] as const;
 
 /** 当前应用版本（staging/app 与开发目录共用同一个 package.json） */
 export const APP_VERSION = (() => {
@@ -140,16 +149,26 @@ export function clearGithubToken(): boolean {
 	return true;
 }
 
-/** 启动时清理历史更新残留（中断的安装包与错误日志，超过 7 天删除）。 */
-export function cleanupStaleUpdateFiles(maxAgeMs = 7 * 24 * 60 * 60 * 1000): number {
-	const updateDir = join(DATA_DIR, "update");
+/**
+ * 启动时清理历史更新残留。安装包是可重新下载的缓存：除当前待恢复的版本外，
+ * 旧安装包立即清理；诊断日志等普通文件仍保留 7 天。
+ */
+export function cleanupStaleUpdateFiles(maxAgeMs = 7 * 24 * 60 * 60 * 1000, updateDir = UPDATE_DIR): number {
+	const pendingFile = join(updateDir, basename(PENDING_UPDATE_FILE));
+	const pendingSetup = readPendingUpdate(updateDir)?.setupPath;
+	const pendingSetupKey = pendingSetup ? resolve(pendingSetup).toLocaleLowerCase("en-US") : null;
 	let removed = 0;
 	try {
 		for (const name of readdirSync(updateDir)) {
 			const file = join(updateDir, name);
 			try {
 				const stats = statSync(file);
-				if (stats.isFile() && Date.now() - stats.mtimeMs > maxAgeMs) {
+				if (!stats.isFile() || file === pendingFile) continue;
+				const managedInstaller = /^Pi.*-Setup-.*\.exe$/iu.test(name);
+				const obsoleteInstaller = managedInstaller && resolve(file).toLocaleLowerCase("en-US") !== pendingSetupKey;
+				const obsoleteHelper = name === "apply-update.cmd" || name === "apply-update.ps1";
+				const incompleteDownload = name.endsWith(".part");
+				if (obsoleteInstaller || obsoleteHelper || incompleteDownload || Date.now() - stats.mtimeMs > maxAgeMs) {
 					unlinkSync(file);
 					removed++;
 				}
@@ -188,15 +207,153 @@ async function latestTagViaRedirect(
 	}
 }
 
-function compareVersions(a: string, b: string): number {
-	const pa = a.replace(/^v/, "").split(".").map(Number);
-	const pb = b.replace(/^v/, "").split(".").map(Number);
-	for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-		const da = pa[i] ?? 0;
-		const db = pb[i] ?? 0;
+interface ParsedVersion {
+	core: number[];
+	prerelease: string[] | null;
+}
+
+function parseVersion(value: string): ParsedVersion | null {
+	const match = value.trim().match(/^v?(\d+(?:\.\d+){1,3})(?:-([0-9A-Za-z.-]+))?$/);
+	if (!match) return null;
+	const core = match[1].split(".").map(Number);
+	if (core.some((part) => !Number.isSafeInteger(part))) return null;
+	return { core, prerelease: match[2] ? match[2].split(".") : null };
+}
+
+function compareVersions(a: string, b: string): number | null {
+	const pa = parseVersion(a);
+	const pb = parseVersion(b);
+	if (!pa || !pb) return null;
+	for (let i = 0; i < Math.max(pa.core.length, pb.core.length); i++) {
+		const da = pa.core[i] ?? 0;
+		const db = pb.core[i] ?? 0;
 		if (da !== db) return da - db;
 	}
+	if (pa.prerelease === null && pb.prerelease === null) return 0;
+	if (pa.prerelease === null) return 1;
+	if (pb.prerelease === null) return -1;
+	for (let i = 0; i < Math.max(pa.prerelease.length, pb.prerelease.length); i++) {
+		const da = pa.prerelease[i];
+		const db = pb.prerelease[i];
+		if (da === undefined) return -1;
+		if (db === undefined) return 1;
+		if (da === db) continue;
+		const daNumber = /^\d+$/.test(da) ? Number(da) : null;
+		const dbNumber = /^\d+$/.test(db) ? Number(db) : null;
+		if (daNumber !== null && dbNumber !== null) return daNumber - dbNumber;
+		if (daNumber !== null) return -1;
+		if (dbNumber !== null) return 1;
+		return da.localeCompare(db, "en-US");
+	}
 	return 0;
+}
+
+interface PendingUpdateRecord {
+	fromVersion: string;
+	targetVersion: string;
+	setupPath: string;
+	startedAt: number;
+	lastError?: string;
+}
+
+export interface UpdateRecovery {
+	state: "completed" | "failed";
+	fromVersion: string;
+	targetVersion: string;
+	setupPath: string;
+	startedAt: number;
+	installerAvailable: boolean;
+	message: string;
+	lastError?: string;
+}
+
+function isManagedUpdatePath(path: string, updateDir = UPDATE_DIR): boolean {
+	const candidate = resolve(path);
+	const root = resolve(updateDir);
+	const prefix = root.endsWith(sep) ? root : root + sep;
+	const normalizedCandidate = process.platform === "win32" ? candidate.toLocaleLowerCase("en-US") : candidate;
+	const normalizedPrefix = process.platform === "win32" ? prefix.toLocaleLowerCase("en-US") : prefix;
+	return normalizedCandidate.startsWith(normalizedPrefix) && /^Pi.*-Setup-.*\.exe$/iu.test(basename(candidate));
+}
+
+function readPendingUpdate(updateDir = UPDATE_DIR): PendingUpdateRecord | null {
+	try {
+		const value = JSON.parse(
+			readFileSync(join(updateDir, basename(PENDING_UPDATE_FILE)), "utf8"),
+		) as Partial<PendingUpdateRecord>;
+		if (
+			typeof value.fromVersion !== "string" ||
+			typeof value.targetVersion !== "string" ||
+			typeof value.setupPath !== "string" ||
+			typeof value.startedAt !== "number" ||
+			!Number.isFinite(value.startedAt) ||
+			!isManagedUpdatePath(value.setupPath, updateDir)
+		) {
+			return null;
+		}
+		if (value.lastError !== undefined && typeof value.lastError !== "string") return null;
+		return value as PendingUpdateRecord;
+	} catch {
+		return null;
+	}
+}
+
+function recordPendingFailure(error: unknown): void {
+	try {
+		const pending = readPendingUpdate();
+		if (!pending) return;
+		writePendingUpdate({
+			...pending,
+			lastError: error instanceof Error ? error.message : String(error),
+		});
+	} catch {
+		/* 记录失败原因是尽力而为，不能掩盖原始安装错误。 */
+	}
+}
+
+function writePendingUpdate(record: PendingUpdateRecord, updateDir = UPDATE_DIR): void {
+	mkdirSync(updateDir, { recursive: true });
+	const file = join(updateDir, basename(PENDING_UPDATE_FILE));
+	const temporary = `${file}.tmp`;
+	writeFileSync(temporary, `${JSON.stringify(record, null, "\t")}\n`, "utf8");
+	renameSync(temporary, file);
+}
+
+/**
+ * 新版本启动时核对上一次更新结果。只有实际运行版本达到目标版本，才清理
+ * 待更新记录和安装包；仍是旧版本时保留安装包供用户一键重试。
+ */
+export function reconcilePendingUpdate(updateDir = UPDATE_DIR, currentVersion = APP_VERSION): UpdateRecovery | null {
+	const pending = readPendingUpdate(updateDir);
+	if (!pending) return null;
+	const installerAvailable = existsSync(pending.setupPath);
+	const versionComparison = compareVersions(currentVersion, pending.targetVersion);
+	if (versionComparison !== null && versionComparison >= 0) {
+		try {
+			if (installerAvailable) unlinkSync(pending.setupPath);
+		} catch {
+			/* 安装包清理失败不影响已经成功启动的新版本。 */
+		}
+		try {
+			unlinkSync(join(updateDir, basename(PENDING_UPDATE_FILE)));
+		} catch {
+			/* 状态文件清理失败不影响已经成功启动的新版本。 */
+		}
+		return {
+			state: "completed",
+			...pending,
+			installerAvailable: false,
+			message: `已成功更新到 v${currentVersion}`,
+		};
+	}
+	return {
+		state: "failed",
+		...pending,
+		installerAvailable,
+		message: installerAvailable
+			? `上次自动安装 v${pending.targetVersion} 未完成，安装包已保留，可以直接重新安装${pending.lastError ? `（${pending.lastError}）` : ""}`
+			: `上次自动安装 v${pending.targetVersion} 未完成，安装包已不存在，请重新下载`,
+	};
 }
 
 interface CheckUpdateOptions {
@@ -266,7 +423,13 @@ export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<Upd
 		info.assetUrl = `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(info.assetName)}`;
 	}
 
-	info.updateAvailable = compareVersions(APP_VERSION, info.latest) < 0;
+	const versionComparison = compareVersions(APP_VERSION, info.latest);
+	if (versionComparison === null) {
+		info.latest = null;
+		info.error = "github";
+		return info;
+	}
+	info.updateAvailable = versionComparison < 0;
 	return info;
 }
 
@@ -283,80 +446,14 @@ export interface UpdateProgress {
 }
 
 let progress: UpdateProgress = { running: false, receivedBytes: 0, totalBytes: null, error: null, phase: "idle" };
+let updateRecovery = reconcilePendingUpdate();
 
 export function getUpdateProgress(): UpdateProgress {
 	return { ...progress };
 }
 
-export interface UpdateRelaunchTarget {
-	path: string;
-	source: "current-electron" | "default-electron" | "legacy-launcher";
-}
-
-interface RelaunchTargetOptions {
-	electronRuntime?: boolean;
-	currentExecutable?: string;
-	localAppData?: string;
-	packageRoot?: string;
-	pathExists?: (path: string) => boolean;
-}
-
-/**
- * 确定安装完成后的真实启动目标。Electron 必须优先使用当前进程路径，
- * 因为安装器允许用户把客户端安装到任意磁盘。
- */
-export function resolveUpdateRelaunchTarget(options: RelaunchTargetOptions = {}): UpdateRelaunchTarget | null {
-	const pathExists = options.pathExists ?? existsSync;
-	const electronRuntime = options.electronRuntime ?? Boolean(process.versions.electron);
-	const currentExecutable = options.currentExecutable ?? process.execPath;
-	if (electronRuntime && pathExists(currentExecutable)) {
-		return { path: currentExecutable, source: "current-electron" };
-	}
-
-	const localAppData = options.localAppData ?? process.env.LOCALAPPDATA;
-	if (localAppData) {
-		const defaultElectron = join(localAppData, "Programs", "PiConsole", "PiConsole.exe");
-		if (pathExists(defaultElectron)) return { path: defaultElectron, source: "default-electron" };
-	}
-
-	const legacyLauncher = join(options.packageRoot ?? PACKAGE_ROOT, "..", "launcher.vbs");
-	if (pathExists(legacyLauncher)) return { path: legacyLauncher, source: "legacy-launcher" };
-	return null;
-}
-
-function powerShellLiteral(value: string): string {
-	if (/[\0\r\n]/.test(value)) throw new Error("更新路径包含不支持的控制字符");
-	return `'${value.replaceAll("'", "''")}'`;
-}
-
-/** 生成带 UTF-8 BOM 的更新辅助脚本，确保中文和自定义磁盘路径不会被 cmd 代码页破坏。 */
-export function buildUpdateHelperScript(
-	setupPath: string,
-	relaunchTarget: UpdateRelaunchTarget,
-	errorLogPath: string,
-): string {
-	return (
-		"\uFEFF" +
-		[
-			"$ErrorActionPreference = 'Stop'",
-			`$setupPath = ${powerShellLiteral(setupPath)}`,
-			`$relaunchPath = ${powerShellLiteral(relaunchTarget.path)}`,
-			`$errorLogPath = ${powerShellLiteral(errorLogPath)}`,
-			"Remove-Item -LiteralPath $errorLogPath -Force -ErrorAction SilentlyContinue",
-			"Start-Sleep -Seconds 2",
-			"try {",
-			"\t$installer = Start-Process -FilePath $setupPath -ArgumentList '/S' -PassThru -Wait",
-			'\tif ($installer.ExitCode -ne 0) { throw "安装程序退出码：$($installer.ExitCode)" }',
-			'\tif (-not (Test-Path -LiteralPath $relaunchPath -PathType Leaf)) { throw "更新完成，但启动文件不存在：$relaunchPath" }',
-			"\t# 安装成功后清理安装包，避免 update 目录残留上亿元的旧安装程序",
-			"\tRemove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue",
-			"\tStart-Process -FilePath $relaunchPath",
-			"} catch {",
-			"\t($_ | Out-String) | Set-Content -LiteralPath $errorLogPath -Encoding UTF8",
-			"}",
-			"",
-		].join("\r\n")
-	);
+export function getUpdateRecovery(): UpdateRecovery | null {
+	return updateRecovery ? { ...updateRecovery } : null;
 }
 
 /** 对下载结果同时校验传输长度和 GitHub Release 返回的 SHA256。 */
@@ -383,15 +480,19 @@ export async function verifyDownloadedInstaller(
 export async function runUpdate(): Promise<void> {
 	if (progress.running) return;
 	progress = { running: true, receivedBytes: 0, totalBytes: null, error: null, phase: "downloading" };
+	let partialPath: string | null = null;
 	try {
 		const credential = resolveGithubCredential();
 		const info = await checkUpdate({ credential });
 		if (!info.assetUrl) throw new Error("无法获得更新包下载地址（GitHub 不可达或 Release 缺少 Setup 资产）");
+		if (!info.latest) throw new Error("GitHub Release 没有有效的版本号");
 		if (info.updateAvailable === false) throw new Error(`当前已是最新版 v${APP_VERSION}`);
 
-		const updateDir = join(DATA_DIR, "update");
-		mkdirSync(updateDir, { recursive: true });
-		const setupPath = join(updateDir, info.assetName ?? "Pi控制台-Setup.exe");
+		mkdirSync(UPDATE_DIR, { recursive: true });
+		const assetName = basename(info.assetName ?? "PiConsole-Setup.exe");
+		if (!/^Pi.*-Setup-.*\.exe$/iu.test(assetName)) throw new Error("GitHub Release 的更新包名称不正确");
+		const setupPath = join(UPDATE_DIR, assetName);
+		partialPath = `${setupPath}.${process.pid}.${Date.now()}.part`;
 
 		// 带 token 时优先走 Assets API（私有仓库 browser_download_url 直链会 404）；
 		// 无 token（公开仓库）用 browser_download_url 直链
@@ -412,7 +513,7 @@ export async function runUpdate(): Promise<void> {
 				: info.assetSize;
 
 		await new Promise<void>((resolve, reject) => {
-			const writer = createWriteStream(setupPath);
+			const writer = createWriteStream(partialPath!);
 			const reader = res.body!.getReader();
 			const pump = async (): Promise<void> => {
 				try {
@@ -432,17 +533,63 @@ export async function runUpdate(): Promise<void> {
 			writer.on("error", reject);
 		});
 
-		try {
-			progress.phase = "verifying";
-			await verifyDownloadedInstaller(setupPath, progress.receivedBytes, progress.totalBytes, info.assetDigest);
-		} catch (error) {
-			if (existsSync(setupPath)) unlinkSync(setupPath);
-			throw error;
-		}
+		progress.phase = "verifying";
+		await verifyDownloadedInstaller(partialPath, progress.receivedBytes, progress.totalBytes, info.assetDigest);
+		renameSync(partialPath, setupPath);
+		partialPath = null;
 
 		progress.phase = "installing";
-		installAndRestart(setupPath);
-		// 不在这里 exit：给 HTTP 响应留时间，由派生进程的 2 秒延迟兜底
+		writePendingUpdate({
+			fromVersion: APP_VERSION,
+			targetVersion: info.latest,
+			setupPath,
+			startedAt: Date.now(),
+		});
+		updateRecovery = null;
+		await launchDesktopUpdateInstaller({
+			setupPath,
+			args: [...UPDATE_INSTALLER_ARGS],
+			targetVersion: info.latest,
+		});
+	} catch (error) {
+		if (partialPath) {
+			try {
+				rmSync(partialPath, { force: true });
+			} catch {
+				/* 下次启动会清理未完成的 .part 下载。 */
+			}
+		}
+		progress = {
+			running: false,
+			receivedBytes: 0,
+			totalBytes: null,
+			error: error instanceof Error ? error.message : String(error),
+			phase: "idle",
+		};
+		recordPendingFailure(error);
+		updateRecovery = reconcilePendingUpdate();
+	}
+}
+
+/** 对上次失败且安装包仍在的更新重新执行安装，不重复下载。 */
+export async function retryPendingUpdate(): Promise<void> {
+	if (progress.running) throw new Error("更新任务正在进行");
+	const pending = readPendingUpdate();
+	if (!pending || !existsSync(pending.setupPath)) throw new Error("没有可重新安装的更新包，请重新检查更新");
+	progress = { running: true, receivedBytes: 0, totalBytes: null, error: null, phase: "installing" };
+	updateRecovery = null;
+	try {
+		writePendingUpdate({
+			fromVersion: pending.fromVersion,
+			targetVersion: pending.targetVersion,
+			setupPath: pending.setupPath,
+			startedAt: Date.now(),
+		});
+		await launchDesktopUpdateInstaller({
+			setupPath: pending.setupPath,
+			args: [...UPDATE_INSTALLER_ARGS],
+			targetVersion: pending.targetVersion,
+		});
 	} catch (error) {
 		progress = {
 			running: false,
@@ -451,44 +598,8 @@ export async function runUpdate(): Promise<void> {
 			error: error instanceof Error ? error.message : String(error),
 			phase: "idle",
 		};
+		recordPendingFailure(error);
+		updateRecovery = reconcilePendingUpdate();
+		throw error;
 	}
-}
-
-/**
- * 派生独立 PowerShell 进程执行更新收尾：等 2 秒释放当前程序 → 静默安装 →
- * 从原安装位置重新启动。VBS 仅用于确实存在的旧版客户端。
- */
-function installAndRestart(setupPath: string): void {
-	const relaunchTarget = resolveUpdateRelaunchTarget();
-	if (!relaunchTarget) throw new Error("无法确定更新后的客户端启动位置，请下载最新安装包手动更新");
-	const updateDir = join(DATA_DIR, "update");
-	const helperPath = join(updateDir, "apply-update.ps1");
-	const errorLogPath = join(updateDir, "update-error.log");
-	const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
-	if (!systemRoot) throw new Error("无法定位 Windows PowerShell");
-	const powerShell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-	if (!existsSync(powerShell)) throw new Error(`Windows PowerShell 不存在：${powerShell}`);
-	writeFileSync(helperPath, buildUpdateHelperScript(setupPath, relaunchTarget, errorLogPath), "utf8");
-	const child = spawn(
-		powerShell,
-		["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helperPath],
-		{
-			detached: true,
-			stdio: "ignore",
-			windowsHide: true,
-		},
-	);
-	child.once("spawn", () => {
-		child.unref();
-		setTimeout(() => process.exit(0), 1500);
-	});
-	child.once("error", (error) => {
-		progress = {
-			running: false,
-			receivedBytes: 0,
-			totalBytes: null,
-			error: `无法启动更新辅助程序：${error.message}`,
-			phase: "idle",
-		};
-	});
 }

@@ -7,10 +7,11 @@
 import { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, shell } from "electron";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createServer as createProbeServer } from "node:net";
 import { AgentBrowserController } from "./browser-controller.js";
 import { registerAgentBrowserRuntime } from "./src/agent-browser-runtime.ts";
+import { handOffToDetachedInstaller, registerDesktopUpdateInstaller } from "./src/desktop-update-runtime.ts";
 
 // 数据位置指针固定留在 AppData；实际数据目录可由用户在设置中整体迁移到其他磁盘。
 const storageConfigPath = join(app.getPath("appData"), "pi-console", "storage-location.json");
@@ -30,6 +31,36 @@ process.env.PI_CONSOLE_STORAGE_CONFIG = storageConfigPath;
 process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? configuredDataPath();
 process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(process.env.PI_CONSOLE_DATA, "agent");
 process.env.PORT = process.env.PORT ?? "3200";
+
+/**
+ * 直接把已校验的安装包交给 electron-builder 的 NSIS 更新流程。
+ * 不再派生 PowerShell/VBS 辅助脚本，避免脚本被执行策略或安全软件静默终止。
+ */
+registerDesktopUpdateInstaller(async ({ setupPath, args, targetVersion }) => {
+	const updateRoot = resolve(process.env.PI_CONSOLE_DATA, "update");
+	const setup = resolve(setupPath);
+	const prefix = updateRoot.endsWith(sep) ? updateRoot : updateRoot + sep;
+	if (!setup.toLocaleLowerCase("en-US").startsWith(prefix.toLocaleLowerCase("en-US"))) {
+		throw new Error("更新安装包不在客户端更新目录内");
+	}
+	if (!existsSync(setup) || !statSync(setup).isFile() || !setup.toLocaleLowerCase("en-US").endsWith(".exe")) {
+		throw new Error("更新安装包不存在或格式不正确");
+	}
+
+	await handOffToDetachedInstaller(
+		{ setupPath: setup, args, targetVersion },
+		{
+			onHandedOff: () => {
+				console.log(`更新安装器：已交接 v${targetVersion}，客户端将退出并由 NSIS 重启`);
+				setTimeout(() => {
+					// 优雅退出先释放窗口、后端端口和文件句柄；极端情况下 5 秒后强制退出。
+					setTimeout(() => app.exit(0), 5_000);
+					app.quit();
+				}, 350);
+			},
+		},
+	);
+});
 
 const APP_PORT = Number(process.env.PORT);
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`;
