@@ -38,13 +38,13 @@ describe("Windows 本地资源管理器", () => {
 		expect(readFileSync(second.path, "utf8")).toBe("second");
 	});
 
-	it.runIf(process.platform === "win32")("按文件名和文本内容递归搜索", () => {
+	it.runIf(process.platform === "win32")("按文件名和文本内容递归搜索", async () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-fs-search-test-"));
 		const child = join(root, "资料");
 		mkdirSync(child);
 		writeFileSync(join(child, "季度报告.md"), "第一行\n关键数据：42", "utf8");
-		const byName = searchFiles(root, "季度报告", "name");
-		const byContent = searchFiles(root, "关键数据", "content");
+		const byName = await searchFiles(root, "季度报告", "name");
+		const byContent = await searchFiles(root, "关键数据", "content");
 		expect(byName.results.map((entry) => entry.name)).toContain("季度报告.md");
 		expect(byContent.results[0]?.line).toBe(2);
 		expect(byContent.results[0]?.preview).toContain("42");

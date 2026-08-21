@@ -26,6 +26,7 @@ import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
 import * as fsExplorer from "./fs.ts";
+import { isAllowedLoopbackHost } from "./http-security.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
@@ -53,6 +54,11 @@ import {
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
 import * as redteam from "./redteam.ts";
+import {
+	abortTrackedSessionPrompt,
+	disposeSessionBeforeDelete,
+	type TrackedSessionPrompt,
+} from "./session-lifecycle.ts";
 import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
@@ -138,6 +144,10 @@ interface ConsoleSession {
 	activePackTools: Map<string, Set<string>>;
 	lastCapabilityTrace: CapabilityTrace | null;
 	lastUsage: unknown;
+	/** DELETE 已开始后禁止再提交消息。 */
+	deleting: boolean;
+	/** 包含鉴权/扩展预处理阶段，避免 isStreaming 尚未置位时删除形成孤儿任务。 */
+	activePrompt: TrackedSessionPrompt | null;
 }
 
 const sessions = new Map<string, ConsoleSession>();
@@ -654,6 +664,8 @@ async function createConsoleSession(
 		activePackTools,
 		lastCapabilityTrace: null,
 		lastUsage: null,
+		deleting: false,
+		activePrompt: null,
 	};
 	sessions.set(sessionId, cs);
 	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
@@ -691,6 +703,8 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			activePackTools,
 			lastCapabilityTrace: null,
 			lastUsage: null,
+			deleting: false,
+			activePrompt: null,
 		};
 		sessions.set(sessionId, cs);
 		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
@@ -1267,7 +1281,11 @@ const server = createServer((req, res) => {
 });
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-	const url = new URL(req.url ?? "/", `http://${req.headers.host ?? HOST}`);
+	if (!isAllowedLoopbackHost(req.headers.host, PORT)) {
+		sendJson(res, 403, { error: "请求地址不是 Pi 控制台本机地址" });
+		return;
+	}
+	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 	const pathname = url.pathname;
 
 	if (req.method === "GET" && serveStatic(pathname, res)) return;
@@ -1722,7 +1740,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const query = url.searchParams.get("q") ?? "";
 		const mode = url.searchParams.get("mode") === "content" ? "content" : "name";
 		try {
-			sendJson(res, 200, fsExplorer.searchFiles(path, query, mode));
+			sendJson(res, 200, await fsExplorer.searchFiles(path, query, mode));
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -1916,7 +1934,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "消息正文和附件不能同时为空" });
 				return;
 			}
-			if (cs.session.isStreaming) {
+			if (cs.deleting) {
+				sendJson(res, 409, { error: "当前会话正在删除，不能再提交消息" });
+				return;
+			}
+			if (cs.session.isStreaming || cs.activePrompt) {
 				sendJson(res, 409, { error: "当前正在运行中，请先停止或等待完成" });
 				return;
 			}
@@ -1933,13 +1955,24 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
 			updateSessionTitle(cs.sessionId, text || attachments.map((path) => path.split(/[\\/]/).pop()).join("、"));
-			cs.session.prompt(promptText, { images }).catch((error) => {
-				releaseTurnCapabilities(cs);
-				bufferAndBroadcast(cs, {
-					type: "error",
-					message: error instanceof Error ? error.message : String(error),
-				});
+			let resolvePreflight: (success: boolean) => void = () => undefined;
+			const preflight = new Promise<boolean>((resolvePromise) => {
+				resolvePreflight = resolvePromise;
 			});
+			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve() };
+			activePrompt.done = cs.session
+				.prompt(promptText, { images, preflightResult: resolvePreflight })
+				.catch((error) => {
+					releaseTurnCapabilities(cs);
+					bufferAndBroadcast(cs, {
+						type: "error",
+						message: error instanceof Error ? error.message : String(error),
+					});
+				})
+				.finally(() => {
+					if (cs.activePrompt === activePrompt) cs.activePrompt = null;
+				});
+			cs.activePrompt = activePrompt;
 			return;
 		}
 
@@ -2070,7 +2103,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// POST /api/sessions/:id/abort — 中止当前运行
 		case "POST abort": {
-			await cs.session.abort();
+			if (cs.deleting) {
+				sendJson(res, 409, { error: "当前会话正在删除" });
+				return;
+			}
+			await abortTrackedSessionPrompt(cs.session, cs.activePrompt);
 			sendJson(res, 200, { ok: true });
 			return;
 		}
@@ -2158,6 +2195,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// DELETE /api/sessions/:id — 删除会话（记录 + 会话文件；工作区文件保留）
 		case "DELETE ": {
+			if (cs.deleting) {
+				sendJson(res, 409, { error: "会话删除已在进行中" });
+				return;
+			}
+			cs.deleting = true;
+			try {
+				await disposeSessionBeforeDelete(cs.session, cs.activePrompt);
+			} catch (error) {
+				cs.deleting = false;
+				throw error;
+			}
 			for (const client of cs.sseClients) client.end();
 			sessions.delete(sessionId);
 			const index = readSessionIndex();

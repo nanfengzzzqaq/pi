@@ -213,6 +213,7 @@ export async function createAgentSessionFromServices(
 		modelRuntime: options.services.modelRuntime,
 		settingsManager: options.services.settingsManager,
 		resourceLoader: options.services.resourceLoader,
+		runtimeServicesConfigured: true,
 		sessionManager: options.sessionManager,
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,

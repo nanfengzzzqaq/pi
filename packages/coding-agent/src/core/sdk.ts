@@ -84,6 +84,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
+	/** @internal Set only when AgentSessionServices already initialized HTTP and model discovery. */
+	runtimeServicesConfigured?: boolean;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
 }
@@ -178,10 +180,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
-	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
-	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+	if (!options.runtimeServicesConfigured) {
+		applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
+		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
+	}
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-	await registerDetectedWhiteRabbitNeo(modelRuntime);
+	if (!options.runtimeServicesConfigured) {
+		await registerDetectedWhiteRabbitNeo(modelRuntime);
+	}
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {

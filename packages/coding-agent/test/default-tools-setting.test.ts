@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.ts";
 import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
 import { type CreateAgentSessionOptions, createAgentSession, type InlineExtension } from "../src/core/sdk.ts";
@@ -130,21 +130,28 @@ describe("defaultTools setting", () => {
 	});
 
 	it("applies through service-based session creation", async () => {
+		const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(null, { status: 404 }));
+		vi.stubGlobal("fetch", fetch);
 		const settingsManager = SettingsManager.inMemory({ defaultTools: ["ls"] });
-		const services = await createAgentSessionServices({ cwd: tempDir, agentDir, settingsManager });
-		const { session } = await createAgentSessionFromServices({
-			services,
-			sessionManager: SessionManager.inMemory(tempDir),
-			model: getModel("anthropic", "claude-sonnet-4-5")!,
-		});
+		try {
+			const services = await createAgentSessionServices({ cwd: tempDir, agentDir, settingsManager });
+			const { session } = await createAgentSessionFromServices({
+				services,
+				sessionManager: SessionManager.inMemory(tempDir),
+				model: getModel("anthropic", "claude-sonnet-4-5")!,
+			});
 
-		expect(
-			session
-				.getAllTools()
-				.map((tool) => tool.name)
-				.sort(),
-		).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-		expect(session.getActiveToolNames()).toEqual(["ls"]);
-		session.dispose();
+			expect(
+				session
+					.getAllTools()
+					.map((tool) => tool.name)
+					.sort(),
+			).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
+			expect(session.getActiveToolNames()).toEqual(["ls"]);
+			expect(fetch).toHaveBeenCalledOnce();
+			session.dispose();
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 });

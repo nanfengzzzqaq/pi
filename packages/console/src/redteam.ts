@@ -17,6 +17,7 @@ export const DEFAULT_VERSION = "0.122.0";
 
 const INSTALL_DIR = join(DATA_DIR, "redteam");
 const VERSION_RECORD = join(INSTALL_DIR, "promptfoo-version.json");
+const NPM_AVAILABILITY_TTL_MS = 60_000;
 
 export interface RedTeamStatus {
 	installed: boolean;
@@ -44,6 +45,8 @@ let progress: InstallProgress = {
 	startedAt: null,
 	elapsedMs: 0,
 };
+
+let npmAvailabilityCache: { value: boolean; checkedAt: number } | null = null;
 
 export function getInstallProgress(): InstallProgress {
 	return {
@@ -115,9 +118,23 @@ function run(
 	});
 }
 
-async function npmAvailable(): Promise<boolean> {
+async function probeNpmAvailability(): Promise<boolean> {
 	const r = await run(npmCommand(), ["--version"], { timeoutMs: 15_000, shell: process.platform === "win32" });
 	return r.code === 0;
+}
+
+/** 工具目录短时间内可能重复刷新；缓存环境探测，真正安装前仍强制复查。 */
+export async function npmAvailable(
+	force = false,
+	probe: () => Promise<boolean> = probeNpmAvailability,
+	now = Date.now(),
+): Promise<boolean> {
+	if (!force && npmAvailabilityCache && now - npmAvailabilityCache.checkedAt < NPM_AVAILABILITY_TTL_MS) {
+		return npmAvailabilityCache.value;
+	}
+	const value = await probe();
+	npmAvailabilityCache = { value, checkedAt: now };
+	return value;
 }
 
 export async function getLocalStatus(): Promise<RedTeamStatus> {
@@ -158,7 +175,7 @@ export function startInstall(update: boolean): boolean {
 	};
 	void (async () => {
 		try {
-			if (!(await npmAvailable())) {
+			if (!(await npmAvailable(true))) {
 				throw new Error("未检测到可用的 npm。安装 promptfoo 需要本机有 Node.js 环境。");
 			}
 			const spec = update ? "promptfoo@latest" : `promptfoo@${DEFAULT_VERSION}`;

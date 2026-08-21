@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import defineRedTeamPack, { parseStrategyIds } from "../packs/red-team/index.ts";
 import { loadPacks, selectCapabilities } from "../src/packs.ts";
-import { uninstall } from "../src/redteam.ts";
+import { npmAvailable, uninstall } from "../src/redteam.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -44,6 +44,20 @@ describe("parseStrategyIds", () => {
 });
 
 describe("red-team pack", () => {
+	it("短时间刷新工具目录时复用 npm 探测，安装前可强制复查", async () => {
+		let probes = 0;
+		const probe = async () => {
+			probes++;
+			return true;
+		};
+
+		expect(await npmAvailable(true, probe, 1_000)).toBe(true);
+		expect(await npmAvailable(false, probe, 2_000)).toBe(true);
+		expect(probes).toBe(1);
+		expect(await npmAvailable(true, probe, 2_001)).toBe(true);
+		expect(probes).toBe(2);
+	});
+
 	it("卸载时删除客户端专属安装目录", () => {
 		const installDir = mkdtempSync(join(tmpdir(), "pi-redteam-install-"));
 		temporaryDirectories.push(installDir);
