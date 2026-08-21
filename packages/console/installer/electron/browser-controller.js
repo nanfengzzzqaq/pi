@@ -375,6 +375,59 @@ export class AgentBrowserController {
 		return output;
 	}
 
+	/**
+	 * 把本地文件注入页面的文件上传输入框（DataTransfer 方式，不弹系统对话框）。
+	 * 大文件分块传入页面，避免单次 executeJavaScript 字符串过大。
+	 * files: [{ name, mimeType, dataBase64 }]
+	 */
+	async uploadFiles(files) {
+		const view = this.ensureView();
+		await this.open();
+		this.status = `正在上传 ${files.length} 个附件（browser_upload）`;
+		this.emitState();
+		try {
+			await view.webContents.executeJavaScript("(() => { window.__piUploadFiles = []; return true; })()");
+			for (const file of files) {
+				await view.webContents.executeJavaScript(
+					`window.__piUploadFiles.push({ name: ${JSON.stringify(file.name)}, mimeType: ${JSON.stringify(file.mimeType)}, parts: [] }), true`,
+				);
+				const chunkSize = 262144;
+				for (let offset = 0; offset < file.dataBase64.length; offset += chunkSize) {
+					const chunk = JSON.stringify(file.dataBase64.slice(offset, offset + chunkSize));
+					await view.webContents.executeJavaScript(
+						`window.__piUploadFiles[window.__piUploadFiles.length - 1].parts.push(${chunk}), true`,
+					);
+				}
+			}
+			const output = await view.webContents.executeJavaScript(`(() => {
+				const items = window.__piUploadFiles || [];
+				delete window.__piUploadFiles;
+				const inputs = [...document.querySelectorAll('input[type=file]')];
+				if (inputs.length === 0) throw new Error('页面没有文件上传入口');
+				// 优先可见的上传框；都是隐藏框时取最后一个（页面通常只有一个）
+				const element = inputs.find((el) => el.offsetParent !== null) || inputs[inputs.length - 1];
+				const dt = new DataTransfer();
+				for (const item of items) {
+					const bin = atob(item.parts.join(''));
+					const bytes = new Uint8Array(bin.length);
+					for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+					dt.items.add(new File([bytes], item.name, { type: item.mimeType || 'application/octet-stream' }));
+				}
+				element.files = dt.files;
+				element.dispatchEvent(new Event('input', { bubbles: true }));
+				element.dispatchEvent(new Event('change', { bubbles: true }));
+				return '已选择 ' + dt.files.length + ' 个文件：' + [...dt.files].map((f) => f.name).join('、');
+			})()`, true);
+			this.status = output;
+			this.emitState();
+			return output;
+		} catch (error) {
+			this.status = `附件上传失败：${error?.message || error}`;
+			this.emitState();
+			throw error;
+		}
+	}
+
 	async scroll(direction, amount) {
 		const view = this.ensureView();
 		await this.open();
