@@ -1,12 +1,13 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
-	buildUpdateHelperScript,
 	checkUpdate,
+	cleanupStaleUpdateFiles,
+	reconcilePendingUpdate,
 	resolveGithubCredential,
-	resolveUpdateRelaunchTarget,
+	UPDATE_INSTALLER_ARGS,
 	verifyDownloadedInstaller,
 } from "../src/updates.ts";
 
@@ -91,44 +92,23 @@ describe("checkUpdate", () => {
 		expect(result.assetName).toBe("PiConsole-Setup-0.3.22.exe");
 		expect(result.assetUrl).toContain("/v0.3.22/PiConsole-Setup-0.3.22.exe");
 	});
+
+	it("rejects a release tag that cannot be compared safely", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(new Response(JSON.stringify({ tag_name: "latest-windows", assets: [] }), { status: 200 }));
+
+		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
+
+		expect(result.latest).toBeNull();
+		expect(result.updateAvailable).toBeNull();
+		expect(result.error).toBe("github");
+	});
 });
 
 describe("更新安装与重启", () => {
-	it("always reopens the current Electron executable from a custom install directory", () => {
-		const current = "D:\\ai work\\PiConsole\\PiConsole.exe";
-		const fallback = "C:\\Users\\HW\\AppData\\Local\\Programs\\PiConsole\\PiConsole.exe";
-		const target = resolveUpdateRelaunchTarget({
-			electronRuntime: true,
-			currentExecutable: current,
-			localAppData: "C:\\Users\\HW\\AppData\\Local",
-			packageRoot: "D:\\ai work\\PiConsole\\resources\\app.asar",
-			pathExists: (path) => path === current || path === fallback,
-		});
-
-		expect(target).toEqual({ path: current, source: "current-electron" });
-	});
-
-	it("only falls back to the legacy VBS launcher when the file really exists", () => {
-		const packageRoot = "D:\\legacy\\PiConsole\\app";
-		const launcher = "D:\\legacy\\PiConsole\\launcher.vbs";
-		expect(
-			resolveUpdateRelaunchTarget({
-				electronRuntime: false,
-				currentExecutable: "C:\\node\\node.exe",
-				localAppData: "",
-				packageRoot,
-				pathExists: (path) => path === launcher,
-			}),
-		).toEqual({ path: launcher, source: "legacy-launcher" });
-		expect(
-			resolveUpdateRelaunchTarget({
-				electronRuntime: false,
-				currentExecutable: "C:\\node\\node.exe",
-				localAppData: "",
-				packageRoot,
-				pathExists: () => false,
-			}),
-		).toBeNull();
+	it("uses electron-builder's native NSIS update arguments", () => {
+		expect(UPDATE_INSTALLER_ARGS).toEqual(["--updated", "/S", "--force-run", "/currentuser"]);
 	});
 
 	it("records and reads the real Electron install directory for legacy migration", () => {
@@ -148,17 +128,72 @@ describe("更新安装与重启", () => {
 		expect(legacyLauncher).toContain("HKCU\\Software\\pi-console\\ElectronInstallDir");
 	});
 
-	it("generates a Unicode-safe helper script without inventing launcher.vbs", () => {
-		const script = buildUpdateHelperScript(
-			"D:\\更新文件\\PiConsole-Setup-0.3.22.exe",
-			{ path: "D:\\O'Brien\\PiConsole\\PiConsole.exe", source: "current-electron" },
-			"D:\\更新文件\\update-error.log",
-		);
+	it("keeps a verified installer after a failed handoff and clears it only after the target version starts", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-update-recovery-"));
+		const installer = join(directory, "PiConsole-Setup-0.3.27.exe");
+		const pendingFile = join(directory, "pending-update.json");
+		try {
+			writeFileSync(installer, "verified installer");
+			writeFileSync(
+				pendingFile,
+				JSON.stringify({
+					fromVersion: "0.3.26",
+					targetVersion: "0.3.27",
+					setupPath: installer,
+					startedAt: 123,
+					lastError: "测试启动失败",
+				}),
+			);
 
-		expect(script.startsWith("\uFEFF")).toBe(true);
-		expect(script).toContain("D:\\O''Brien\\PiConsole\\PiConsole.exe");
-		expect(script).not.toContain("launcher.vbs");
-		expect(script).toContain("-PassThru -Wait");
+			const failed = reconcilePendingUpdate(directory, "0.3.26");
+			expect(failed).toMatchObject({
+				state: "failed",
+				targetVersion: "0.3.27",
+				installerAvailable: true,
+			});
+			expect(failed?.message).toContain("测试启动失败");
+			expect(existsSync(installer)).toBe(true);
+			expect(existsSync(pendingFile)).toBe(true);
+
+			const completed = reconcilePendingUpdate(directory, "0.3.27");
+			expect(completed).toMatchObject({ state: "completed", targetVersion: "0.3.27" });
+			expect(existsSync(installer)).toBe(false);
+			expect(existsSync(pendingFile)).toBe(false);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans obsolete installers and helper scripts without deleting the pending installer", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-update-cleanup-"));
+		const pendingInstaller = join(directory, "PiConsole-Setup-0.3.27.exe");
+		const obsoleteInstaller = join(directory, "PiConsole-Setup-0.3.26.exe");
+		const obsoleteHelper = join(directory, "apply-update.ps1");
+		const incompleteDownload = join(directory, "PiConsole-Setup-0.3.28.exe.123.part");
+		const diagnostic = join(directory, "recent.log");
+		try {
+			for (const file of [pendingInstaller, obsoleteInstaller, obsoleteHelper, incompleteDownload, diagnostic]) {
+				writeFileSync(file, "test");
+			}
+			writeFileSync(
+				join(directory, "pending-update.json"),
+				JSON.stringify({
+					fromVersion: "0.3.26",
+					targetVersion: "0.3.27",
+					setupPath: pendingInstaller,
+					startedAt: 123,
+				}),
+			);
+
+			expect(cleanupStaleUpdateFiles(Number.MAX_SAFE_INTEGER, directory)).toBe(3);
+			expect(existsSync(pendingInstaller)).toBe(true);
+			expect(existsSync(obsoleteInstaller)).toBe(false);
+			expect(existsSync(obsoleteHelper)).toBe(false);
+			expect(existsSync(incompleteDownload)).toBe(false);
+			expect(existsSync(diagnostic)).toBe(true);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("verifies both installer length and GitHub SHA256", async () => {

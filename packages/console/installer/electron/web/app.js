@@ -43,6 +43,7 @@ const codexOAuthCodeEl = $("codex-oauth-code");
 const appVersionEl = $("app-version");
 const updateCheckBtnEl = $("update-check-btn");
 const updateRunBtnEl = $("update-run-btn");
+const updateRetryBtnEl = $("update-retry-btn");
 const updateStatusEl = $("update-status");
 const updateProgressEl = $("update-progress");
 const updateProgressBarEl = $("update-progress-bar");
@@ -4639,6 +4640,38 @@ updateCheckBtnEl.addEventListener("click", async () => {
 	}
 });
 
+async function loadUpdateRecovery() {
+	try {
+		const recovery = await api("/api/app/update-recovery");
+		if (!recovery) return;
+		if (recovery.state === "completed") {
+			updateRetryBtnEl.hidden = true;
+			updateStatusEl.textContent = recovery.message;
+			showInfo(recovery.message);
+			return;
+		}
+		settingsBtnEl.classList.add("update-available");
+		updateStatusEl.textContent = recovery.message;
+		updateRetryBtnEl.hidden = !recovery.installerAvailable;
+		showError(recovery.message);
+	} catch {
+		/* 恢复提示不阻断客户端启动。 */
+	}
+}
+
+updateRetryBtnEl.addEventListener("click", async () => {
+	updateRetryBtnEl.disabled = true;
+	updateStatusEl.textContent = "正在重新启动安装程序…";
+	updateOverlayEl.hidden = false;
+	try {
+		await api("/api/app/update-retry", { method: "POST", body: "{}" });
+	} catch (error) {
+		updateOverlayEl.hidden = true;
+		updateRetryBtnEl.disabled = false;
+		updateStatusEl.textContent = `重新安装失败：${error.message}`;
+	}
+});
+
 updateRunBtnEl.addEventListener("click", async () => {
 	updateRunBtnEl.disabled = true;
 	updateStatusEl.textContent = "正在下载更新…";
@@ -4689,9 +4722,11 @@ const UPDATE_CHECKED_AT_KEY = "pi-console-update-checked-at";
 async function autoCheckUpdate() {
 	const last = Number(localStorage.getItem(UPDATE_CHECKED_AT_KEY)) || 0;
 	if (Number.isFinite(last) && Date.now() - last < UPDATE_CHECK_INTERVAL_MS) return;
-	localStorage.setItem(UPDATE_CHECKED_AT_KEY, String(Date.now()));
 	try {
 		const info = await api("/api/app/update-check");
+		if (info.latest !== null && info.error === null) {
+			localStorage.setItem(UPDATE_CHECKED_AT_KEY, String(Date.now()));
+		}
 		if (info.updateAvailable) {
 			settingsBtnEl.classList.add("update-available");
 			showInfo(`发现新版本 v${info.latest}（当前 v${info.current}），可在「设置 → 关于与更新」中升级`);
@@ -4707,7 +4742,14 @@ async function autoCheckUpdate() {
 
 (async function init() {
 	try {
-		await Promise.all([refreshCatalog(), loadModels(), loadFsRoots(), loadContextPanel(), loadSessions()]);
+		await Promise.all([
+			refreshCatalog(),
+			loadModels(),
+			loadFsRoots(),
+			loadContextPanel(),
+			loadSessions(),
+			loadUpdateRecovery(),
+		]);
 		await ensureSession();
 		connectSSE();
 		inputEl.disabled = false;

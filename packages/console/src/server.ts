@@ -1864,6 +1864,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(res, 200, updates.getUpdateProgress());
 		return;
 	}
+	if (pathname === "/api/app/update-recovery" && req.method === "GET") {
+		sendJson(res, 200, updates.getUpdateRecovery());
+		return;
+	}
+	if (pathname === "/api/app/update-retry" && req.method === "POST") {
+		try {
+			await updates.retryPendingUpdate();
+			sendJson(res, 202, { ok: true });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
 
 	// /api/sessions/:id/*
 	const match = pathname.match(/^\/api\/sessions\/([^/]+)(?:\/(.*))?$/);
