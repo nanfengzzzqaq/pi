@@ -6,6 +6,16 @@
 
 const SESSION_KEY = "pi-console-session";
 const TOKEN_KEY = "pi-console-token";
+const SENSITIVE_DISPLAY_PARAMETER_VALUE =
+	/([?&#](?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)=)(?!\[REDACTED\])([^&#\s<>"')\]}，。；！,;]+)/gi;
+
+/**
+ * 用户原文仍发送给本地服务端，以便浏览器最终恢复临时凭据完成导航；聊天界面
+ * 只展示脱敏副本，避免链接令牌在发送后的当前页面短暂裸露。
+ */
+function redactSensitiveDisplayText(value) {
+	return String(value ?? "").replace(SENSITIVE_DISPLAY_PARAMETER_VALUE, "$1[REDACTED]");
+}
 
 // ---------------------------------------------------------------------------
 // 元素引用
@@ -1259,7 +1269,13 @@ function renderHistory(history) {
 			if (latestAssistant) latestAssistant.foldProcess();
 			latestAssistant = null;
 			pendingCapabilityTrace = item.capabilityTrace || null;
-			appendMessage("user", item.text || (item.attachments?.length ? `发送了 ${item.attachments.length} 个文件` : ""), item.attachments);
+			appendMessage(
+				"user",
+				redactSensitiveDisplayText(
+					item.text || (item.attachments?.length ? `发送了 ${item.attachments.length} 个文件` : ""),
+				),
+				item.attachments,
+			);
 		} else if (item.role === "assistant") {
 			const container = latestAssistant || appendMessage("assistant", "");
 			latestAssistant = container;
@@ -2840,7 +2856,11 @@ async function sendMessage() {
 			renderAttachments();
 		}
 		if (targetSessionId === sessionId) {
-			appendMessage("user", text || `发送了 ${attachmentsToSend.length} 个文件`, savedPaths);
+			appendMessage(
+				"user",
+				redactSensitiveDisplayText(text || `发送了 ${attachmentsToSend.length} 个文件`),
+				savedPaths,
+			);
 		}
 		await api(`/api/sessions/${targetSessionId}/messages`, {
 			method: "POST",

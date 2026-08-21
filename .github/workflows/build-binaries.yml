@@ -22,9 +22,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  classify:
+    name: Classify release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+    outputs:
+      release_kind: ${{ steps.classify.outputs.release_kind }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Classify release tag
+        id: classify
+        run: |
+          set -euo pipefail
+
+          VERSION="${RELEASE_TAG#v}"
+          coding_agent_version="$(node -p "require('./packages/coding-agent/package.json').version")"
+          console_version="$(node -p "require('./packages/console/package.json').version")"
+
+          coding_agent_match=false
+          console_match=false
+          if [[ "${VERSION}" == "${coding_agent_version}" ]]; then
+            coding_agent_match=true
+          fi
+          if [[ "${VERSION}" == "${console_version}" ]]; then
+            console_match=true
+          fi
+
+          if [[ "${coding_agent_match}" == "true" && "${console_match}" == "true" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} matches both Coding Agent and Console package versions."
+            exit 1
+          fi
+          if [[ "${coding_agent_match}" == "false" && "${console_match}" == "false" ]]; then
+            echo "::error::Release tag ${RELEASE_TAG} matches neither Coding Agent (${coding_agent_version}) nor Console (${console_version})."
+            exit 1
+          fi
+
+          if [[ "${coding_agent_match}" == "true" ]]; then
+            echo "release_kind=coding-agent" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Release tag ${RELEASE_TAG} belongs to Coding Agent; continuing the build and publish workflow."
+          else
+            echo "release_kind=console" >> "${GITHUB_OUTPUT}"
+            echo "::notice::Release tag ${RELEASE_TAG} belongs to Console; no Coding Agent artifacts will be built or published."
+          fi
+
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
+    needs: classify
+    if: ${{ needs.classify.outputs.release_kind == 'coding-agent' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

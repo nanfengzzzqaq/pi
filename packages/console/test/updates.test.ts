@@ -37,18 +37,22 @@ describe("checkUpdate", () => {
 	it("uses the resolved credential for a private release", async () => {
 		const fetchMock = vi.fn().mockResolvedValue(
 			new Response(
-				JSON.stringify({
-					tag_name: "v0.3.9",
-					assets: [
-						{
-							name: "Pi控制台-Setup-0.3.9.exe",
-							url: "https://api.github.com/assets/1",
-							browser_download_url: "https://github.com/download/1",
-							size: 123,
-							digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-						},
-					],
-				}),
+				JSON.stringify([
+					{
+						tag_name: "v9.3.9",
+						draft: false,
+						prerelease: false,
+						assets: [
+							{
+								name: "PiConsole-Setup-9.3.9.exe",
+								url: "https://api.github.com/assets/1",
+								browser_download_url: "https://github.com/download/1",
+								size: 123,
+								digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+							},
+						],
+					},
+				]),
 				{ status: 200 },
 			),
 		);
@@ -58,12 +62,12 @@ describe("checkUpdate", () => {
 			credential: { token: "secret", source: "gh-cli" },
 		});
 
-		expect(result.latest).toBe("0.3.9");
+		expect(result.latest).toBe("9.3.9");
 		expect(result.assetApiUrl).toBe("https://api.github.com/assets/1");
 		expect(result.assetDigest).toBe("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
 		expect(result.error).toBeNull();
 		expect(fetchMock).toHaveBeenCalledWith(
-			"https://api.github.com/repos/nanfengzzzqaq/pi/releases/latest",
+			"https://api.github.com/repos/nanfengzzzqaq/pi/releases?per_page=100",
 			expect.objectContaining({
 				headers: expect.objectContaining({ Authorization: "Bearer secret" }),
 			}),
@@ -82,27 +86,165 @@ describe("checkUpdate", () => {
 		expect(result.error).toBe("authentication");
 	});
 
-	it("uses a stable ASCII asset name when the API cannot list release assets", async () => {
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValue(new Response(JSON.stringify({ tag_name: "v0.3.22", assets: [] }), { status: 200 }));
+	it("selects the newest stable Console release from mixed repository releases", async () => {
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify([
+					{
+						tag_name: "v10.0.0",
+						assets: [{ name: "pi-windows-x64.zip", browser_download_url: "https://github.com/coding-agent" }],
+					},
+					{
+						tag_name: "v9.8.0",
+						assets: [
+							{
+								name: "PiConsole-Setup-9.8.0.exe",
+								browser_download_url: "https://github.com/console-9.8.0",
+							},
+						],
+					},
+					{
+						tag_name: "v9.9.0",
+						draft: true,
+						assets: [
+							{
+								name: "PiConsole-Setup-9.9.0.exe",
+								browser_download_url: "https://github.com/draft-console",
+							},
+						],
+					},
+					{
+						tag_name: "v9.8.1-beta.1",
+						assets: [
+							{
+								name: "PiConsole-Setup-9.8.1-beta.1.exe",
+								browser_download_url: "https://github.com/prerelease-console",
+							},
+						],
+					},
+				]),
+				{ status: 200 },
+			),
+		);
 
 		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
 
-		expect(result.assetName).toBe("PiConsole-Setup-0.3.22.exe");
-		expect(result.assetUrl).toContain("/v0.3.22/PiConsole-Setup-0.3.22.exe");
+		expect(result.latest).toBe("9.8.0");
+		expect(result.assetName).toBe("PiConsole-Setup-9.8.0.exe");
+		expect(result.assetUrl).toBe("https://github.com/console-9.8.0");
+		expect(result.updateAvailable).toBe(true);
+	});
+
+	it("ignores a newer latest release without a Console installer and uses the older valid Console release", async () => {
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify([
+					{
+						tag_name: "v99.0.0",
+						assets: [{ name: "pi-linux-x64.tar.gz", browser_download_url: "https://github.com/coding-agent" }],
+					},
+					{
+						tag_name: "v98.0.0",
+						assets: [
+							{
+								name: "PiConsole-Setup-98.0.0.exe",
+								browser_download_url: "https://github.com/console-98.0.0",
+							},
+						],
+					},
+				]),
+				{ status: 200 },
+			),
+		);
+
+		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
+
+		expect(result.latest).toBe("98.0.0");
+		expect(result.assetUrl).toBe("https://github.com/console-98.0.0");
+	});
+
+	it("does not offer an update or invent a download URL when no release has the exact Console asset", async () => {
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify([
+					{
+						tag_name: "v99.0.0",
+						assets: [
+							{
+								name: "PiConsole-Setup-latest.exe",
+								browser_download_url: "https://github.com/wrong-console-asset",
+							},
+						],
+					},
+				]),
+				{ status: 200 },
+			),
+		);
+
+		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
+
+		expect(result.latest).toBeNull();
+		expect(result.updateAvailable).not.toBe(true);
+		expect(result.assetName).toBeNull();
+		expect(result.assetUrl).toBeNull();
+		expect(result.assetApiUrl).toBeNull();
 	});
 
 	it("rejects a release tag that cannot be compared safely", async () => {
-		const fetchMock = vi
-			.fn()
-			.mockResolvedValue(new Response(JSON.stringify({ tag_name: "latest-windows", assets: [] }), { status: 200 }));
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify([
+					{
+						tag_name: "latest-windows",
+						assets: [
+							{
+								name: "PiConsole-Setup-latest-windows.exe",
+								browser_download_url: "https://github.com/invalid-version",
+							},
+						],
+					},
+				]),
+				{ status: 200 },
+			),
+		);
 
 		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
 
 		expect(result.latest).toBeNull();
 		expect(result.updateAvailable).toBeNull();
 		expect(result.error).toBe("github");
+	});
+
+	it("keeps the redirect fallback but only trusts an asset confirmed by the release API", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("temporary network failure"))
+			.mockResolvedValueOnce(
+				new Response(null, {
+					status: 302,
+					headers: { location: "/nanfengzzzqaq/pi/releases/tag/v8.0.0" },
+				}),
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						tag_name: "v8.0.0",
+						assets: [
+							{
+								name: "PiConsole-Setup-8.0.0.exe",
+								browser_download_url: "https://github.com/console-8.0.0",
+							},
+						],
+					}),
+					{ status: 200 },
+				),
+			);
+
+		const result = await checkUpdate({ fetch: fetchMock as typeof fetch, credential: null });
+
+		expect(result.latest).toBe("8.0.0");
+		expect(result.assetUrl).toBe("https://github.com/console-8.0.0");
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 	});
 });
 
