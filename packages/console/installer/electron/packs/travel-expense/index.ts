@@ -6,9 +6,9 @@
  * （browser_* 工具），本包不直接接触页面。
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -54,16 +54,39 @@ function listFilesRecursive(root: string): string[] {
 	return output;
 }
 
-/** 提取 OFD 页面 XML 中的文本（TextCode 片段按对象拼接）。 */
+/**
+ * 提取 OFD 页面文本并按坐标重建阅读顺序：
+ * 每个 TextObject 带 Boundary="x y w h"，按 Y 分行（容差 3）、行内按 X 排序，
+ * 避免 XML 文档顺序与视觉顺序不一致导致站名、金额错乱。
+ */
 function ofdXmlText(xml: string): string {
-	const codes = [...xml.matchAll(/<ofd:TextCode[^>]*>([\s\S]*?)<\/ofd:TextCode>/g)].map((match) =>
-		match[1]
-			.replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
-			.replace(/&amp;/g, "&")
-			.replace(/&lt;/g, "<")
-			.replace(/&gt;/g, ">"),
-	);
-	return codes.join("\n");
+	const objects = [...xml.matchAll(/<ofd:TextObject([^>]*)>([\s\S]*?)<\/ofd:TextObject>/g)].map((match) => {
+		const boundary = match[1].match(/Boundary="([-\d.\s]+)"/);
+		const [x, y] = boundary ? boundary[1].trim().split(/\s+/).slice(0, 2).map(Number) : [0, 0];
+		const codes = [...match[2].matchAll(/<ofd:TextCode[^>]*>([\s\S]*?)<\/ofd:TextCode>/g)].map((code) =>
+			code[1]
+				.replace(/&#x([0-9a-fA-F]+);/g, (_m, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16)))
+				.replace(/&amp;/g, "&")
+				.replace(/&lt;/g, "<")
+				.replace(/&gt;/g, ">"),
+		);
+		return { x: x ?? 0, y: y ?? 0, text: codes.join("") };
+	});
+	objects.sort((a, b) => a.y - b.y || a.x - b.x);
+	const lines: Array<{ y: number; parts: Array<{ x: number; text: string }> }> = [];
+	for (const object of objects) {
+		if (!object.text) continue;
+		const line = lines.find((candidate) => Math.abs(candidate.y - object.y) < 3);
+		if (line) line.parts.push(object);
+		else lines.push({ y: object.y, parts: [object] });
+	}
+	return lines
+		.map((line) => {
+			line.parts.sort((a, b) => a.x - b.x);
+			return line.parts.map((part) => part.text).join("");
+		})
+		.filter(Boolean)
+		.join("\n");
 }
 
 function normalizeDate(text: string): string | undefined {
@@ -74,34 +97,57 @@ function normalizeDate(text: string): string | undefined {
 
 function parseRailwayText(text: string): Partial<RailwayInvoice> {
 	const result: Partial<RailwayInvoice> = {};
-	const train = text.match(/\b([GDC]\d{1,5})\b/);
-	if (train) result.trainNumber = train[1];
-	// 出发站与开车时间成对出现（如“南京南站 12:12开”），其后第一站为到达站
-	const depart = text.match(/([\u4e00-\u9fa5]{2,8}站)\s*(\d{1,2}:\d{2})\s*开/);
-	if (depart) {
-		result.fromStation = depart[1];
-		result.departTime = depart[2];
-		const after = text.slice((depart.index ?? 0) + depart[0].length);
-		const arrival = after.match(/([\u4e00-\u9fa5]{2,8}站)/);
-		if (arrival) result.toStation = arrival[1];
+	const lines = text.split("\n").map((line) => line.trim());
+
+	// 典型票面行：“南京南站G7575常州站”——出发站、车次、到达站同行
+	const routeLine = /([\u4e00-\u9fa5]{2,8}站)\s*([GDC]\d{1,5})\s*([\u4e00-\u9fa5]{2,8}站)/.exec(text);
+	if (routeLine) {
+		result.fromStation = routeLine[1];
+		result.trainNumber = routeLine[2];
+		result.toStation = routeLine[3];
 	} else {
-		const stations = [...text.matchAll(/([\u4e00-\u9fa5]{2,8}站)/g)].map((match) => match[1]);
-		const unique = [...new Set(stations)];
-		if (unique.length >= 2) {
-			result.fromStation = unique[0];
-			result.toStation = unique[1];
+		const train = text.match(/\b([GDC]\d{1,5})\b/);
+		if (train) result.trainNumber = train[1];
+		const depart = text.match(/([\u4e00-\u9fa5]{2,8}站)\s*(\d{1,2}:\d{2})\s*开/);
+		if (depart) {
+			result.fromStation = depart[1];
+			const after = text.slice((depart.index ?? 0) + depart[0].length);
+			const arrival = after.match(/([\u4e00-\u9fa5]{2,8}站)/);
+			if (arrival) result.toStation = arrival[1];
+		} else {
+			const stations = [...new Set([...text.matchAll(/([\u4e00-\u9fa5]{2,8}站)/g)].map((m) => m[1]))];
+			if (stations.length >= 2) {
+				result.fromStation = stations[0];
+				result.toStation = stations[1];
+			}
 		}
 	}
+	const departTime = text.match(/(\d{1,2}:\d{2})\s*开/);
+	if (departTime) result.departTime = departTime[1];
 	result.date = normalizeDate(text);
 	const seat = text.match(/(商务座|特等座|一等座|二等座|硬卧|软卧|硬座|无座)/);
 	if (seat) result.seatClass = seat[1];
-	const amounts = [...text.matchAll(/[¥￥]\s*(\d+(?:\.\d+)?)/g)].map((match) => Number(match[1]));
-	if (amounts.length > 0) result.amount = Math.max(...amounts);
-	const passenger = text.match(/乘车人[：:]?\s*([\u4e00-\u9fa5]{2,4})/);
-	if (passenger) result.passenger = passenger[1];
-	const invoiceNumber = text.match(/\b(\d{20})\b/);
+	// 优先“票价:￥72.00”，退化为全文最大的 ￥ 金额
+	const fare = text.match(/票价[：:]?\s*[¥￥]?\s*(\d+(?:\.\d+)?)/);
+	if (fare) result.amount = Number(fare[1]);
+	else {
+		const amounts = [...text.matchAll(/[¥￥]\s*(\d+(?:\.\d+)?)/g)].map((m) => Number(m[1]));
+		if (amounts.length > 0) result.amount = Math.max(...amounts);
+	}
+	const passengerLabel = text.match(/乘车人[：:]?\s*([\u4e00-\u9fa5]{2,4})/);
+	if (passengerLabel) result.passenger = passengerLabel[1];
+	else {
+		// 真实票面：姓名独立一行，紧挨着下一行的脱敏身份证号
+		for (let i = 0; i + 1 < lines.length; i++) {
+			if (/^[\u4e00-\u9fa5]{2,4}$/.test(lines[i]) && /^\d{6}[\d*]{8,16}$/.test(lines[i + 1])) {
+				result.passenger = lines[i];
+				break;
+			}
+		}
+	}
+	const invoiceNumber = text.match(/发票号码[：:]?(\d{8,26})/) ?? text.match(/\b(\d{20})\b/);
 	if (invoiceNumber) result.invoiceNumber = invoiceNumber[1];
-	const issue = text.match(/开票日期\s*(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)/);
+	const issue = text.match(/开票日期[：:]?\s*(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)/);
 	if (issue) result.issueDate = normalizeDate(issue[1]);
 	return result;
 }
@@ -132,18 +178,54 @@ function readRailwayInvoice(requested: string, workspaceRoot: string): RailwayIn
 		};
 	}
 	try {
-		const files = listFilesRecursive(workDir);
-		// 票面文本：OFD 各页 Content.xml
-		const contentFiles = files.filter((path) => /content\.xml$/i.test(path));
+		let files = listFilesRecursive(workDir);
+		let contentFiles = files.filter((path) => /content\.xml$/i.test(path));
 		if (contentFiles.length === 0) {
-			return { source: requested, uploadFile: file, error: "压缩包里没有 OFD 页面内容（Content.xml）" };
+			// 真实票据常见结构：外层 zip 里直接是 .ofd 文件（OFD 本身又是压缩包），需要再解一层
+			const nested = files.filter((path) => /\.ofd$/i.test(path));
+			for (const [index, ofd] of nested.entries()) {
+				const inner = join(workDir, `ofd-inner-${index}`);
+				mkdirSync(inner, { recursive: true });
+				try {
+					execFileSync(systemTarExecutable(), ["-xf", ofd, "-C", inner], {
+						windowsHide: true,
+						timeout: 15000,
+					});
+					contentFiles.push(
+						...listFilesRecursive(inner).filter((path) => /content\.xml$/i.test(path)),
+					);
+				} catch {
+					/* 单个内层 OFD 解压失败不影响其余票据 */
+				}
+			}
+			files = listFilesRecursive(workDir);
+		}
+		if (contentFiles.length === 0) {
+			return {
+				source: requested,
+				uploadFile: file,
+				error: "压缩包里没有铁路电子客票票面（OFD Content.xml）；请提供原始 OFD 文件或含 OFD 的压缩包，不要只发截图",
+			};
 		}
 		const text = contentFiles.map((path) => ofdXmlText(readFileSync(path, "utf8"))).join("\n");
 		const parsed = parseRailwayText(text);
-		// 建议上传的发票文件：优先 pdf（页面渲染友好），其次 ofd，最后原 zip
+		// 建议上传的发票文件：优先 pdf（页面渲染友好），其次 ofd，最后原文件；
+		// 从临时目录复制回原压缩包所在目录，避免临时目录清理后上传失败
+		let uploadFile: string = file;
 		const pdf = files.find((path) => /\.pdf$/i.test(path));
 		const ofd = files.find((path) => /\.ofd$/i.test(path));
-		const uploadFile = pdf ?? ofd ?? file;
+		const picked = pdf ?? ofd;
+		if (picked) {
+			const durable = join(dirname(file), basename(picked));
+			if (!existsSync(durable)) {
+				try {
+					copyFileSync(picked, durable);
+				} catch {
+					/* 复制失败时退回原压缩包作为上传文件 */
+				}
+			}
+			if (existsSync(durable)) uploadFile = durable;
+		}
 		return { source: requested, uploadFile, ...parsed };
 	} finally {
 		rmSync(workDir, { recursive: true, force: true });

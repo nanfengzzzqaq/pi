@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -13,24 +13,9 @@ function tool(name: string) {
 	return found;
 }
 
-/** 构造一张仿真铁路电子客票 OFD（zip）用于解析测试。 */
+/** 构造一张仿真铁路电子客票：外层 zip 内是 .ofd（本身又是 zip，含带坐标的 TextObject）+ .pdf。 */
 function buildFakeInvoiceZip(): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-invoice-test-"));
-	const ticketRoot = join(dir, "26329116804009553237");
-	mkdirSync(join(ticketRoot, "Doc_0", "Pages", "Page_0"), { recursive: true });
-	const xml = `<?xml version="1.0" encoding="utf-8"?>
-<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content>
-<ofd:TextObject ID="1"><ofd:TextCode>铁路电子客票</ofd:TextCode></ofd:TextObject>
-<ofd:TextObject ID="2"><ofd:TextCode>发票号码 26329116804009553237 开票日期 2026年8月21日</ofd:TextCode></ofd:TextObject>
-<ofd:TextObject ID="3"><ofd:TextCode>G7575 南京南站 12:12开 → 常州站</ofd:TextCode></ofd:TextObject>
-<ofd:TextObject ID="4"><ofd:TextCode>2026年8月21日 04车08D号 二等座</ofd:TextCode></ofd:TextObject>
-<ofd:TextObject ID="5"><ofd:TextCode>票价 ￥72.00 乘车人 苏爱健</ofd:TextCode></ofd:TextObject>
-</ofd:Content></ofd:Page>`;
-	writeFileSync(join(ticketRoot, "Doc_0", "Pages", "Page_0", "Content.xml"), xml, "utf8");
-	writeFileSync(join(ticketRoot, "26329116804009553237.pdf"), "%PDF-fake", "utf8");
-	writeFileSync(join(ticketRoot, "26329116804009553237.ofd"), "PK-fake", "utf8");
-	const zipPath = join(dir, "26329116804009553237.zip");
-	// PowerShell Compress-Archive 生成标准 zip（GNU tar 不支持写 zip）
 	const powershell = join(
 		process.env.SystemRoot ?? process.env.WINDIR ?? "",
 		"System32",
@@ -38,16 +23,55 @@ function buildFakeInvoiceZip(): string {
 		"v1.0",
 		"powershell.exe",
 	);
-	execFileSync(
-		powershell,
-		[
-			"-NoProfile",
-			"-Command",
-			"Compress-Archive -Path '26329116804009553237' -DestinationPath '26329116804009553237.zip' -Force",
-		],
-		{ cwd: dir, windowsHide: true, timeout: 30000 },
-	);
-	return zipPath;
+	const compress = (cwd: string, dest: string, sources: string[]) => {
+		// Compress-Archive 只支持 .zip 扩展名；目标不是 .zip 时先压成 zip 再改名
+		const direct = dest.toLocaleLowerCase("en-US").endsWith(".zip");
+		const zipName = direct ? dest : "pi-tmp-archive.zip";
+		execFileSync(
+			powershell,
+			[
+				"-NoProfile",
+				"-Command",
+				`Compress-Archive -Path ${sources.map((s) => `'${s}'`).join(",")} -DestinationPath '${zipName}' -Force`,
+			],
+			{ cwd, windowsHide: true, timeout: 30000 },
+		);
+		if (!direct) {
+			copyFileSync(join(cwd, zipName), join(cwd, dest));
+			rmSync(join(cwd, zipName), { force: true });
+		}
+	};
+
+	// 内层：OFD 文档（TextObject 故意按乱序书写，Boundary 坐标才是阅读顺序）
+	const ofdDir = join(dir, "ofd-doc");
+	mkdirSync(join(ofdDir, "Doc_0", "Pages", "Page_0"), { recursive: true });
+	const xml = `<?xml version="1.0" encoding="utf-8"?>
+<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content>
+<ofd:TextObject ID="11" Boundary="40 40 14 8"><ofd:TextCode>南京南</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="14" Boundary="54 40 8 8"><ofd:TextCode>站</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="12" Boundary="64 40 12 8"><ofd:TextCode>G7575</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="10" Boundary="78 40 10 8"><ofd:TextCode>常州</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="13" Boundary="88 40 8 8"><ofd:TextCode>站</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="20" Boundary="10 50 60 8"><ofd:TextCode>2026年08月21日</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="21" Boundary="70 50 30 8"><ofd:TextCode>12:12开</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="22" Boundary="100 50 40 8"><ofd:TextCode>二等座</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="30" Boundary="10 60 50 8"><ofd:TextCode>票价:</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="31" Boundary="35 60 10 8"><ofd:TextCode>￥</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="32" Boundary="45 60 20 8"><ofd:TextCode>72.00</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="40" Boundary="10 70 30 8"><ofd:TextCode>苏爱健</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="41" Boundary="10 75 60 8"><ofd:TextCode>3212811997****4234</ofd:TextCode></ofd:TextObject>
+<ofd:TextObject ID="50" Boundary="10 20 80 8"><ofd:TextCode>发票号码:26329116804009553237开票日期:2026年08月21日</ofd:TextCode></ofd:TextObject>
+</ofd:Content></ofd:Page>`;
+	writeFileSync(join(ofdDir, "Doc_0", "Pages", "Page_0", "Content.xml"), xml, "utf8");
+	compress(ofdDir, "26329116804009553237.ofd", ["Doc_0"]);
+
+	// 外层：zip 内放原始 .ofd 与 .pdf（真实票据的下载结构）
+	const outerDir = join(dir, "outer");
+	mkdirSync(outerDir, { recursive: true });
+	copyFileSync(join(ofdDir, "26329116804009553237.ofd"), join(outerDir, "26329116804009553237.ofd"));
+	writeFileSync(join(outerDir, "26329116804009553237.pdf"), "%PDF-fake", "utf8");
+	compress(outerDir, "26329116804009553237.zip", ["26329116804009553237.ofd", "26329116804009553237.pdf"]);
+	return join(outerDir, "26329116804009553237.zip");
 }
 
 describe("差旅报销能力包", () => {
@@ -174,6 +198,12 @@ describe("差旅报销能力包", () => {
 		const details = (output.details as { invoices?: Array<Record<string, unknown>> }).invoices ?? [];
 		expect(details[0].date).toBe("2026-08-21");
 		expect(details[0].amount).toBe(72);
+		expect(details[0].fromStation).toBe("南京南站");
+		expect(details[0].toStation).toBe("常州站");
+		expect(details[0].departTime).toBe("12:12");
+		expect(details[0].passenger).toBe("苏爱健");
+		expect(details[0].trainNumber).toBe("G7575");
+		expect(details[0].issueDate).toBe("2026-08-21");
 		expect(String(details[0].uploadFile)).toContain(".pdf");
 	});
 
