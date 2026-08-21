@@ -340,6 +340,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_MODE: ${{ needs.prepare.outputs.release_mode }}
       RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
       SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
@@ -372,9 +373,9 @@ jobs:
             failure_status="$?"
             set +e
             if [[ "${cleanup_enabled}" == "true" ]]; then
-              release_state="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+              release_state="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
               if [[ "${release_state}" == "true" ]]; then
-                gh release delete "${RELEASE_TAG}" --yes
+                gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
                 release_state=missing
               elif [[ "${release_state}" != "missing" ]]; then
                 echo "::warning::A non-draft release now exists for ${RELEASE_TAG}; it was not removed."
@@ -429,7 +430,7 @@ jobs:
                   echo "::error::${RELEASE_TAG} became public while the installer was building; refusing to replace it."
                   exit 1
                 fi
-                gh release delete "${RELEASE_TAG}" --yes
+                gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
               elif [[ "${release_status}" != "404" ]]; then
                 echo "::error::Unable to inspect ${RELEASE_TAG} during recovery; GitHub API returned HTTP ${release_status}."
                 exit 1
@@ -461,6 +462,7 @@ jobs:
             printf '构建来源：`%s`。\n' "${SOURCE_SHA}"
           } > "${notes_file}"
           gh release create "${RELEASE_TAG}" "${asset}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --draft \
             --title "Pi Console ${RELEASE_TAG}" \
@@ -474,7 +476,7 @@ jobs:
             exit 1
           fi
 
-          gh release edit "${RELEASE_TAG}" --draft=false --latest
+          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
           cleanup_enabled=false
           trap - ERR
 
