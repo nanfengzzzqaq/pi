@@ -28,6 +28,7 @@ const attachBtnEl = $("attach-btn");
 const attachmentsEl = $("attachments");
 const settingsBtnEl = $("settings-btn");
 const themeBtnEl = $("theme-btn");
+const workbenchBtnEl = $("workbench-btn");
 const agentBrowserBtnEl = $("agent-browser-btn");
 const settingsModalEl = $("settings-modal");
 const settingsCloseEl = $("settings-close");
@@ -116,9 +117,14 @@ const agentBrowserForwardEl = $("side-browser-forward");
 const agentBrowserRefreshEl = $("side-browser-refresh");
 const agentBrowserGoEl = $("side-browser-go");
 const agentBrowserExternalEl = $("side-browser-external");
-const agentBrowserCloseEl = $("side-browser-close");
+const agentBrowserPickEl = $("side-browser-pick");
+const agentBrowserScreenshotEl = $("side-browser-screenshot");
+const agentBrowserDevtoolsEl = $("side-browser-devtools");
+const agentBrowserHintEl = $("side-browser-hint");
 const workbenchSideEl = $("workbench-side");
 const workbenchSideResizerEl = $("workbench-side-resizer");
+const workbenchCloseButtons = document.querySelectorAll("[data-workbench-close]");
+const workbenchMaximizeButtons = document.querySelectorAll("[data-workbench-maximize]");
 const sideTabReviewEl = $("side-tab-review");
 const sideTabTerminalEl = $("side-tab-terminal");
 const sideTabBrowserEl = $("side-tab-browser");
@@ -418,9 +424,9 @@ let sidePanelSuppressed = false;
 const sideTabButtons = { review: sideTabReviewEl, terminal: sideTabTerminalEl, browser: sideTabBrowserEl };
 const sideTabPanes = { review: reviewPaneEl, terminal: terminalPaneEl, browser: agentBrowserPaneEl };
 
-/** 侧栏内容此刻是否展开显示（收起状态只剩底部标签条）。 */
+/** 右侧工作台此刻是否展开显示。 */
 function sidePanelVisible() {
-	return !workbenchSideEl.hidden && !workbenchSideEl.classList.contains("collapsed");
+	return !workbenchSideEl.hidden;
 }
 
 function applyWorkbenchSideWidth(width) {
@@ -435,7 +441,6 @@ function browserTabActive() {
 	return (
 		activeSideTab === "browser" &&
 		!workbenchSideEl.hidden &&
-		!workbenchSideEl.classList.contains("collapsed") &&
 		catalogViewEl.hidden &&
 		officePreviewPaneEl.hidden &&
 		codeEditorPaneEl.hidden
@@ -467,14 +472,16 @@ function syncBrowserNativeVisibility() {
 function renderSideTabs() {
 	for (const [name, button] of Object.entries(sideTabButtons)) button.classList.toggle("active", activeSideTab === name);
 	for (const [name, pane] of Object.entries(sideTabPanes)) pane.hidden = name !== activeSideTab;
+	workbenchBtnEl.classList.toggle("active", sidePanelVisible());
+	agentBrowserBtnEl.classList.toggle("active", sidePanelVisible() && activeSideTab === "browser");
 }
 
 function showSidePanel(tab) {
 	applyWorkbenchSideWidth(localStorage.getItem(WORKBENCH_SIDE_WIDTH_KEY));
 	sidePanelSuppressed = false;
 	activeSideTab = tab;
+	if (tab === "browser") browserIntent = true;
 	workbenchSideEl.hidden = false;
-	workbenchSideEl.classList.remove("collapsed");
 	workbenchSideResizerEl.hidden = false;
 	sideTabButtons[tab]?.classList.remove("activity");
 	renderSideTabs();
@@ -482,13 +489,27 @@ function showSidePanel(tab) {
 	if (tab === "review") void loadReview();
 }
 
-/** 收起侧栏：内容隐藏，底部标签条保留，点击任意标签即可重新展开。 */
-function hideSidePanel() {
-	if (workbenchSideEl.hidden) return;
-	workbenchSideEl.classList.add("collapsed");
+/** 完整关闭右侧工作台；只隐藏画面，不停止智能体、命令或网页后台状态。 */
+function closeSidePanel({ userInitiated = true } = {}) {
+	if (userInitiated) terminalAutoShowSuppressedAt = Date.now();
+	if (activeSideTab === "browser" && userInitiated) {
+		browserIntent = false;
+		browserUserClosedAt = Date.now();
+	}
+	sidePanelSuppressed = false;
+	workbenchSideEl.hidden = true;
 	workbenchSideResizerEl.hidden = true;
 	renderSideTabs();
 	syncBrowserNativeVisibility();
+}
+
+function toggleSidePanelMaximized() {
+	const maximized = workbenchSideEl.classList.toggle("maximized");
+	for (const button of workbenchMaximizeButtons) {
+		button.textContent = maximized ? "▣" : "□";
+		button.title = maximized ? "恢复右侧工作台宽度" : "放大右侧工作台";
+	}
+	requestAnimationFrame(syncAgentBrowserBounds);
 }
 
 /** Office 预览 / 代码编辑器占用右侧时收起侧栏（保留标签状态）。 */
@@ -512,20 +533,27 @@ function restoreSidePanel() {
 }
 
 sideTabReviewEl.addEventListener("click", () => {
-	if (activeSideTab === "review" && sidePanelVisible()) hideSidePanel();
+	if (activeSideTab === "review" && sidePanelVisible()) closeSidePanel();
 	else showSidePanel("review");
 });
 sideTabTerminalEl.addEventListener("click", () => {
-	if (activeSideTab === "terminal" && sidePanelVisible()) hideSidePanel();
+	if (activeSideTab === "terminal" && sidePanelVisible()) closeSidePanel();
 	else showSidePanel("terminal");
 });
 sideTabBrowserEl.addEventListener("click", () => {
-	if (activeSideTab === "browser" && sidePanelVisible() && !browserIntent) hideSidePanel();
+	if (activeSideTab === "browser" && sidePanelVisible()) closeSidePanel();
 	else {
 		browserIntent = true;
 		browserUserClosedAt = 0;
 		showSidePanel("browser");
 	}
+});
+
+for (const button of workbenchCloseButtons) button.addEventListener("click", () => closeSidePanel());
+for (const button of workbenchMaximizeButtons) button.addEventListener("click", toggleSidePanelMaximized);
+workbenchBtnEl.addEventListener("click", () => {
+	if (sidePanelVisible()) closeSidePanel();
+	else showSidePanel(activeSideTab || "terminal");
 });
 
 workbenchSideResizerEl.addEventListener("pointerdown", (event) => {
@@ -583,7 +611,8 @@ function renderAgentBrowserState(state) {
 			browserIntent = true;
 			showSidePanel("browser");
 		} else if (browserIntent && sidePanelVisible() && activeSideTab !== "browser") {
-			sideTabBrowserEl.classList.add("activity");
+			if (Date.now() - terminalAutoShowSuppressedAt < 8000) sideTabBrowserEl.classList.add("activity");
+			else showSidePanel("browser");
 		}
 	}
 	syncBrowserNativeVisibility();
@@ -609,6 +638,7 @@ async function openAgentBrowser(url) {
 async function closeAgentBrowser() {
 	browserIntent = false;
 	browserUserClosedAt = Date.now();
+	closeSidePanel();
 	if (!window.piDesktop?.hideBrowser) return;
 	try {
 		renderAgentBrowserState(await window.piDesktop.hideBrowser());
@@ -630,10 +660,9 @@ async function navigateAgentBrowser() {
 }
 
 agentBrowserBtnEl.addEventListener("click", () => {
-	if (browserIntent && activeSideTab === "browser") void closeAgentBrowser();
+	if (activeSideTab === "browser" && sidePanelVisible()) void closeAgentBrowser();
 	else void openAgentBrowser();
 });
-agentBrowserCloseEl.addEventListener("click", () => void closeAgentBrowser());
 agentBrowserGoEl.addEventListener("click", () => void navigateAgentBrowser());
 agentBrowserAddressEl.addEventListener("keydown", (event) => {
 	if (event.key !== "Enter") return;
@@ -651,6 +680,75 @@ agentBrowserRefreshEl.addEventListener("click", async () => {
 });
 agentBrowserExternalEl.addEventListener("click", () => {
 	if (agentBrowserState?.url) openExternalUrl(agentBrowserState.url);
+});
+
+agentBrowserDevtoolsEl.addEventListener("click", async () => {
+	if (!window.piDesktop?.browserDevtools) return showInfo("开发者工具只在 Windows 桌面版中可用");
+	try {
+		await window.piDesktop.browserDevtools();
+	} catch (error) {
+		showError(`打开开发者工具失败：${error.message}`);
+	}
+});
+
+agentBrowserScreenshotEl.addEventListener("click", async () => {
+	if (!window.piDesktop?.browserScreenshot) return showInfo("网页截图只在 Windows 桌面版中可用");
+	agentBrowserScreenshotEl.disabled = true;
+	try {
+		const saved = await window.piDesktop.browserScreenshot();
+		if (saved?.path) {
+			showInfo(`网页截图已保存：${saved.path}`);
+			if (currentFsPath) void loadFsDir(currentFsPath);
+		}
+	} catch (error) {
+		showError(`保存网页截图失败：${error.message}`);
+	} finally {
+		agentBrowserScreenshotEl.disabled = false;
+	}
+});
+
+/** 把浏览器中点选的元素加入输入框；只在用户发送时才进入模型上下文。 */
+agentBrowserPickEl.addEventListener("click", async () => {
+	if (!window.piDesktop?.browserPickElement) return showInfo("网页元素选取只在 Windows 桌面版中可用");
+	agentBrowserPickEl.disabled = true;
+	agentBrowserHintEl.textContent = "请在右侧网页中点选元素；按 Esc 取消。";
+	try {
+		const picked = await window.piDesktop.browserPickElement();
+		if (!picked) return;
+		const reference = [
+			"[网页元素（browser_pick）]",
+			`标题：${picked.title || "（无）"}`,
+			`网址：${picked.url || "（无）"}`,
+			`文字：${picked.text || "（无）"}`,
+			`选择器：${picked.selector || "（无）"}`,
+			`位置：x=${picked.x}，y=${picked.y}，宽=${picked.width}，高=${picked.height}`,
+		].join("\n");
+		inputEl.value = `${inputEl.value.trimEnd()}${inputEl.value.trim() ? "\n\n" : ""}${reference}`;
+		resizeComposerInput();
+		inputEl.focus();
+		showInfo("网页元素信息已加入输入框，发送后智能体才会读取");
+	} catch (error) {
+		showError(`选取网页元素失败：${error.message}`);
+	} finally {
+		agentBrowserPickEl.disabled = false;
+		agentBrowserHintEl.textContent = "智能体只操作此独立浏览器，不影响你的系统浏览器。";
+	}
+});
+
+document.addEventListener("keydown", (event) => {
+	if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key.toLocaleLowerCase("en-US") === "j") {
+		event.preventDefault();
+		if (activeSideTab === "terminal" && sidePanelVisible()) closeSidePanel();
+		else showSidePanel("terminal");
+		return;
+	}
+	if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase("en-US") === "b") {
+		event.preventDefault();
+		if (sidePanelVisible()) closeSidePanel();
+		else showSidePanel(activeSideTab || "terminal");
+		return;
+	}
+	if (event.key === "Escape" && sidePanelVisible()) closeSidePanel();
 });
 
 // ---------------------------------------------------------------------------
@@ -859,6 +957,7 @@ function terminalCommandText(args) {
 }
 
 function appendTerminalEntry(toolCallId, toolName, args, status, { restored = false } = {}) {
+	if (terminalEntries.has(toolCallId)) return;
 	terminalOutputEl.querySelector(".terminal-empty")?.remove();
 	const wrap = document.createElement("div");
 	wrap.className = `terminal-entry ${status === "running" ? "running" : "done"}`;
@@ -867,7 +966,11 @@ function appendTerminalEntry(toolCallId, toolName, args, status, { restored = fa
 	head.className = "terminal-entry-head";
 	const badge = document.createElement("span");
 	badge.className = "terminal-entry-badge";
-	badge.textContent = toolName;
+	badge.textContent = toolName === "powershell" ? "PS" : "Bash";
+	badge.title = `执行引擎：${toolName}`;
+	const prompt = document.createElement("span");
+	prompt.className = "terminal-entry-prompt";
+	prompt.textContent = toolName === "powershell" ? "PS>" : "$";
 	const cmd = document.createElement("code");
 	cmd.className = "terminal-entry-cmd";
 	cmd.title = "点击复制命令";
@@ -876,7 +979,7 @@ function appendTerminalEntry(toolCallId, toolName, args, status, { restored = fa
 	const state = document.createElement("span");
 	state.className = "terminal-entry-state";
 	state.textContent = status === "running" ? "运行中…" : "完成";
-	head.append(badge, cmd, state);
+	head.append(badge, prompt, cmd, state);
 	const out = document.createElement("pre");
 	out.className = "terminal-entry-output";
 	out.hidden = true;
@@ -884,7 +987,19 @@ function appendTerminalEntry(toolCallId, toolName, args, status, { restored = fa
 	terminalOutputEl.appendChild(wrap);
 	// 历史恢复的条目没有真实起始时间，完成时不显示耗时
 	terminalEntries.set(toolCallId, { wrap, out, state, startedAt: restored ? 0 : Date.now() });
+	markTerminalToolBlock(toolCallId);
 	scrollTerminalOutput();
+}
+
+/** 聊天区只保留命令摘要，完整输出集中到右侧统一终端，避免同一内容出现两遍。 */
+function markTerminalToolBlock(toolCallId) {
+	const block = document.querySelector(`[data-tool-call-id="${CSS.escape(toolCallId)}"]`);
+	if (!block) return;
+	block.classList.add("terminal-synced");
+	const result = block.querySelector(".tool-result");
+	if (!result) return;
+	result.innerHTML = '<button class="tool-terminal-link" type="button">在统一终端查看完整输出</button>';
+	result.hidden = false;
 }
 
 /** 展示用文本：统一换行符，去掉 Windows 回车符避免 pre-wrap 下出现空行。 */
@@ -930,7 +1045,7 @@ function clearTerminal() {
 /** 终端工具开始执行：记录条目并展示终端标签（不打断用户正在查看的其他标签）。 */
 function handleTerminalToolStart(event) {
 	appendTerminalEntry(event.toolCallId, event.toolName, event.args, "running");
-	if (!sidePanelVisible()) showSidePanel("terminal");
+	if (!sidePanelVisible() && Date.now() - terminalAutoShowSuppressedAt >= 8000) showSidePanel("terminal");
 	else if (activeSideTab !== "terminal") {
 		if (Date.now() - terminalAutoShowSuppressedAt < 8000) sideTabTerminalEl.classList.add("activity");
 		else showSidePanel("terminal");
@@ -978,17 +1093,18 @@ function renderReview(summary) {
 	reviewSummaryEl.innerHTML = "";
 	reviewFilesEl.innerHTML = "";
 	reviewDiffEl.innerHTML = "";
+	delete reviewDiffEl.dataset.rawDiff;
 	if (!summary.isRepository) {
 		reviewSummaryEl.textContent = "当前工作区不是 Git 仓库；让智能体初始化仓库或切换到 Git 工作区后再试。";
 		reviewStatusEl.textContent = "无差异";
 		return;
 	}
-	reviewStatusEl.textContent = summary.files.length > 0 ? `${summary.files.length} 个文件有改动` : "工作区干净";
 	const meta = document.createElement("div");
 	meta.className = "review-meta";
 	meta.textContent = `分支：${summary.branch || "（未命名）"}${summary.upstream ? ` · 跟踪 ${summary.upstream}` : ""}`;
 	reviewSummaryEl.appendChild(meta);
 	if (summary.files.length === 0) {
+		reviewStatusEl.textContent = "工作区干净";
 		reviewDiffEl.innerHTML = '<div class="review-empty">没有代码差异</div>';
 		return;
 	}
@@ -996,58 +1112,79 @@ function renderReview(summary) {
 		const row = document.createElement("button");
 		row.type = "button";
 		row.className = "review-file";
-		const mark = `${file.index}${file.worktree}`.trim();
+		const untracked = file.index === "?" && file.worktree === "?";
+		const staged = !untracked && file.index !== " ";
+		const unstaged = !untracked && file.worktree !== " ";
 		const name = document.createElement("span");
 		name.className = "review-file-name";
 		name.textContent = file.path;
 		name.title = file.path;
 		const state = document.createElement("span");
-		state.className = `review-file-state ${mark === "?" ? "added" : "modified"}`;
-		state.textContent = mark === "??" || mark === "?" ? "新增" : mark || "修改";
+		state.className = `review-file-state ${untracked ? "added" : staged ? "staged" : "modified"}`;
+		state.textContent = untracked ? "新增" : staged && unstaged ? "两处改动" : staged ? "已暂存" : "未暂存";
 		row.append(name, state);
+		row.title = "点击定位差异；双击在代码编辑器中打开";
 		row.addEventListener("click", () => {
 			const target = reviewDiffEl.querySelector(`[data-review-file="${CSS.escape(file.path)}"]`);
-			if (target) target.scrollIntoView({ block: "start", behavior: "smooth" });
+			if (target) {
+				target.open = true;
+				target.scrollIntoView({ block: "start", behavior: "smooth" });
+			}
+		});
+		row.addEventListener("dblclick", () => {
+			if (!summary.root || !TEXT_FILE_RE.test(file.path)) return;
+			const separator = summary.root.includes("\\") ? "\\" : "/";
+			const fullPath = `${summary.root.replace(/[\\/]$/, "")}${separator}${file.path.replace(/[\\/]/g, separator)}`;
+			void openCodeEditor(fullPath, file.path.split(/[\\/]/).pop());
 		});
 		reviewFilesEl.appendChild(row);
 	}
-	renderReviewDiff([summary.stagedDiff, summary.diff].filter(Boolean).join("\n"));
+	const stats = renderReviewDiff([summary.stagedDiff, summary.diff].filter(Boolean).join("\n"));
+	reviewStatusEl.textContent = `${summary.files.length} 个文件 · +${stats.additions} / -${stats.deletions}`;
 }
 
 function renderReviewDiff(fullDiff) {
+	reviewDiffEl.dataset.rawDiff = fullDiff;
 	if (!fullDiff) {
 		reviewDiffEl.innerHTML = '<div class="review-empty">没有代码差异</div>';
-		return;
+		return { additions: 0, deletions: 0 };
 	}
-	let currentBlock = null;
-	for (const line of fullDiff.split("\n")) {
-		if (line.startsWith("diff --git ")) {
-			const markerIndex = line.indexOf(" b/");
-			const name = markerIndex >= 0 ? line.slice(markerIndex + 3) : line.slice(11);
-			currentBlock = document.createElement("div");
-			currentBlock.className = "review-file-diff";
-			currentBlock.dataset.reviewFile = name;
-			const head = document.createElement("div");
-			head.className = "review-file-diff-head";
-			head.textContent = name;
-			head.title = name;
-			currentBlock.appendChild(head);
-			reviewDiffEl.appendChild(currentBlock);
-			continue;
+	let additions = 0;
+	let deletions = 0;
+	const sections = fullDiff.split(/(?=^diff --git )/m).filter((section) => section.trim());
+	for (const section of sections) {
+		const lines = section.split("\n");
+		const markerIndex = lines[0]?.indexOf(" b/") ?? -1;
+		const name = markerIndex >= 0 ? lines[0].slice(markerIndex + 3) : lines[0]?.slice(11) || "代码差异";
+		const sectionAdditions = lines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
+		const sectionDeletions = lines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
+		additions += sectionAdditions;
+		deletions += sectionDeletions;
+		const block = document.createElement("details");
+		block.className = "review-file-diff";
+		block.dataset.reviewFile = name;
+		block.open = true;
+		const head = document.createElement("summary");
+		head.className = "review-file-diff-head";
+		head.innerHTML = `<span>${escapeHtml(name)}</span><span class="review-file-stats">+${sectionAdditions} / -${sectionDeletions}</span>`;
+		head.title = `${name}（点击折叠或展开）`;
+		block.appendChild(head);
+		for (const line of lines.slice(1)) {
+			const row = document.createElement("div");
+			if (line.startsWith("+") && !line.startsWith("+++")) row.className = "review-line add";
+			else if (line.startsWith("-") && !line.startsWith("---")) row.className = "review-line del";
+			else if (line.startsWith("@@")) row.className = "review-line hunk";
+			row.textContent = line || " ";
+			block.appendChild(row);
 		}
-		const target = currentBlock ?? reviewDiffEl;
-		const row = document.createElement("div");
-		if (line.startsWith("+")) row.className = "review-line add";
-		else if (line.startsWith("-")) row.className = "review-line del";
-		else if (line.startsWith("@@")) row.className = "review-line hunk";
-		row.textContent = line || " ";
-		target.appendChild(row);
+		reviewDiffEl.appendChild(block);
 	}
+	return { additions, deletions };
 }
 
 reviewRefreshEl.addEventListener("click", () => void loadReview());
 reviewCopyEl.addEventListener("click", () => {
-	const text = reviewDiffEl.innerText;
+	const text = reviewDiffEl.dataset.rawDiff || reviewDiffEl.innerText;
 	if (!text.trim()) return;
 	copyTextToClipboard(text);
 });
@@ -2275,6 +2412,13 @@ function updateToolBlock(block, isError, resultText) {
 	const liveEl = block.querySelector(".tool-live");
 	if (liveEl) liveEl.hidden = true;
 	const resultEl = block.querySelector(".tool-result");
+	if (block.classList.contains("terminal-synced")) {
+		if (resultEl) {
+			resultEl.innerHTML = '<button class="tool-terminal-link" type="button">在统一终端查看完整输出</button>';
+			resultEl.hidden = false;
+		}
+		return;
+	}
 	if (resultEl && resultText) {
 		resultEl.innerHTML = renderResultText(resultText);
 		resultEl.hidden = false;
@@ -2285,6 +2429,7 @@ function updateToolBlock(block, isError, resultText) {
 function updateToolBlockLive(toolCallId, text) {
 	const block = document.querySelector(`[data-tool-call-id="${CSS.escape(toolCallId)}"]`);
 	if (!block || !text) return;
+	if (block.classList.contains("terminal-synced")) return;
 	const liveEl = block.querySelector(".tool-live");
 	if (liveEl) {
 		liveEl.textContent = normalizeTerminalText(text);
@@ -2519,6 +2664,12 @@ collapseBtnEl.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 messagesEl.addEventListener("click", (e) => {
+	const terminalLink = e.target.closest(".tool-terminal-link");
+	if (terminalLink) {
+		e.preventDefault();
+		showSidePanel("terminal");
+		return;
+	}
 	const externalLink = e.target.closest("a.external-link");
 	if (externalLink) {
 		e.preventDefault();
@@ -4565,8 +4716,7 @@ async function autoCheckUpdate() {
 		thinkingSelectEl.disabled = false;
 		pollContext();
 		inputEl.focus();
-		// 默认展开右侧边栏的终端标签：智能体运行本地命令时可以直接看到同步输出。
-		showSidePanel("terminal");
+		// 右侧工作台默认关闭；智能体运行命令或用户使用快捷键时再打开，避免挤占对话空间。
 		void autoCheckUpdate();
 	} catch (error) {
 		showError(`初始化失败：${error.message}`);

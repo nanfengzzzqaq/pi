@@ -406,6 +406,12 @@ body {
 	background: var(--panel-2);
 }
 
+.secondary-btn.active {
+	border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	color: var(--accent);
+}
+
 .secondary-btn.danger {
 	border-color: color-mix(in srgb, var(--error) 42%, var(--border));
 	color: var(--error);
@@ -930,6 +936,25 @@ body {
 .agent-browser-toolbar button:disabled {
 	opacity: 0.38;
 	cursor: default;
+}
+
+.agent-browser-contextbar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 6px 9px;
+	border-bottom: 1px solid var(--border);
+	background: var(--sidebar-bg);
+}
+
+.agent-browser-hint {
+	min-width: 0;
+	margin-left: auto;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--faint);
+	font-size: 10.5px;
 }
 
 .agent-browser-stage {
@@ -2792,6 +2817,10 @@ body {
 	display: none;
 }
 
+.workbench-side.maximized {
+	width: min(76%, 1180px) !important;
+}
+
 /* 收起状态：只保留底部标签条（贴右下角），随时可以点回任意面板 */
 .workbench-side.collapsed {
 	width: 264px;
@@ -2968,6 +2997,11 @@ body {
 	color: #f5a524;
 }
 
+.review-file-state.staged {
+	background: color-mix(in srgb, var(--accent) 16%, transparent);
+	color: var(--accent);
+}
+
 .review-file-state.added {
 	background: color-mix(in srgb, #30a46c 16%, transparent);
 	color: #30a46c;
@@ -2997,12 +3031,46 @@ body {
 }
 
 .review-file-diff-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
 	padding: 7px 12px;
 	background: var(--panel-2);
 	border-bottom: 1px solid var(--border);
 	color: var(--muted);
 	font: 600 11.5px var(--mono);
 	word-break: break-all;
+	cursor: pointer;
+	list-style: none;
+}
+
+.review-file-diff-head::-webkit-details-marker {
+	display: none;
+}
+
+.review-file-diff-head::before {
+	content: "▾";
+	flex: 0 0 auto;
+	color: var(--faint);
+}
+
+.review-file-diff:not([open]) .review-file-diff-head::before {
+	content: "▸";
+}
+
+.review-file-diff-head > span:first-child {
+	min-width: 0;
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.review-file-stats {
+	flex: 0 0 auto;
+	color: var(--faint);
+	font-weight: 500;
 }
 
 .review-line {
@@ -3032,6 +3100,14 @@ body {
 
 /* ---------- 终端面板 ---------- */
 
+.terminal-shell-note {
+	padding: 6px 12px;
+	border-bottom: 1px solid var(--border);
+	background: var(--sidebar-bg);
+	color: var(--faint);
+	font-size: 10.5px;
+}
+
 .terminal-output {
 	flex: 1;
 	min-height: 0;
@@ -3050,28 +3126,23 @@ body {
 }
 
 .terminal-entry {
-	margin-bottom: 10px;
-	border: 1px solid var(--border);
-	border-radius: 10px;
-	overflow: hidden;
-	background: color-mix(in srgb, var(--panel) 60%, transparent);
+	padding: 8px 0 10px;
+	border-bottom: 1px solid var(--border);
 }
 
 .terminal-entry.running {
-	border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+	background: color-mix(in srgb, var(--accent) 4%, transparent);
 }
 
 .terminal-entry.error {
-	border-color: color-mix(in srgb, #e5484d 46%, var(--border));
+	background: color-mix(in srgb, #e5484d 4%, transparent);
 }
 
 .terminal-entry-head {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	padding: 7px 10px;
-	background: var(--panel-2);
-	border-bottom: 1px solid var(--border);
+	padding: 2px 4px 5px;
 }
 
 .terminal-entry-badge {
@@ -3081,6 +3152,12 @@ body {
 	background: color-mix(in srgb, var(--accent) 16%, transparent);
 	color: var(--accent);
 	font: 700 10px var(--mono);
+}
+
+.terminal-entry-prompt {
+	flex-shrink: 0;
+	color: #30a46c;
+	font: 700 11.5px var(--mono);
 }
 
 .terminal-entry-cmd {
@@ -3109,14 +3186,28 @@ body {
 }
 
 .terminal-entry-output {
-	max-height: 320px;
+	max-height: 420px;
 	overflow-y: auto;
 	margin: 0;
-	padding: 8px 10px;
+	padding: 5px 4px 0 46px;
 	font: 11.5px/1.6 var(--mono);
 	white-space: pre-wrap;
 	word-break: break-all;
 	color: var(--muted);
+}
+
+.tool-terminal-link {
+	padding: 4px 9px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--accent);
+	font: 11.5px var(--sans);
+	cursor: pointer;
+}
+
+.tool-terminal-link:hover {
+	border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
 }
 
 /* ---------- 运行中工具的实时输出（聊天区执行过程） ---------- */

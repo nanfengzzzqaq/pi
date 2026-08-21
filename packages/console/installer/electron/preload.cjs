@@ -35,6 +35,15 @@ contextBridge.exposeInMainWorld("piDesktop", {
 	browserReload() {
 		return ipcRenderer.invoke("pi:browser-reload");
 	},
+	browserDevtools() {
+		return ipcRenderer.invoke("pi:browser-devtools");
+	},
+	browserPickElement() {
+		return ipcRenderer.invoke("pi:browser-pick-element");
+	},
+	browserScreenshot() {
+		return ipcRenderer.invoke("pi:browser-screenshot");
+	},
 	setBrowserBounds(bounds) {
 		ipcRenderer.send("pi:browser-bounds", bounds);
 	},
