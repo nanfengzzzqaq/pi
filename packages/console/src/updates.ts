@@ -25,7 +25,7 @@ import { launchDesktopUpdateInstaller } from "./desktop-update-runtime.ts";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
 
 const REPO = "nanfengzzzqaq/pi";
-const GITHUB_LATEST_API = `https://api.github.com/repos/${REPO}/releases/latest`;
+const GITHUB_RELEASES_API = `https://api.github.com/repos/${REPO}/releases?per_page=100`;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 const UPDATE_DIR = join(DATA_DIR, "update");
 const PENDING_UPDATE_FILE = join(UPDATE_DIR, "pending-update.json");
@@ -52,6 +52,14 @@ interface ReleaseAsset {
 	browser_download_url: string;
 	size?: number;
 	digest?: string;
+}
+
+interface GithubRelease {
+	tag_name?: string;
+	assets?: ReleaseAsset[];
+	body?: string;
+	draft?: boolean;
+	prerelease?: boolean;
 }
 
 export interface UpdateInfo {
@@ -248,6 +256,62 @@ function compareVersions(a: string, b: string): number | null {
 	return 0;
 }
 
+interface ConsoleRelease {
+	release: GithubRelease;
+	version: string;
+	asset: ReleaseAsset;
+}
+
+/**
+ * 同一仓库同时发布 coding-agent 与 Pi Console。只有 tag 可安全比较、不是草稿/
+ * 预发布，并且 Release 真实包含与该版本完全匹配的安装包时，才视为客户端版本。
+ */
+function selectLatestConsoleRelease(releases: GithubRelease[]): ConsoleRelease | null {
+	let selected: ConsoleRelease | null = null;
+	for (const release of releases) {
+		if (release.draft === true || release.prerelease === true || typeof release.tag_name !== "string") continue;
+		const parsed = parseVersion(release.tag_name);
+		if (!parsed || parsed.prerelease !== null) continue;
+		const version = release.tag_name.replace(/^v/, "");
+		const expectedAssetName = `PiConsole-Setup-${version}.exe`;
+		const asset = Array.isArray(release.assets)
+			? release.assets.find(
+					(candidate) =>
+						candidate?.name === expectedAssetName &&
+						typeof candidate.browser_download_url === "string" &&
+						candidate.browser_download_url.length > 0,
+				)
+			: undefined;
+		if (!asset) continue;
+		if (!selected || (compareVersions(version, selected.version) ?? -1) > 0) {
+			selected = { release, version, asset };
+		}
+	}
+	return selected;
+}
+
+async function releaseViaRedirectFallback(
+	fetchImpl: typeof fetch,
+	credential: GithubCredential | null,
+): Promise<ConsoleRelease | null> {
+	const tag = await latestTagViaRedirect(fetchImpl, credential);
+	if (!tag) return null;
+	try {
+		const response = await fetchImpl(
+			`https://api.github.com/repos/${REPO}/releases/tags/${encodeURIComponent(tag)}`,
+			{
+				headers: { ...githubHeaders(credential), Accept: "application/vnd.github+json" },
+				signal: AbortSignal.timeout(15000),
+			},
+		);
+		if (!response.ok) return null;
+		const release = (await response.json()) as GithubRelease;
+		return selectLatestConsoleRelease([release]);
+	} catch {
+		return null;
+	}
+}
+
 interface PendingUpdateRecord {
 	fromVersion: string;
 	targetVersion: string;
@@ -378,27 +442,26 @@ export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<Upd
 		httpStatus: null,
 	};
 
-	let tag: string | null = null;
-	let assets: ReleaseAsset[] = [];
+	let selected: ConsoleRelease | null = null;
 	let networkFailed = false;
 	try {
-		const res = await fetchImpl(GITHUB_LATEST_API, {
+		const res = await fetchImpl(GITHUB_RELEASES_API, {
 			headers: { ...githubHeaders(credential), Accept: "application/vnd.github+json" },
 			signal: AbortSignal.timeout(15000),
 		});
 		info.httpStatus = res.status;
 		if (res.ok) {
-			const release = (await res.json()) as { tag_name?: string; assets?: ReleaseAsset[]; body?: string };
-			tag = release.tag_name ?? null;
-			assets = release.assets ?? [];
-			info.notes = release.body ?? null;
+			const releases = (await res.json()) as unknown;
+			if (Array.isArray(releases)) selected = selectLatestConsoleRelease(releases as GithubRelease[]);
 		}
 	} catch {
 		networkFailed = true;
 	}
-	if (!tag) tag = await latestTagViaRedirect(fetchImpl, credential);
+	if (!selected && (networkFailed || (info.httpStatus !== null && info.httpStatus >= 400))) {
+		selected = await releaseViaRedirectFallback(fetchImpl, credential);
+	}
 
-	if (!tag) {
+	if (!selected) {
 		if (info.httpStatus === 401 || info.httpStatus === 403 || (info.httpStatus === 404 && !credential)) {
 			info.error = "authentication";
 		} else if (networkFailed || info.httpStatus === null) {
@@ -408,20 +471,13 @@ export async function checkUpdate(options: CheckUpdateOptions = {}): Promise<Upd
 		}
 		return info;
 	}
-	info.latest = tag.replace(/^v/, "");
-
-	const asset = assets.find((a) => /Setup-.*\.exe$/i.test(a.name));
-	if (asset) {
-		info.assetUrl = asset.browser_download_url;
-		info.assetApiUrl = asset.url ?? null;
-		info.assetName = asset.name;
-		info.assetSize = asset.size ?? null;
-		info.assetDigest = asset.digest ?? null;
-	} else {
-		// 降级：发布资产统一使用 ASCII 名称，避免 URL 和 Windows 代码页差异。
-		info.assetName = `PiConsole-Setup-${info.latest}.exe`;
-		info.assetUrl = `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(info.assetName)}`;
-	}
+	info.latest = selected.version;
+	info.notes = selected.release.body ?? null;
+	info.assetUrl = selected.asset.browser_download_url;
+	info.assetApiUrl = selected.asset.url ?? null;
+	info.assetName = selected.asset.name;
+	info.assetSize = selected.asset.size ?? null;
+	info.assetDigest = selected.asset.digest ?? null;
 
 	const versionComparison = compareVersions(APP_VERSION, info.latest);
 	if (versionComparison === null) {

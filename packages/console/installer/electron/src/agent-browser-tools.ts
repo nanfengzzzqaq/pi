@@ -9,6 +9,8 @@ import {
 	type AgentBrowserTarget,
 	type AgentBrowserUploadFile,
 	getAgentBrowserRuntime,
+	redactSensitiveText,
+	resolveSensitiveBrowserUrl,
 } from "./agent-browser-runtime.ts";
 
 const UPLOAD_MIME_TYPES: Record<string, string> = {
@@ -59,14 +61,20 @@ function readUploadFiles(cwd: string, paths: string[]): AgentBrowserUploadFile[]
 }
 
 function result(text: string): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details: {} };
+	return { content: [{ type: "text", text: redactSensitiveText(text) }], details: {} };
+}
+
+function optionalTarget(params: { ref?: string; selector?: string; text?: string }): AgentBrowserTarget | undefined {
+	if (!params.ref && !params.selector && !params.text) return undefined;
+	return { ref: params.ref, selector: params.selector, text: params.text };
 }
 
 function target(params: { ref?: string; selector?: string; text?: string }): AgentBrowserTarget {
-	if (!params.ref && !params.selector && !params.text) {
+	const resolved = optionalTarget(params);
+	if (!resolved) {
 		throw new Error("请提供页面快照中的 ref、CSS selector 或可见文字之一");
 	}
-	return { ref: params.ref, selector: params.selector, text: params.text };
+	return resolved;
 }
 
 function workspaceOutput(cwd: string, requested: string | undefined): string {
@@ -92,11 +100,16 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 		defineTool({
 			name: "browser_navigate",
 			label: "打开网页",
-			description: "在 Pi 客户端的独立浏览器中打开网址。它与用户自己的 Chrome 窗口和账号目录隔离。",
+			description:
+				"在 Pi 客户端的独立浏览器中打开网址。它与用户自己的 Chrome 窗口和账号目录隔离；消息里的安全网址引用必须原样传入。",
 			parameters: Type.Object({ url: Type.String({ description: "完整网址，如 https://example.com" }) }),
 			execute: async (_id, params) => {
-				const state = await browser().navigate(params.url);
-				return result(`已打开：${state.title || state.url}\n${state.url}`);
+				try {
+					const state = await browser().navigate(resolveSensitiveBrowserUrl(params.url));
+					return result(`已打开：${state.title || state.url}\n${state.url}`);
+				} catch (error) {
+					throw new Error(redactSensitiveText(error instanceof Error ? error.message : String(error)));
+				}
 			},
 		}),
 		defineTool({
@@ -125,10 +138,13 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			parameters: Type.Object({
 				...targetParameters,
 				value: Type.String({ description: "要输入的内容" }),
-				submit: Type.Optional(Type.Boolean({ description: "输入后是否按回车提交，默认否" })),
+				submit: Type.Optional(Type.Boolean({ description: "输入后是否按回车确认，默认否；不会提交整张表单" })),
+				commit: Type.Optional(
+					Type.Boolean({ description: "输入后是否失焦以持久化字段，默认是；搜索下拉候选时设为否" }),
+				),
 			}),
 			execute: async (_id, params) =>
-				result(await browser().type(target(params), params.value, params.submit === true)),
+				result(await browser().type(target(params), params.value, params.submit === true, params.commit !== false)),
 		}),
 		defineTool({
 			name: "browser_scroll",
@@ -186,16 +202,17 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			name: "browser_upload",
 			label: "上传附件",
 			description:
-				"把本地文件作为附件上传到当前网页的文件上传框（如报销单的火车票附件）。路径可写工作区内相对路径或绝对路径；单文件 ≤20MB，总量 ≤50MB。",
+				"把本地文件定向上传到当前网页的文件上传框（如某一条报销明细的火车票附件）。页面有多个上传入口时必须传 ref、selector 或附近可见文字，工具不会猜测。路径可写工作区内相对路径或绝对路径；单文件 ≤20MB，总量 ≤50MB。",
 			parameters: Type.Object({
 				paths: Type.Array(Type.String(), {
 					minItems: 1,
 					description: '要上传的本地文件路径列表，如 ["tickets/去程票.png", "tickets/查验.png"]',
 				}),
+				...targetParameters,
 			}),
 			execute: async (_id, params) => {
 				const files = readUploadFiles(cwd, params.paths);
-				return result(await browser().upload(files));
+				return result(await browser().uploadFiles(files, optionalTarget(params)));
 			},
 		}),
 	];

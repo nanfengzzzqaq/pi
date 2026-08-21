@@ -1,0 +1,493 @@
+name: Release Pi Console
+
+on:
+  push:
+    branches:
+      - downstream
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pi-console-downstream
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Check Console release version
+    runs-on: ubuntu-latest
+    outputs:
+      release_mode: ${{ steps.release.outputs.release_mode }}
+      release_needed: ${{ steps.release.outputs.release_needed }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check whether this version needs a release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(node -p "require('./packages/console/package.json').version")"
+          electron_version="$(node -p "require('./packages/console/installer/electron/package.json').version")"
+          lock_version="$(node -p "require('./packages/console/installer/electron/package-lock.json').version")"
+          lock_root_version="$(node -p "require('./packages/console/installer/electron/package-lock.json').packages[''].version")"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Console version must use X.Y.Z format; found ${VERSION}."
+            exit 1
+          fi
+          if [[ "${electron_version}" != "${VERSION}" || "${lock_version}" != "${VERSION}" || "${lock_root_version}" != "${VERSION}" ]]; then
+            echo "::error::Console versions do not match: package=${VERSION}, electron=${electron_version}, lock=${lock_version}, lock-root=${lock_root_version}."
+            exit 1
+          fi
+
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          if [[ "${SOURCE_SHA}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::Checked out ${SOURCE_SHA}, expected pushed commit ${GITHUB_SHA}."
+            exit 1
+          fi
+
+          RELEASE_TAG="v${VERSION}"
+          response_file="$(mktemp)"
+          http_status="$(curl --silent --show-error \
+            --output "${response_file}" \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+
+          case "${http_status}" in
+            200)
+              tag_type="$(jq -r '.object.type' "${response_file}")"
+              tag_sha="$(jq -r '.object.sha' "${response_file}")"
+              if [[ "${tag_type}" != "commit" || "${tag_sha}" != "${SOURCE_SHA}" ]]; then
+                echo "::error::${RELEASE_TAG} exists but points to ${tag_type} ${tag_sha}; expected commit ${SOURCE_SHA}. Bump the Console version or repair the tag before rerunning."
+                exit 1
+              fi
+
+              release_file="$(mktemp)"
+              release_status="$(curl --silent --show-error \
+                --output "${release_file}" \
+                --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+              if [[ "${release_status}" == "404" ]]; then
+                release_needed=true
+                release_mode=recover
+                echo "::warning::${RELEASE_TAG} has no GitHub Release; rebuilding the installer and recovering the release."
+              elif [[ "${release_status}" == "200" ]]; then
+                is_draft="$(jq -r '.draft' "${release_file}")"
+                if [[ "${is_draft}" == "true" ]]; then
+                  release_needed=true
+                  release_mode=recover
+                  echo "::warning::${RELEASE_TAG} is still a draft; rebuilding the installer and recovering the release."
+                else
+                  expected_asset="PiConsole-Setup-${VERSION}.exe"
+                  asset_count="$(jq '.assets | length' "${release_file}")"
+                  valid_asset_count="$(jq --arg name "${expected_asset}" '[.assets[] | select(.name == $name and .size > 0)] | length' "${release_file}")"
+                  if [[ "${asset_count}" != "1" || "${valid_asset_count}" != "1" ]]; then
+                    echo "::error::Published ${RELEASE_TAG} must contain exactly one non-empty ${expected_asset} asset. Repair or remove the release before rerunning."
+                    exit 1
+                  fi
+                  release_needed=false
+                  release_mode=noop
+                  echo "::notice::${RELEASE_TAG} is already published from ${SOURCE_SHA} with the verified installer; nothing to do."
+                fi
+              else
+                echo "::error::Unable to inspect the GitHub Release for ${RELEASE_TAG}; GitHub API returned HTTP ${release_status}."
+                exit 1
+              fi
+              ;;
+            404)
+              release_needed=true
+              release_mode=create
+              echo "::notice::${RELEASE_TAG} does not exist; validating and building commit ${SOURCE_SHA}."
+              ;;
+            *)
+              echo "::error::Unable to check ${RELEASE_TAG}; GitHub API returned HTTP ${http_status}."
+              exit 1
+              ;;
+          esac
+
+          echo "release_mode=${release_mode}" >> "${GITHUB_OUTPUT}"
+          echo "release_needed=${release_needed}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${SOURCE_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  validate-ubuntu:
+    name: Validate repository (Ubuntu)
+    needs: prepare
+    if: ${{ needs.prepare.outputs.release_needed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+  build-windows:
+    name: Validate and build Pi Console (Windows)
+    needs:
+      - prepare
+      - validate-ubuntu
+    if: ${{ needs.prepare.outputs.release_needed == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Verify release source
+        shell: pwsh
+        run: |
+          $actualSha = (git rev-parse HEAD).Trim()
+          if ($actualSha -ne $env:SOURCE_SHA) {
+              throw "Checked out $actualSha, expected $env:SOURCE_SHA"
+          }
+          $actualVersion = (node -p "require('./packages/console/package.json').version").Trim()
+          $electronVersion = (node -p "require('./packages/console/installer/electron/package.json').version").Trim()
+          $lockVersion = (node -p "require('./packages/console/installer/electron/package-lock.json').version").Trim()
+          $lockRootVersion = (node -p "require('./packages/console/installer/electron/package-lock.json').packages[''].version").Trim()
+          if ($actualVersion -ne $env:VERSION -or $electronVersion -ne $env:VERSION -or $lockVersion -ne $env:VERSION -or $lockRootVersion -ne $env:VERSION) {
+              throw "Console versions do not match: package=$actualVersion, electron=$electronVersion, lock=$lockVersion, lock-root=$lockRootVersion, expected=$env:VERSION"
+          }
+          if ($env:RELEASE_TAG -ne "v$($env:VERSION)") {
+              throw "Release tag $env:RELEASE_TAG does not match Console version $env:VERSION"
+          }
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build Pi packages
+        run: npm run build
+
+      - name: Test Windows client
+        run: npm test --workspace=@pi/console
+
+      - name: Check packaged scripts
+        run: |
+          node --check packages/console/installer/electron/main.js
+          node --check packages/console/web/app.js
+
+      - name: Download and verify OfficeCLI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $downloadHeaders = @{ "User-Agent" = "pi-console-release" }
+          $apiHeaders = @{
+              Accept = "application/vnd.github+json"
+              Authorization = "Bearer $env:GH_TOKEN"
+              "User-Agent" = "pi-console-release"
+              "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $release = $null
+          try {
+              $release = Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/iOfficeAI/OfficeCLI/releases/latest"
+              $releaseTag = "$($release.tag_name)"
+          } catch {
+              Write-Warning "Authenticated OfficeCLI release lookup failed; falling back to the official latest-release redirect."
+              $latest = Invoke-WebRequest -Headers $downloadHeaders -Uri "https://github.com/iOfficeAI/OfficeCLI/releases/latest"
+              $releaseUri = $latest.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+              $tagMatch = [regex]::Match($releaseUri, '/releases/tag/([^/?#]+)')
+              if (-not $tagMatch.Success) {
+                  throw "Unable to resolve the latest OfficeCLI release tag from $releaseUri"
+              }
+              $releaseTag = [uri]::UnescapeDataString($tagMatch.Groups[1].Value)
+          }
+          if (-not $releaseTag) { throw "Latest OfficeCLI release did not provide a tag" }
+          $assetName = "officecli-win-x64.exe"
+          $downloadBase = "https://github.com/iOfficeAI/OfficeCLI/releases/download/$releaseTag"
+
+          $binDir = Join-Path $env:GITHUB_WORKSPACE "packages\console\data\bin"
+          New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+          $binaryPath = Join-Path $binDir "officecli.exe"
+          Invoke-WebRequest -Headers $downloadHeaders -Uri "$downloadBase/$assetName" -OutFile $binaryPath
+          if (-not (Test-Path -LiteralPath $binaryPath) -or (Get-Item -LiteralPath $binaryPath).Length -le 0) {
+              throw "Downloaded OfficeCLI binary is empty"
+          }
+
+          $expectedHash = $null
+          if ($release) {
+              $apiAssets = @($release.assets | Where-Object { $_.name -eq $assetName })
+              if ($apiAssets.Count -eq 1 -and "$($apiAssets[0].digest)" -match '^sha256:([0-9a-fA-F]{64})$') {
+                  $expectedHash = $Matches[1].ToLowerInvariant()
+              }
+          }
+          $sumsPath = Join-Path $env:RUNNER_TEMP "officecli-SHA256SUMS"
+          if (-not $expectedHash) {
+              Invoke-WebRequest -Headers $downloadHeaders -Uri "$downloadBase/SHA256SUMS" -OutFile $sumsPath
+              foreach ($line in Get-Content -LiteralPath $sumsPath) {
+                  $match = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
+                  if ($match.Success -and $match.Groups[2].Value.Trim() -eq $assetName) {
+                      $expectedHash = $match.Groups[1].Value.ToLowerInvariant()
+                      break
+                  }
+              }
+          }
+          if (-not $expectedHash) {
+              throw "Unable to obtain the official SHA-256 for $assetName"
+          }
+          $actualHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+              throw "OfficeCLI SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+
+          $probe = (& $binaryPath --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $probe) {
+              throw "Downloaded OfficeCLI binary did not pass its version probe"
+          }
+          $record = @{
+              version = $releaseTag -replace '^v', ''
+              downloadedAt = (Get-Date).ToUniversalTime().ToString("o")
+              sha256 = $expectedHash
+          }
+          $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $binDir "officecli.json") -Encoding utf8
+          Write-Host "Verified OfficeCLI $probe ($actualHash)"
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File packages/console/installer/electron-build.ps1
+
+      - name: Verify installer
+        id: installer
+        shell: pwsh
+        run: |
+          $expectedName = "PiConsole-Setup-$($env:VERSION).exe"
+          $expectedPath = Join-Path $env:GITHUB_WORKSPACE "packages\console\installer\electron\dist\$expectedName"
+          $packagedVersion = (node packages/console/installer/get-version.cjs packages/console/installer/electron/package.json).Trim()
+          if ($packagedVersion -ne $env:VERSION) {
+              throw "Packaged Console version is $packagedVersion, expected $env:VERSION"
+          }
+          if (-not (Test-Path -LiteralPath $expectedPath)) {
+              throw "Expected installer was not created: $expectedName"
+          }
+          $installer = Get-Item -LiteralPath $expectedPath
+          if ($installer.Name -ne $expectedName -or $installer.Length -le 0) {
+              throw "Installer name or size is invalid"
+          }
+          $hash = (Get-FileHash -LiteralPath $expectedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Verified $($installer.Name), $($installer.Length) bytes, SHA-256 $hash"
+
+      - name: Upload verified installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pi-console-${{ env.SOURCE_SHA }}
+          path: packages/console/installer/electron/dist/PiConsole-Setup-${{ env.VERSION }}.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Tag and publish Pi Console
+    needs:
+      - prepare
+      - build-windows
+    if: ${{ needs.prepare.outputs.release_needed == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_MODE: ${{ needs.prepare.outputs.release_mode }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+      SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download verified installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pi-console-${{ env.SOURCE_SHA }}
+          path: release-assets
+
+      - name: Create tag and GitHub Release
+        run: |
+          set -Eeuo pipefail
+
+          asset="release-assets/PiConsole-Setup-${VERSION}.exe"
+          if [[ ! -s "${asset}" ]]; then
+            echo "::error::Verified installer is missing or empty: ${asset}"
+            exit 1
+          fi
+          asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "${asset_count}" != "1" ]]; then
+            echo "::error::Expected exactly one release asset, found ${asset_count}."
+            exit 1
+          fi
+
+          tag_created=false
+          cleanup_enabled=false
+          cleanup_failed_publish() {
+            failure_status="$?"
+            set +e
+            if [[ "${cleanup_enabled}" == "true" ]]; then
+              release_state="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+              if [[ "${release_state}" == "true" ]]; then
+                gh release delete "${RELEASE_TAG}" --yes
+                release_state=missing
+              elif [[ "${release_state}" != "missing" ]]; then
+                echo "::warning::A non-draft release now exists for ${RELEASE_TAG}; it was not removed."
+              fi
+              if [[ "${tag_created}" == "true" && "${release_state}" == "missing" ]]; then
+                current_tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha 2>/dev/null || true)"
+                if [[ "${current_tag_sha}" == "${SOURCE_SHA}" ]]; then
+                  gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" >/dev/null
+                fi
+              fi
+            fi
+            exit "${failure_status}"
+          }
+          trap cleanup_failed_publish ERR
+
+          case "${RELEASE_MODE}" in
+            create)
+              response_file="$(mktemp)"
+              http_status="$(curl --silent --show-error \
+                --output "${response_file}" \
+                --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+              if [[ "${http_status}" != "404" ]]; then
+                echo "::error::Expected ${RELEASE_TAG} to be absent before creation; GitHub API returned HTTP ${http_status}."
+                exit 1
+              fi
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                --field ref="refs/tags/${RELEASE_TAG}" \
+                --field sha="${SOURCE_SHA}" >/dev/null
+              tag_created=true
+              cleanup_enabled=true
+              ;;
+            recover)
+              tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+              if [[ "$(jq -r '.object.type' <<< "${tag_json}")" != "commit" || "$(jq -r '.object.sha' <<< "${tag_json}")" != "${SOURCE_SHA}" ]]; then
+                echo "::error::${RELEASE_TAG} changed while the installer was building; refusing recovery."
+                exit 1
+              fi
+              release_file="$(mktemp)"
+              release_status="$(curl --silent --show-error \
+                --output "${release_file}" \
+                --write-out '%{http_code}' \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${GH_TOKEN}" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+              if [[ "${release_status}" == "200" ]]; then
+                if [[ "$(jq -r '.draft' "${release_file}")" != "true" ]]; then
+                  echo "::error::${RELEASE_TAG} became public while the installer was building; refusing to replace it."
+                  exit 1
+                fi
+                gh release delete "${RELEASE_TAG}" --yes
+              elif [[ "${release_status}" != "404" ]]; then
+                echo "::error::Unable to inspect ${RELEASE_TAG} during recovery; GitHub API returned HTTP ${release_status}."
+                exit 1
+              fi
+              cleanup_enabled=true
+              ;;
+            *)
+              echo "::error::Unknown Console release mode: ${RELEASE_MODE}."
+              exit 1
+              ;;
+          esac
+
+          tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          actual_tag_type="$(jq -r '.object.type' <<< "${tag_json}")"
+          actual_tag_sha="$(jq -r '.object.sha' <<< "${tag_json}")"
+          if [[ "${actual_tag_type}" != "commit" || "${actual_tag_sha}" != "${SOURCE_SHA}" ]]; then
+            echo "::error::${RELEASE_TAG} points to ${actual_tag_type} ${actual_tag_sha}, expected commit ${SOURCE_SHA}."
+            exit 1
+          fi
+
+          notes_file="$(mktemp)"
+          {
+            echo '## 本版关键修复'
+            echo
+            echo '- 修复差旅报销自动化的票据解析、附件上传和表单填写稳定性。'
+            echo '- 增加只保存草稿的安全约束，并强化敏感链接脱敏。'
+            echo '- 改进本地模型与内置浏览器工具协作的可靠性。'
+            echo
+            printf '构建来源：`%s`。\n' "${SOURCE_SHA}"
+          } > "${notes_file}"
+          gh release create "${RELEASE_TAG}" "${asset}" \
+            --verify-tag \
+            --draft \
+            --title "Pi Console ${RELEASE_TAG}" \
+            --notes-file "${notes_file}"
+
+          draft_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          draft_asset_count="$(jq '.assets | length' <<< "${draft_json}")"
+          draft_valid_asset_count="$(jq --arg name "$(basename "${asset}")" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${draft_json}")"
+          if [[ "$(jq -r '.draft' <<< "${draft_json}")" != "true" || "${draft_asset_count}" != "1" || "${draft_valid_asset_count}" != "1" ]]; then
+            echo "::error::Draft release validation failed for ${RELEASE_TAG}."
+            exit 1
+          fi
+
+          gh release edit "${RELEASE_TAG}" --draft=false --latest
+          cleanup_enabled=false
+          trap - ERR
+
+          published_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          published_asset_count="$(jq '.assets | length' <<< "${published_json}")"
+          published_valid_asset_count="$(jq --arg name "$(basename "${asset}")" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${published_json}")"
+          final_tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          if [[ "$(jq -r '.draft' <<< "${published_json}")" != "false" \
+            || "${published_asset_count}" != "1" \
+            || "${published_valid_asset_count}" != "1" \
+            || "$(jq -r '.object.type' <<< "${final_tag_json}")" != "commit" \
+            || "$(jq -r '.object.sha' <<< "${final_tag_json}")" != "${SOURCE_SHA}" ]]; then
+            echo "::error::Published release validation failed for ${RELEASE_TAG}."
+            exit 1
+          fi
+          echo "Published ${RELEASE_TAG} from ${SOURCE_SHA} with $(basename "${asset}")."
