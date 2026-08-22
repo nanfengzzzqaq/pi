@@ -1,16 +1,28 @@
 import { WebContentsView, session } from "electron";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import { redactSensitiveText, redactSensitiveUrl } from "./src/agent-browser-runtime.ts";
 import {
+	agentBrowserUploadOrigin,
+	deduplicateAgentBrowserSnapshotCandidates,
+	redactSensitiveText,
+	redactSensitiveUrl,
+} from "./src/agent-browser-runtime.ts";
+import {
+	EKUAIBAO_ATTACHMENT_ACTION_PATTERN,
+	EKUAIBAO_ATTACHMENT_CONTEXT_PATTERN,
 	EKUAIBAO_DANGEROUS_ATTRIBUTE_PATTERN,
 	EKUAIBAO_DANGEROUS_LABEL_PATTERN,
+	EKUAIBAO_DESTRUCTIVE_ATTRIBUTE_PATTERN,
+	EKUAIBAO_DESTRUCTIVE_LABEL_PATTERN,
 	EKUAIBAO_DRAFT_ATTRIBUTE_PATTERN,
 	EKUAIBAO_DRAFT_LABEL_PATTERN,
+	EKUAIBAO_ROW_CONTEXT_PATTERN,
 } from "./src/agent-browser-safety.ts";
 
 const BROWSER_PARTITION = "persist:pi-agent-browser";
 const EMPTY_PAGE = "about:blank";
+const UPLOAD_ISOLATED_WORLD_ID = 1001;
 
 function cleanText(value) {
 	return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -273,25 +285,126 @@ export class AgentBrowserController {
 		return picked;
 	}
 
-	async snapshot(maxChars) {
+	async snapshot(options) {
 		const view = this.ensureView();
 		await this.open();
 		this.status = "正在获取页面状态（browser_snapshot）";
 		this.emitState();
-		const limit = Math.max(1000, Math.min(Number(maxChars) || 6000, 12000));
+		const requested = typeof options === "number" ? { maxChars: options } : options ?? {};
+		const limit = Math.max(1000, Math.min(Number(requested.maxChars) || 6000, 12000));
+		const maxElements = Math.max(20, Math.min(Number(requested.maxElements) || 500, 1000));
+		const scopeTexts = Array.isArray(requested.scopeTexts)
+			? requested.scopeTexts.map((item) => cleanText(item)).filter(Boolean).slice(0, 8)
+			: [];
 		const snapshot = await view.webContents.executeJavaScript(`(() => {
+			const maxElements = ${maxElements};
+			const scopeTexts = ${JSON.stringify(scopeTexts)};
+			const readable = (element) => (
+				element?.innerText || element?.value || element?.getAttribute?.('aria-label') ||
+				element?.getAttribute?.('title') || element?.getAttribute?.('placeholder') ||
+				element?.getAttribute?.('data-testid') || element?.getAttribute?.('data-test') || ''
+			).replace(/\\s+/g, ' ').trim();
 			const visible = (element) => {
 				const style = getComputedStyle(element);
 				const rect = element.getBoundingClientRect();
-				return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+				return style.visibility !== "hidden" && style.display !== "none" && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
 			};
-			document.querySelectorAll('[data-pi-agent-ref]').forEach((element) => element.removeAttribute('data-pi-agent-ref'));
+			const roots = [document];
+			for (let index = 0; index < roots.length; index++) {
+				const root = roots[index];
+				for (const node of root.querySelectorAll('*')) {
+					if (node.shadowRoot) roots.push(node.shadowRoot);
+					if (node.tagName === 'IFRAME') {
+						try { if (node.contentDocument) roots.push(node.contentDocument); } catch { /* cross-origin */ }
+					}
+				}
+			}
+			const queryAll = (selector, bases = roots) => {
+				const found = [];
+				const seen = new Set();
+				for (const base of bases) {
+					if (base.matches?.(selector) && !seen.has(base)) { seen.add(base); found.push(base); }
+					for (const item of base.querySelectorAll?.(selector) || []) {
+						if (!seen.has(item)) { seen.add(item); found.push(item); }
+					}
+				}
+				return found;
+			};
+			const layer = (element) => {
+				let value = 0;
+				for (let node = element; node?.nodeType === 1; node = node.parentElement) {
+					const parsed = Number.parseInt(getComputedStyle(node).zIndex, 10);
+					if (Number.isFinite(parsed)) value = Math.max(value, parsed);
+				}
+				return value;
+			};
+			const overlaySelector = '[role="dialog"],[aria-modal="true"],.ant-modal-wrap,.ant-drawer-content-wrapper,[class*="drawer-content"],[class*="modal-content"]';
+			const overlays = queryAll(overlaySelector).filter(visible).sort((left, right) => layer(right) - layer(left));
+			const scopeSelector = 'section,article,form,li,tr,[role="row"],[role="dialog"],[class*="item"],[class*="card"],[class*="detail"],[class*="drawer"],[class*="modal"],div';
+			let contentScopes = [];
+			if (scopeTexts.length) {
+				const matchingScopes = queryAll(scopeSelector)
+					.filter((element) => visible(element) && scopeTexts.every((text) => readable(element).includes(text)));
+				const overlayScopes = matchingScopes.filter((element) =>
+					overlays.some((overlay) => overlay === element || overlay.contains(element)),
+				);
+				const preferredScopes = overlayScopes.length ? overlayScopes : matchingScopes;
+				contentScopes = preferredScopes
+					.filter((candidate) => !preferredScopes.some((other) => other !== candidate && candidate.contains(other)))
+					.sort((left, right) => readable(left).length - readable(right).length || layer(right) - layer(left))
+					.slice(0, 12);
+			}
+			const searchScopes = contentScopes.length ? contentScopes : [...overlays, ...roots];
 			const selector = "a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=combobox],[role=option],[contenteditable=true],[data-testid],[data-test],[placeholder],[onclick],[tabindex]:not([tabindex='-1'])";
-			const semantic = [...document.querySelectorAll(selector)];
-			const pointerElements = [...document.querySelectorAll('div,span,li')].filter((element) => getComputedStyle(element).cursor === 'pointer');
-			const elements = [...new Set([...semantic, ...pointerElements])].filter(visible).slice(0, 200).map((element, index) => {
-				const ref = "e" + (index + 1);
-				element.setAttribute("data-pi-agent-ref", ref);
+			const activationSelector = 'a[href],area[href],button,input:not([type=hidden]),select,textarea,summary,details,label,iframe,object,embed,audio[controls],video[controls],[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role=button],[role=link],[role=option],[role=checkbox],[role=radio],[role=tab],[role=menuitem],[role=menuitemcheckbox],[role=menuitemradio],[role=switch],[role=combobox],[role=slider],[role=spinbutton],[role=textbox],[role=treeitem],[data-testid],[data-test],[onclick],[onmousedown],[onmouseup],[onpointerdown],[onpointerup]';
+			const normalizedReadable = (element) => readable(element).replace(/[\\s/：:（）()_-]+/g, '').toLocaleLowerCase('zh-CN');
+			const elementDepth = (element) => {
+				let depth = 0;
+				for (let node = element; node; node = node.parentElement || node.getRootNode?.()?.host || null) depth++;
+				return depth;
+			};
+			const activationIds = new WeakMap();
+			let activationSequence = 0;
+			const activationKey = (element) => {
+				const expectedText = normalizedReadable(element);
+				const matchingDescendants = [...element.querySelectorAll?.(activationSelector) || []]
+					.filter((candidate) => visible(candidate) && normalizedReadable(candidate) === expectedText)
+					.sort((left, right) => {
+						const depth = elementDepth(right) - elementDepth(left);
+						if (depth !== 0) return depth;
+						const leftRect = left.getBoundingClientRect();
+						const rightRect = right.getBoundingClientRect();
+						return leftRect.width * leftRect.height - rightRect.width * rightRect.height;
+					});
+				const activation = matchingDescendants[0] || (element.matches?.(activationSelector) ? element : element.closest?.(activationSelector));
+				if (!activation) return '';
+				if (!activationIds.has(activation)) activationIds.set(activation, 'a' + (++activationSequence));
+				return activationIds.get(activation);
+			};
+			const elements = [];
+			const seenElements = new Set();
+			const candidateLimit = Math.min(4000, Math.max(maxElements + 100, maxElements * 4));
+			for (const scope of searchScopes) {
+				const semantic = queryAll(selector, [scope]);
+				const pointerElements = queryAll('div,span,li', [scope]).filter((element) => visible(element) && getComputedStyle(element).cursor === 'pointer');
+				for (const element of [...semantic, ...pointerElements]) {
+					const isFileInput = element.matches?.('input[type="file"]');
+					if ((!visible(element) && !isFileInput) || seenElements.has(element)) continue;
+					seenElements.add(element);
+					elements.push(element);
+					if (elements.length >= candidateLimit) break;
+				}
+				if (elements.length >= candidateLimit) break;
+			}
+			window.__piAgentRefSequence = Number(window.__piAgentRefSequence) || 0;
+			const usedRefs = new Set();
+			const serialized = elements.map((element) => {
+				let ref = element.getAttribute('data-pi-agent-ref') || '';
+				if (!ref || usedRefs.has(ref)) {
+					ref = 'e' + (++window.__piAgentRefSequence);
+					element.setAttribute('data-pi-agent-ref', ref);
+				}
+				usedRefs.add(ref);
 				const rect = element.getBoundingClientRect();
 				let fieldLabel = [...(element.labels || [])].map((label) => label.innerText || label.textContent || '').join(' ').replace(/\\s+/g, ' ').trim();
 				if (!fieldLabel && element.getAttribute('aria-labelledby')) {
@@ -304,11 +417,20 @@ export class AgentBrowserController {
 						if (candidate) { fieldLabel = (candidate.innerText || candidate.textContent || '').replace(/\\s+/g, ' ').trim(); break; }
 					}
 				}
+				let context = '';
+				if (element.matches?.('input[type="file"]')) {
+					let container = element.parentElement;
+					for (let depth = 0; depth < 7 && container; depth++, container = container.parentElement) {
+						const candidate = readable(container);
+						if (candidate && candidate.length <= 500) { context = candidate; break; }
+					}
+				}
 				return {
 					ref,
 					tag: element.tagName.toLowerCase(),
 					role: element.getAttribute("role") || "",
 					text: (element.innerText || element.value || element.getAttribute("aria-label") || element.getAttribute("title") || element.getAttribute("placeholder") || element.getAttribute("data-testid") || element.getAttribute("data-test") || "").replace(/\\s+/g, " ").trim().slice(0, 180),
+					dedupeText: readable(element).slice(0, 1000),
 					testId: element.getAttribute("data-testid") || element.getAttribute("data-test") || "",
 					placeholder: element.getAttribute("placeholder") || "",
 					name: element.getAttribute("name") || "",
@@ -316,26 +438,40 @@ export class AgentBrowserController {
 					fieldLabel: fieldLabel.slice(0, 100),
 					href: element.href || "",
 					disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+					checked: element.matches?.('input[type="checkbox"],input[type="radio"]') ? Boolean(element.checked) : null,
+					ariaChecked: element.getAttribute("aria-checked"),
+					hidden: !visible(element),
+					context: context.slice(0, 180),
 					x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height),
+					dedupeDepth: elementDepth(element),
+					dedupeActivationKey: activationKey(element),
 				};
 			});
+			const bodyRoot = contentScopes[0] || overlays[0] || document.body;
 			return {
 				url: location.href,
 				title: document.title,
-				text: (document.body?.innerText || "").replace(/\\n{3,}/g, "\\n\\n").slice(0, ${limit}),
-				elements,
+				text: (bodyRoot?.innerText || bodyRoot?.textContent || "").replace(/\\n{3,}/g, "\\n\\n").slice(0, ${limit}),
+				elements: serialized,
+				scopeMatched: !scopeTexts.length || contentScopes.length > 0,
 			};
 		})()`);
+		snapshot.elements = deduplicateAgentBrowserSnapshotCandidates(snapshot.elements, maxElements);
 		snapshot.url = redactSensitiveUrl(snapshot.url);
 		snapshot.text = redactSensitiveText(snapshot.text);
 		const elementLines = snapshot.elements.map((element) => {
-			const label = [element.tag, element.role, element.disabled ? "disabled" : ""].filter(Boolean).join("/");
+			const label = [element.tag, element.role, element.disabled ? "disabled" : "", element.hidden ? "hidden" : ""]
+				.filter(Boolean)
+				.join("/");
 			const hints = [
 				element.fieldLabel ? `label=${element.fieldLabel}` : "",
 				element.testId ? `testid=${element.testId}` : "",
 				element.placeholder ? `placeholder=${element.placeholder}` : "",
 				element.name ? `name=${element.name}` : "",
 				element.type ? `type=${element.type}` : "",
+				typeof element.checked === "boolean" ? `checked=${element.checked}` : "",
+				element.ariaChecked !== null && element.ariaChecked !== "" ? `aria-checked=${element.ariaChecked}` : "",
+				element.context ? `context=${element.context}` : "",
 			]
 				.filter(Boolean)
 				.join(" ");
@@ -345,27 +481,63 @@ export class AgentBrowserController {
 		this.status = `页面状态已读取：${snapshot.elements.length} 个可操作元素`;
 		this.emitState();
 		return redactSensitiveText(
-			[`标题：${redactSensitiveText(snapshot.title) || "（无）"}`, `网址：${snapshot.url}`, "", "可操作元素：", ...elementLines, "", "页面正文：", snapshot.text]
+			[
+				`标题：${redactSensitiveText(snapshot.title) || "（无）"}`,
+				`网址：${snapshot.url}`,
+				...(snapshot.scopeMatched ? [] : [`范围文字未找到：${scopeTexts.join(" / ")}`]),
+				"",
+				"可操作元素：",
+				...elementLines,
+				"",
+				"页面正文：",
+				snapshot.text,
+			]
 				.join("\n")
-				.slice(0, limit + 6000),
+				.slice(0, limit + 16000),
 		);
 	}
 
 	async findAndRun(target, action) {
 		const view = this.ensureView();
+		const actionToken = randomUUID();
 		const encodedTarget = JSON.stringify(target ?? {});
 		const encodedAction = JSON.stringify(action);
+		const encodedActionToken = JSON.stringify(actionToken);
 		const encodedSafetyPatterns = JSON.stringify({
+			attachmentAction: EKUAIBAO_ATTACHMENT_ACTION_PATTERN,
+			attachmentContext: EKUAIBAO_ATTACHMENT_CONTEXT_PATTERN,
 			dangerousAttribute: EKUAIBAO_DANGEROUS_ATTRIBUTE_PATTERN,
 			dangerousLabel: EKUAIBAO_DANGEROUS_LABEL_PATTERN,
+			destructiveAttribute: EKUAIBAO_DESTRUCTIVE_ATTRIBUTE_PATTERN,
+			destructiveLabel: EKUAIBAO_DESTRUCTIVE_LABEL_PATTERN,
 			draftAttribute: EKUAIBAO_DRAFT_ATTRIBUTE_PATTERN,
 			draftLabel: EKUAIBAO_DRAFT_LABEL_PATTERN,
+			rowContext: EKUAIBAO_ROW_CONTEXT_PATTERN,
 		});
 		const response = await view.webContents.executeJavaScript(`(() => {
 			try {
 				const target = ${encodedTarget};
 				const action = ${encodedAction};
+				const actionToken = ${encodedActionToken};
 				const safetyPatterns = ${encodedSafetyPatterns};
+				const isEkuaibao = /(^|\\.)ekuaibao\\.com$/i.test(location.hostname);
+				if (action.kind === 'type' && action.pressEnter && isEkuaibao) {
+					throw new Error("安全策略已禁止在易快报页面通过回车确认，以免触发表单提交；请点击明确的候选项");
+				}
+				const readable = (item) => (
+					item?.innerText || item?.value || item?.getAttribute?.('aria-label') || item?.getAttribute?.('title') ||
+					item?.getAttribute?.('placeholder') || item?.getAttribute?.('data-testid') || item?.getAttribute?.('data-test') || ''
+				).replace(/\\s+/g, ' ').trim();
+				const safetyTokens = (value) => String(value || '')
+					.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+					.replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
+					.replace(/[^a-z0-9\\u4e00-\\u9fff]+/gi, ' ')
+					.trim();
+				const visible = (element) => {
+					const style = getComputedStyle(element);
+					const rect = element.getBoundingClientRect();
+					return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+				};
 				const roots = [document];
 				for (let index = 0; index < roots.length; index++) {
 					const root = roots[index];
@@ -376,65 +548,181 @@ export class AgentBrowserController {
 						}
 					}
 				}
-				const queryAll = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
-				const readable = (item) => (
-					item.innerText || item.value || item.getAttribute('aria-label') || item.getAttribute('title') ||
-					item.getAttribute('placeholder') || item.getAttribute('data-testid') || item.getAttribute('data-test') || ''
-				).replace(/\\s+/g, ' ').trim();
-				let element = null;
-				if (target.ref) element = queryAll('[data-pi-agent-ref="' + CSS.escape(target.ref) + '"]')[0] || null;
-				if (!element && target.selector) {
-					try { element = queryAll(target.selector)[0] || null; } catch { throw new Error("CSS selector 无效"); }
+				const queryAll = (selector, bases = roots) => {
+					const found = [];
+					const seen = new Set();
+					for (const base of bases) {
+						if (base.matches?.(selector) && !seen.has(base)) { seen.add(base); found.push(base); }
+						for (const item of base.querySelectorAll?.(selector) || []) {
+							if (!seen.has(item)) { seen.add(item); found.push(item); }
+						}
+					}
+					return found;
+				};
+				const layer = (element) => {
+					let value = 0;
+					for (let node = element; node?.nodeType === 1; node = node.parentElement) {
+						const parsed = Number.parseInt(getComputedStyle(node).zIndex, 10);
+						if (Number.isFinite(parsed)) value = Math.max(value, parsed);
+					}
+					return value;
+				};
+				const overlays = queryAll('[role="dialog"],[aria-modal="true"],.ant-modal-wrap,.ant-drawer-content-wrapper,[class*="drawer-content"],[class*="modal-content"]')
+					.filter(visible)
+					.sort((left, right) => layer(right) - layer(left));
+				const orderedBases = (bases) => bases === roots ? [...overlays, ...roots] : bases;
+				const locatorCandidates = (locator, bases = roots) => {
+					const scopedBases = orderedBases(bases);
+					let candidates = [];
+					if (locator?.ref) candidates = queryAll('[data-pi-agent-ref="' + CSS.escape(locator.ref) + '"]', scopedBases);
+					else if (locator?.selector) {
+						try { candidates = queryAll(locator.selector, scopedBases); } catch { throw new Error('CSS selector 无效'); }
+					} else if (locator?.text) {
+						const selector = 'a,button,input,textarea,select,summary,label,li,[role=button],[role=link],[role=option],[role=combobox],[data-testid],[data-test],[placeholder],[onclick],[contenteditable=true],div,span';
+						const pool = queryAll(selector, scopedBases);
+						const exact = pool.filter((item) => readable(item) === locator.text);
+						candidates = exact.length
+							? exact
+							: pool.filter((item) => readable(item).includes(locator.text)).sort((left, right) => readable(left).length - readable(right).length);
+					}
+					return candidates;
+				};
+				const occurrenceIndex = (locator) => Math.max(0, (Number(locator?.occurrence) || 1) - 1);
+				const resolveLocator = (locator, bases = roots) => locatorCandidates(locator, bases)[occurrenceIndex(locator)] || null;
+				const localScopeSelector = '[role="dialog"],[aria-modal="true"],[role="row"],tr,li,form,section,article,[class*="drawer"],[class*="modal"],[class*="item"],[class*="card"],[class*="detail"],[class*="field"],[class*="form-item"],[data-testid],[data-test]';
+				const overlayScopeSelector = '[role="dialog"],[aria-modal="true"],[class*="drawer"],[class*="modal"]';
+				const hasLocalScope = (candidate, wanted, boundary) => {
+					const directText = readable(candidate);
+					if (directText.length <= 800 && wanted.every((text) => directText.includes(text))) return true;
+					let node = candidate.parentElement || candidate.getRootNode?.()?.host || null;
+					for (let depth = 0; depth < 12 && node?.nodeType === 1; depth++) {
+						if (node === document.body || node === document.documentElement) break;
+						if (node.matches?.(localScopeSelector)) {
+							const scopedText = readable(node);
+							const isOverlayScope = node.matches(overlayScopeSelector);
+							if ((isOverlayScope || scopedText.length <= 2500) && wanted.every((text) => scopedText.includes(text))) {
+								return true;
+							}
+						}
+						if (node === boundary) break;
+						const root = node.getRootNode?.();
+						node = node.parentElement || root?.host || null;
+					}
+					return false;
+				};
+				let withinElement = null;
+				let targetBases = roots;
+				if (target.within) {
+					withinElement = resolveLocator(target.within);
+					if (!withinElement) throw new Error('没有找到 within 指定的页面范围');
+					targetBases = [withinElement];
+					if (withinElement.shadowRoot) targetBases.push(withinElement.shadowRoot);
 				}
-				if (!element && target.text) {
-					const selector = 'a,button,input,textarea,select,summary,label,li,[role=button],[role=link],[role=option],[role=combobox],[data-testid],[data-test],[placeholder],[onclick],[contenteditable=true]';
-					const semantic = queryAll(selector);
-					const textElements = queryAll('div,span,li');
-					const candidates = [...new Set([...semantic, ...textElements])];
-					element = candidates.find((item) => readable(item) === target.text)
-						|| candidates.find((item) => readable(item).includes(target.text));
+				let candidates = locatorCandidates(target, targetBases);
+				const scopeTexts = Array.isArray(target.scopeTexts)
+					? target.scopeTexts.map((item) => String(item || '').replace(/\\s+/g, ' ').trim()).filter(Boolean)
+					: [];
+				if (scopeTexts.length) {
+					candidates = candidates.filter((candidate) => hasLocalScope(candidate, scopeTexts, withinElement));
 				}
+				let element = candidates[occurrenceIndex(target)] || null;
 				if (!element) throw new Error("没有找到目标元素，请先调用 browser_snapshot 获取最新 ref");
 
-				if (action.kind === 'click') {
+				if (action.kind === 'click' || action.kind === 'hover') {
 					const clickableSelector = 'a,button,input[type=button],input[type=submit],summary,label,[role=button],[role=link],[role=option],[data-testid],[data-test],[onclick]';
-					let clickable = element.matches(clickableSelector) ? element : (element.closest(clickableSelector) || element);
-					if (clickable === element && !element.matches(clickableSelector)) {
+					let clickable = element;
+					if (element.tagName === 'LABEL' && element.control) clickable = element.control;
+					else if (!element.matches(clickableSelector) && getComputedStyle(element).cursor !== 'pointer') {
 						let container = element.parentElement;
-						for (let depth = 0; depth < 7 && container; depth++, container = container.parentElement) {
-							const radios = [...container.querySelectorAll('input[type=radio]')];
-							if (radios.length === 1) { clickable = radios[0]; break; }
-							const controls = [...container.querySelectorAll('input:not([type=hidden]),button,[role=button],[role=combobox],[role=option]')];
-							if (controls.length === 1) { clickable = controls[0]; break; }
+						for (let depth = 0; depth < 8 && container; depth++, container = container.parentElement) {
+							if (withinElement && !withinElement.contains(container)) break;
+							if (container.matches(clickableSelector) || getComputedStyle(container).cursor === 'pointer') { clickable = container; break; }
 						}
 					}
 					const label = readable(clickable).slice(0, 160) || clickable.tagName;
+					const locatorSignal = [target.selector || '', target.text || ''].join(' ').replace(/\\s+/g, ' ').trim();
 					const attributeSignal = [
-						target.selector || '', target.text || '', clickable.id || '', clickable.className || '',
+						clickable.id || '', clickable.className || '',
 						clickable.getAttribute('name') || '', clickable.getAttribute('data-testid') || '',
 						clickable.getAttribute('data-test') || '', clickable.getAttribute('aria-label') || '',
 						clickable.getAttribute('title') || ''
 					].join(' ').replace(/\\s+/g, ' ').trim();
-					const isEkuaibao = /(^|\\.)ekuaibao\\.com$/i.test(location.hostname);
-					const dangerousAttribute = new RegExp(safetyPatterns.dangerousAttribute, 'i').test(attributeSignal);
-					// button.type exposes the browser's effective type, so a button
-					// without an explicit type inside a form is still treated as submit.
-					const dangerousControl = /^(?:INPUT|BUTTON)$/i.test(clickable.tagName)
-						&& Boolean(clickable.form)
-						&& /^submit$/i.test(clickable.type || '');
+					const blockedSignal = (locatorSignal + ' ' + attributeSignal).trim();
+					const dangerousAttributePattern = new RegExp(safetyPatterns.dangerousAttribute, 'i');
+					const dangerousAttribute = dangerousAttributePattern.test(blockedSignal)
+						|| dangerousAttributePattern.test(safetyTokens(blockedSignal));
 					const dangerousLabel = new RegExp(safetyPatterns.dangerousLabel).test(label);
-					if (isEkuaibao && (dangerousAttribute || dangerousControl || dangerousLabel)) {
-						throw new Error("安全策略已阻止易快报的提交、删除、作废或撤销操作；差旅插件只允许保存草稿");
+					if (action.kind === 'click' && isEkuaibao && (dangerousAttribute || dangerousLabel)) {
+						throw new Error("安全策略已阻止易快报的提交、送审、删除单据、作废或撤销操作；差旅插件只允许保存草稿");
 					}
 					// Draft recognition is deliberately evaluated only after every dangerous
 					// signal above has been rejected. It is not an override for submit/delete.
 					const isDraft = new RegExp(safetyPatterns.draftLabel).test(label)
 						|| new RegExp(safetyPatterns.draftAttribute, 'i').test(' ' + attributeSignal + ' ');
+					const submitControl = /^(?:INPUT|BUTTON)$/i.test(clickable.tagName)
+						&& /^(?:submit|image)$/i.test(clickable.type || clickable.getAttribute('type') || '');
+					if (action.kind === 'click' && isEkuaibao && submitControl && !isDraft) {
+						throw new Error("安全策略已阻止易快报的非草稿提交控件；差旅插件只允许精确的保存草稿按钮");
+					}
+					const destructive = new RegExp(safetyPatterns.destructiveAttribute, 'i').test(safetyTokens(blockedSignal))
+						|| new RegExp(safetyPatterns.destructiveLabel).test(label);
+					if (action.kind === 'click' && isEkuaibao && destructive) {
+						let contextSignal = '';
+						let destructiveRow = false;
+						const attachmentActionPattern = new RegExp(safetyPatterns.attachmentAction, 'i');
+						const attachmentContextPattern = new RegExp(safetyPatterns.attachmentContext, 'i');
+						const rowContextPattern = new RegExp(safetyPatterns.rowContext, 'i');
+						const matchesAttachmentAction = (value) => attachmentActionPattern.test(value)
+							|| attachmentActionPattern.test(safetyTokens(value));
+						const matchesAttachmentContext = (value) => attachmentContextPattern.test(value)
+							|| attachmentContextPattern.test(safetyTokens(value));
+						const matchesRowContext = (value) => rowContextPattern.test(value)
+							|| rowContextPattern.test(safetyTokens(value));
+						const explicitAttachmentAction = matchesAttachmentAction((label + ' ' + attributeSignal).trim());
+						for (let node = clickable, depth = 0; depth < 5 && node?.nodeType === 1; depth++, node = node.parentElement) {
+							const nodeAttributes = [
+								node.id || '', node.className || '', node.getAttribute('name') || '',
+								node.getAttribute('data-testid') || '', node.getAttribute('data-test') || '',
+								node.getAttribute('aria-label') || '', node.getAttribute('title') || ''
+							].join(' ').replace(/\\s+/g, ' ').trim();
+							const fullNodeText = readable(node);
+							const nodeText = depth <= 2 && fullNodeText.length <= 240 ? fullNodeText : '';
+							const candidateContext = (nodeAttributes + ' ' + nodeText).trim();
+							if (matchesRowContext(candidateContext)) destructiveRow = true;
+							if (matchesAttachmentContext(candidateContext)) { contextSignal = candidateContext; break; }
+							if (depth > 0 && node.matches?.('form,[role="dialog"],[role="row"],tr')) break;
+						}
+						if (destructiveRow && !explicitAttachmentAction) {
+							throw new Error("安全策略已阻止易快报费用明细行的删除操作");
+						}
+						const attachmentRemoval = explicitAttachmentAction || Boolean(contextSignal);
+						if (!attachmentRemoval) {
+							throw new Error("安全策略已阻止易快报中没有明确附件上下文的删除或移除操作");
+						}
+					}
 					if (clickable.disabled || clickable.getAttribute('aria-disabled') === 'true') throw new Error("目标元素已禁用");
-					clickable.scrollIntoView({ block: 'center', inline: 'center' });
-					clickable.focus();
-					clickable.click();
-					return { ok: true, value: (isDraft ? '已点击草稿保存按钮：' : '已点击：') + label };
+					if (clickable.ownerDocument !== document) {
+						throw new Error("目标元素位于内嵌框架，已停止可信鼠标操作以防坐标偏移点错；请改用顶层页面入口");
+					}
+					for (const stale of document.querySelectorAll('[data-pi-agent-action-token]')) {
+						stale.removeAttribute('data-pi-agent-action-token');
+					}
+					clickable.setAttribute('data-pi-agent-action-token', actionToken);
+					clickable.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+					if (action.kind === 'click') clickable.focus({ preventScroll: true });
+					const rect = clickable.getBoundingClientRect();
+					if (rect.width <= 0 || rect.height <= 0) throw new Error('目标元素当前不可见，无法发送真实鼠标事件');
+					return {
+						ok: true,
+						pointer: {
+							x: Math.max(0, Math.round(rect.left + rect.width / 2)),
+							y: Math.max(0, Math.round(rect.top + rect.height / 2)),
+							kind: action.kind,
+							token: actionToken,
+						},
+						label,
+						isDraft,
+					};
 				}
 
 				if (!element.isContentEditable && !('value' in element)) {
@@ -475,6 +763,139 @@ export class AgentBrowserController {
 			}
 		})()`, true);
 		if (!response?.ok) throw new Error(response?.error || "页面操作失败");
+		if (response.pointer) {
+			const originalPoint = { x: response.pointer.x, y: response.pointer.y };
+			const verifyPointerTarget = async () => {
+				const verified = await view.webContents.executeJavaScript(`(() => {
+					try {
+						const token = ${JSON.stringify(actionToken)};
+						const point = ${JSON.stringify(originalPoint)};
+						const safetyPatterns = ${encodedSafetyPatterns};
+						const candidates = [...document.querySelectorAll('[data-pi-agent-action-token]')]
+							.filter((element) => element.getAttribute('data-pi-agent-action-token') === token);
+						if (candidates.length !== 1) throw new Error('可信鼠标目标已重渲染或不再唯一，未发送点击事件');
+						const clickable = candidates[0];
+						if (!clickable.isConnected || clickable.ownerDocument !== document) {
+							throw new Error('可信鼠标目标已离开当前文档，未发送点击事件');
+						}
+						const style = getComputedStyle(clickable);
+						const rect = clickable.getBoundingClientRect();
+						if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0' || rect.width <= 0 || rect.height <= 0) {
+							throw new Error('可信鼠标目标已不可见，未发送点击事件');
+						}
+						const currentPoint = {
+							x: Math.max(0, Math.round(rect.left + rect.width / 2)),
+							y: Math.max(0, Math.round(rect.top + rect.height / 2)),
+						};
+						if (Math.abs(currentPoint.x - point.x) > 2 || Math.abs(currentPoint.y - point.y) > 2) {
+							throw new Error('可信鼠标目标在操作前发生位移，未发送点击事件');
+						}
+						const hit = document.elementFromPoint(point.x, point.y);
+						if (!hit || (hit !== clickable && !clickable.contains(hit))) {
+							throw new Error('可信鼠标坐标已被其他元素覆盖，未发送点击事件');
+						}
+						const activationSelector = [
+							'a[href]', 'area[href]', 'button', 'input:not([type=hidden])', 'select', 'textarea',
+							'summary', 'details', 'label', 'iframe', 'object', 'embed', 'audio[controls]', 'video[controls]',
+							'[contenteditable]:not([contenteditable="false"])', '[tabindex]:not([tabindex="-1"])',
+							'[role=button]', '[role=link]', '[role=option]', '[role=checkbox]', '[role=radio]', '[role=tab]',
+							'[role=menuitem]', '[role=menuitemcheckbox]', '[role=menuitemradio]', '[role=switch]',
+							'[role=combobox]', '[role=slider]', '[role=spinbutton]', '[role=textbox]', '[role=treeitem]',
+							'[data-testid]', '[data-test]', '[onclick]', '[onmousedown]', '[onmouseup]', '[onpointerdown]', '[onpointerup]',
+						].join(',');
+						let activation = hit;
+						while (activation && activation !== clickable && !activation.matches?.(activationSelector)) {
+							activation = activation.parentElement;
+						}
+						const expectedLabelControl = Boolean(activation) && clickable.tagName === 'LABEL' && clickable.control === activation;
+						if (activation !== clickable && !expectedLabelControl) {
+							throw new Error('可信鼠标坐标命中了目标内部的独立交互控件，未发送点击事件');
+						}
+						const readable = (item) => (
+							item?.innerText || item?.value || item?.getAttribute?.('aria-label') || item?.getAttribute?.('title') ||
+							item?.getAttribute?.('placeholder') || item?.getAttribute?.('data-testid') || item?.getAttribute?.('data-test') || ''
+						).replace(/\\s+/g, ' ').trim();
+						const safetyTokens = (value) => String(value || '')
+							.replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+							.replace(/([A-Z])([A-Z][a-z])/g, '$1 $2')
+							.replace(/[^a-z0-9\\u4e00-\\u9fff]+/gi, ' ')
+							.trim();
+						const attributes = (item) => [
+							item?.id || '', item?.className || '', item?.getAttribute?.('name') || '',
+							item?.getAttribute?.('data-testid') || '', item?.getAttribute?.('data-test') || '',
+							item?.getAttribute?.('aria-label') || '', item?.getAttribute?.('title') || ''
+						].join(' ').replace(/\\s+/g, ' ').trim();
+						const label = readable(clickable).slice(0, 160) || clickable.tagName;
+						const attributeSignal = (attributes(clickable) + ' ' + attributes(hit)).trim();
+						const isEkuaibao = /(^|\\.)ekuaibao\\.com$/i.test(location.hostname);
+						if (clickable.disabled || clickable.getAttribute('aria-disabled') === 'true') {
+							throw new Error('可信鼠标目标已禁用，未发送点击事件');
+						}
+						if (isEkuaibao) {
+							const dangerousAttributePattern = new RegExp(safetyPatterns.dangerousAttribute, 'i');
+							const dangerousAttribute = dangerousAttributePattern.test(attributeSignal)
+								|| dangerousAttributePattern.test(safetyTokens(attributeSignal));
+							const dangerousLabel = new RegExp(safetyPatterns.dangerousLabel).test(label);
+							if (dangerousAttribute || dangerousLabel) {
+								throw new Error('安全策略在点击前复核时发现提交、送审、删除单据、作废或撤销控件');
+							}
+							const isDraft = new RegExp(safetyPatterns.draftLabel).test(label)
+								|| new RegExp(safetyPatterns.draftAttribute, 'i').test(' ' + attributeSignal + ' ');
+							const submitControl = /^(?:INPUT|BUTTON)$/i.test(clickable.tagName)
+								&& /^(?:submit|image)$/i.test(clickable.type || clickable.getAttribute('type') || '');
+							if (submitControl && !isDraft) throw new Error('安全策略在点击前复核时发现非草稿提交控件');
+							const destructive = new RegExp(safetyPatterns.destructiveAttribute, 'i').test(safetyTokens(attributeSignal))
+								|| new RegExp(safetyPatterns.destructiveLabel).test(label);
+							if (destructive) {
+								const attachmentActionPattern = new RegExp(safetyPatterns.attachmentAction, 'i');
+								const attachmentContextPattern = new RegExp(safetyPatterns.attachmentContext, 'i');
+								const rowContextPattern = new RegExp(safetyPatterns.rowContext, 'i');
+								const matches = (pattern, value) => pattern.test(value) || pattern.test(safetyTokens(value));
+								const explicitAttachmentAction = matches(attachmentActionPattern, (label + ' ' + attributeSignal).trim());
+								let attachmentContext = false;
+								let destructiveRow = false;
+								for (let node = clickable, depth = 0; depth < 5 && node?.nodeType === 1; depth++, node = node.parentElement) {
+									const context = (attributes(node) + ' ' + (depth <= 2 ? readable(node).slice(0, 240) : '')).trim();
+									if (matches(rowContextPattern, context)) destructiveRow = true;
+									if (matches(attachmentContextPattern, context)) { attachmentContext = true; break; }
+									if (depth > 0 && node.matches?.('form,[role="dialog"],[role="row"],tr')) break;
+								}
+								if ((destructiveRow && !explicitAttachmentAction) || (!explicitAttachmentAction && !attachmentContext)) {
+									throw new Error('安全策略在点击前复核时发现非附件删除或移除控件');
+								}
+							}
+							return { ok: true, point: currentPoint, label, isDraft };
+						}
+						return { ok: true, point: currentPoint, label, isDraft: false };
+					} catch (error) {
+						return { ok: false, error: error?.message || String(error) };
+					}
+				})()`, true);
+				if (!verified?.ok) throw new Error(verified?.error || "可信鼠标目标复核失败");
+				return verified;
+			};
+			try {
+				let verified = await verifyPointerTarget();
+				const point = verified.point;
+				view.webContents.sendInputEvent({ type: "mouseMove", ...point });
+				await new Promise((resolve) => setTimeout(resolve, response.pointer.kind === "hover" ? 100 : 40));
+				if (response.pointer.kind === "click") {
+					verified = await verifyPointerTarget();
+					view.webContents.sendInputEvent({ type: "mouseDown", button: "left", clickCount: 1, ...point });
+					view.webContents.sendInputEvent({ type: "mouseUp", button: "left", clickCount: 1, ...point });
+				}
+				const prefix = response.pointer.kind === "hover" ? "已悬浮：" : verified.isDraft ? "已点击草稿保存按钮：" : "已点击：";
+				return redactSensitiveText(prefix + verified.label);
+			} finally {
+				await view.webContents.executeJavaScript(`(() => {
+					for (const element of document.querySelectorAll('[data-pi-agent-action-token]')) {
+						if (element.getAttribute('data-pi-agent-action-token') === ${JSON.stringify(actionToken)}) {
+							element.removeAttribute('data-pi-agent-action-token');
+						}
+					}
+				})()`).catch(() => {});
+			}
+		}
 		return redactSensitiveText(response.value);
 	}
 
@@ -483,6 +904,16 @@ export class AgentBrowserController {
 		this.status = "正在点击页面元素（browser_click）";
 		this.emitState();
 		const output = await this.findAndRun(target, { kind: "click" });
+		this.status = output;
+		this.emitState();
+		return output;
+	}
+
+	async hover(target) {
+		await this.open();
+		this.status = "正在悬浮页面元素（browser_hover）";
+		this.emitState();
+		const output = await this.findAndRun(target, { kind: "hover" });
 		this.status = output;
 		this.emitState();
 		return output;
@@ -503,31 +934,110 @@ export class AgentBrowserController {
 	 * 大文件分块传入页面，避免单次 executeJavaScript 字符串过大。
 	 * files: [{ name, mimeType, dataBase64 }]
 	 */
-	async uploadFiles(files, target) {
+	async uploadFiles(files, target, allowedOrigin) {
 		const view = this.ensureView();
 		await this.open();
 		this.status = `正在上传 ${files.length} 个附件（browser_upload）`;
 		this.emitState();
+		const webContents = view.webContents;
+		if (typeof webContents.executeJavaScriptInIsolatedWorld !== "function") {
+			throw new Error("当前浏览器内核不支持隔离附件传输，已停止上传");
+		}
+		const startUrl = webContents.getURL();
+		let startOrigin;
+		let lockedOrigin;
 		try {
-			await view.webContents.executeJavaScript("(() => { window.__piUploadFiles = []; return true; })()");
+			startOrigin = agentBrowserUploadOrigin(startUrl);
+			lockedOrigin = agentBrowserUploadOrigin(allowedOrigin);
+		} catch {
+			throw new Error("附件上传缺少有效的调用方来源锁，已在读取页面数据前停止");
+		}
+		if (String(allowedOrigin).trim() !== lockedOrigin || startOrigin !== lockedOrigin) {
+			throw new Error("当前页面来源与调用方锁定来源不一致，已在注入附件数据前停止");
+		}
+		const uploadToken = randomUUID();
+		const isolated = (code) => webContents.executeJavaScriptInIsolatedWorld(
+			UPLOAD_ISOLATED_WORLD_ID,
+			[{ code }],
+			true,
+		);
+		const cleanupCode = `(() => {
+			if (globalThis.__piUploadSession?.token === ${JSON.stringify(uploadToken)}) delete globalThis.__piUploadSession;
+			return true;
+		})()`;
+		let navigationStarted = false;
+		const onNavigation = (_event, _url, _isInPlace, isMainFrame) => {
+			if (isMainFrame === false) return;
+			navigationStarted = true;
+			void isolated(cleanupCode).catch(() => {});
+		};
+		webContents.on("did-start-navigation", onNavigation);
+		const assertSameDocument = () => {
+			if (navigationStarted || webContents.isDestroyed() || webContents.getURL() !== startUrl) {
+				throw new Error("附件上传期间页面发生导航，已中止并清理待上传数据");
+			}
+		};
+		try {
+			assertSameDocument();
+			const initialized = await isolated(`(() => {
+				if (location.href !== ${JSON.stringify(startUrl)} || location.origin !== ${JSON.stringify(startOrigin)}) {
+					return { ok: false, error: '附件上传页面与锁定页面不一致' };
+				}
+				globalThis.__piUploadSession = { token: ${JSON.stringify(uploadToken)}, files: [] };
+				return { ok: true };
+			})()`);
+			if (!initialized?.ok) throw new Error(initialized?.error || "无法建立隔离附件传输会话");
 			for (const file of files) {
-				await view.webContents.executeJavaScript(
-					`window.__piUploadFiles.push({ name: ${JSON.stringify(file.name)}, mimeType: ${JSON.stringify(file.mimeType)}, parts: [] }), true`,
-				);
+				assertSameDocument();
+				const added = await isolated(`(() => {
+					const session = globalThis.__piUploadSession;
+					if (session?.token !== ${JSON.stringify(uploadToken)} || location.href !== ${JSON.stringify(startUrl)} || location.origin !== ${JSON.stringify(startOrigin)}) {
+						return { ok: false, error: '附件传输会话已失效' };
+					}
+					session.files.push({ name: ${JSON.stringify(file.name)}, mimeType: ${JSON.stringify(file.mimeType)}, parts: [] });
+					return { ok: true };
+				})()`);
+				if (!added?.ok) throw new Error(added?.error || "附件传输会话已失效");
 				const chunkSize = 262144;
 				for (let offset = 0; offset < file.dataBase64.length; offset += chunkSize) {
+					assertSameDocument();
 					const chunk = JSON.stringify(file.dataBase64.slice(offset, offset + chunkSize));
-					await view.webContents.executeJavaScript(
-						`window.__piUploadFiles[window.__piUploadFiles.length - 1].parts.push(${chunk}), true`,
-					);
+					const appended = await isolated(`(() => {
+						const session = globalThis.__piUploadSession;
+						if (session?.token !== ${JSON.stringify(uploadToken)} || location.href !== ${JSON.stringify(startUrl)} || location.origin !== ${JSON.stringify(startOrigin)}) {
+							return { ok: false, error: '附件传输会话已失效' };
+						}
+						session.files[session.files.length - 1].parts.push(${chunk});
+						return { ok: true };
+					})()`);
+					if (!appended?.ok) throw new Error(appended?.error || "附件分块传输已中止");
 				}
 			}
+			assertSameDocument();
 			const encodedTarget = JSON.stringify(target ?? {});
-			const response = await view.webContents.executeJavaScript(`(() => {
+			const response = await isolated(`(() => {
 				try {
-					const items = window.__piUploadFiles || [];
-					delete window.__piUploadFiles;
+					const session = globalThis.__piUploadSession;
+					if (session?.token !== ${JSON.stringify(uploadToken)} || location.href !== ${JSON.stringify(startUrl)} || location.origin !== ${JSON.stringify(startOrigin)}) {
+						throw new Error('附件上传前页面或文档已改变');
+					}
+					const items = session.files;
+					delete globalThis.__piUploadSession;
 					const target = ${encodedTarget};
+					const hasAnchorLocator = Boolean(target.ref || target.selector || target.text);
+					const hasTarget = Boolean(
+						hasAnchorLocator || target.within ||
+						(Array.isArray(target.scopeTexts) && target.scopeTexts.length)
+					);
+					const readable = (item) => (
+						item?.innerText || item?.value || item?.getAttribute?.('aria-label') || item?.getAttribute?.('title') ||
+						item?.getAttribute?.('placeholder') || item?.getAttribute?.('data-testid') || item?.getAttribute?.('data-test') || ''
+					).replace(/\\s+/g, ' ').trim();
+					const visible = (element) => {
+						const style = getComputedStyle(element);
+						const rect = element.getBoundingClientRect();
+						return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+					};
 					const roots = [document];
 					for (let index = 0; index < roots.length; index++) {
 						const root = roots[index];
@@ -538,36 +1048,141 @@ export class AgentBrowserController {
 							}
 						}
 					}
-					const queryAll = (selector) => roots.flatMap((root) => [...root.querySelectorAll(selector)]);
-					const readable = (item) => (
-						item.innerText || item.value || item.getAttribute('aria-label') || item.getAttribute('title') ||
-						item.getAttribute('placeholder') || item.getAttribute('data-testid') || item.getAttribute('data-test') || ''
-					).replace(/\\s+/g, ' ').trim();
+					const queryAll = (selector, bases = roots) => {
+						const found = [];
+						const seen = new Set();
+						for (const base of bases) {
+							if (base.matches?.(selector) && !seen.has(base)) { seen.add(base); found.push(base); }
+							for (const item of base.querySelectorAll?.(selector) || []) {
+								if (!seen.has(item)) { seen.add(item); found.push(item); }
+							}
+						}
+						return found;
+					};
+					const layer = (element) => {
+						let value = 0;
+						for (let node = element; node?.nodeType === 1; node = node.parentElement) {
+							const parsed = Number.parseInt(getComputedStyle(node).zIndex, 10);
+							if (Number.isFinite(parsed)) value = Math.max(value, parsed);
+						}
+						return value;
+					};
+					const overlays = queryAll('[role="dialog"],[aria-modal="true"],.ant-modal-wrap,.ant-drawer-content-wrapper,[class*="drawer-content"],[class*="modal-content"]')
+						.filter(visible)
+						.sort((left, right) => layer(right) - layer(left) || readable(left).length - readable(right).length);
+					const orderedBases = (bases) => bases === roots ? [...overlays, ...roots] : bases;
+					const occurrenceIndex = (locator) => Math.max(0, (Number(locator?.occurrence) || 1) - 1);
+					const localScopeSelector = '[role="dialog"],[aria-modal="true"],[role="row"],tr,li,form,section,article,[class*="drawer"],[class*="modal"],[class*="item"],[class*="card"],[class*="detail"],[class*="field"],[class*="form-item"],[data-testid],[data-test]';
+					const overlayScopeSelector = '[role="dialog"],[aria-modal="true"],[class*="drawer"],[class*="modal"]';
+					const hasLocalScope = (candidate, wanted, boundary) => {
+						const directText = readable(candidate);
+						if (directText.length <= 800 && wanted.every((text) => directText.includes(text))) return true;
+						let node = candidate.parentElement || candidate.getRootNode?.()?.host || null;
+						for (let depth = 0; depth < 12 && node?.nodeType === 1; depth++) {
+							if (node === document.body || node === document.documentElement) break;
+							if (node.matches?.(localScopeSelector)) {
+								const scopedText = readable(node);
+								const isOverlayScope = node.matches(overlayScopeSelector);
+								if ((isOverlayScope || scopedText.length <= 2500) && wanted.every((text) => scopedText.includes(text))) {
+									return true;
+								}
+							}
+							if (node === boundary) break;
+							const root = node.getRootNode?.();
+							node = node.parentElement || root?.host || null;
+						}
+						return false;
+					};
+					const locatorCandidates = (locator, bases = roots, requireOccurrenceForSelector = false) => {
+						const scopedBases = orderedBases(bases);
+						let candidates = [];
+						if (locator?.ref) candidates = queryAll('[data-pi-agent-ref="' + CSS.escape(locator.ref) + '"]', scopedBases);
+						else if (locator?.selector) {
+							try { candidates = queryAll(locator.selector, scopedBases); } catch { throw new Error('CSS selector 无效'); }
+							if (requireOccurrenceForSelector && candidates.length > 1 && !locator.occurrence) {
+								throw new Error('CSS selector 匹配到 ' + candidates.length + ' 个元素，请提供 occurrence 指定第几个');
+							}
+						} else if (locator?.text) {
+							const pool = queryAll('input,label,button,a,div,span,[role=button],[data-testid],[data-test]', scopedBases);
+							const exact = pool.filter((item) => readable(item) === locator.text);
+							candidates = exact.length
+								? exact
+								: pool.filter((item) => readable(item).includes(locator.text)).sort((left, right) => readable(left).length - readable(right).length);
+						}
+						const scopeTexts = Array.isArray(locator?.scopeTexts)
+							? locator.scopeTexts.map((item) => String(item || '').replace(/\\s+/g, ' ').trim()).filter(Boolean)
+							: [];
+						if (scopeTexts.length) {
+							const boundary = bases.find((base) => base?.nodeType === 1) || null;
+							candidates = candidates.filter((candidate) => hasLocalScope(candidate, scopeTexts, boundary));
+						}
+						return candidates;
+					};
+					const resolveLocator = (locator, bases = roots, strictSelector = false) =>
+						locatorCandidates(locator, bases, strictSelector)[occurrenceIndex(locator)] || null;
+					let withinElement = null;
+					let targetBases = roots;
+					if (target.within) {
+						withinElement = resolveLocator(target.within, roots, true);
+						if (!withinElement) throw new Error('指定的上传范围不存在，未回退到全页上传框');
+						targetBases = [withinElement];
+						if (withinElement.shadowRoot) targetBases.push(withinElement.shadowRoot);
+					}
 					const inputs = queryAll('input[type=file]');
 					if (inputs.length === 0) throw new Error('页面没有文件上传入口');
 					let anchor = null;
-					if (target.ref) anchor = queryAll('[data-pi-agent-ref="' + CSS.escape(target.ref) + '"]')[0] || null;
-					if (!anchor && target.selector) {
-						try { anchor = queryAll(target.selector)[0] || null; } catch { throw new Error('CSS selector 无效'); }
+					if (target.ref || target.selector || target.text) anchor = resolveLocator(target, targetBases, true);
+					if (!anchor && Array.isArray(target.scopeTexts) && target.scopeTexts.length) {
+						const wanted = target.scopeTexts.map((item) => String(item || '').replace(/\\s+/g, ' ').trim()).filter(Boolean);
+						anchor = queryAll('section,article,form,li,tr,[role="row"],[role="dialog"],[class*="item"],[class*="card"],[class*="detail"],[class*="drawer"],[class*="modal"],div', targetBases)
+							.filter((item) => wanted.every((text) => readable(item).includes(text)))
+							.sort((left, right) => readable(left).length - readable(right).length)[0] || null;
 					}
-					if (!anchor && target.text) {
-						const candidates = queryAll('input,label,button,a,div,span,[role=button],[data-testid],[data-test]');
-						anchor = candidates.find((item) => readable(item) === target.text)
-							|| candidates.find((item) => readable(item).includes(target.text));
-					}
+					if (hasAnchorLocator && !anchor) throw new Error('指定的上传目标不存在，未回退到 within、弹窗或全页上传框');
+					if (hasTarget && !anchor && !withinElement) throw new Error('指定的上传目标不存在，未回退到全页上传框');
 					let element = null;
 					if (anchor?.matches?.('input[type=file]')) element = anchor;
-					if (!element && anchor?.tagName === 'LABEL' && anchor.control?.matches?.('input[type=file]')) element = anchor.control;
-					if (!element && anchor) {
-						let container = anchor;
-						for (let depth = 0; depth < 8 && container; depth++, container = container.parentElement) {
-							const nearby = [...container.querySelectorAll?.('input[type=file]') || []];
-							if (nearby.length === 1) { element = nearby[0]; break; }
+					if (
+						!element && anchor?.tagName === 'LABEL' && anchor.control?.matches?.('input[type=file]') &&
+						(!withinElement || withinElement.contains(anchor.control))
+					) {
+						element = anchor.control;
+					}
+					if (!element && anchor?.getAttribute?.('aria-controls')) {
+						const controlled = anchor.ownerDocument.getElementById(anchor.getAttribute('aria-controls'));
+						if (controlled?.matches?.('input[type=file]') && (!withinElement || withinElement.contains(controlled))) {
+							element = controlled;
 						}
-						if (!element) throw new Error('指定的上传目标附近没有唯一的文件输入框，请重新获取页面快照后传 ref 或 selector');
+					}
+					if (!element && anchor) {
+						const localBoundarySelector = '[role="dialog"],[aria-modal="true"],[role="row"],tr,li,form,section,article,[class*="drawer"],[class*="modal"],[class*="detail"],[class*="item"],[class*="card"]';
+						const closestBoundary = anchor.closest?.(localBoundarySelector) || null;
+						const nearestBoundary = closestBoundary && (!withinElement || withinElement.contains(closestBoundary))
+							? closestBoundary
+							: withinElement || anchor;
+						const boundaryBases = [nearestBoundary];
+						if (nearestBoundary.shadowRoot) boundaryBases.push(nearestBoundary.shadowRoot);
+						const boundaryInputs = queryAll('input[type=file]', boundaryBases);
+						if (boundaryInputs.length > 1) throw new Error('指定目标最近边界内存在多个上传框，已拒绝猜测');
+						if (boundaryInputs.length === 1) element = boundaryInputs[0];
+					}
+					if (!element && withinElement) {
+						const scopedInputs = queryAll('input[type=file]', targetBases);
+						if (scopedInputs.length === 1) element = scopedInputs[0];
+						else if (target.occurrence && scopedInputs[occurrenceIndex(target)]) element = scopedInputs[occurrenceIndex(target)];
+						else if (scopedInputs.length > 1) throw new Error('within 指定范围内存在多个上传框，必须精确指定');
+					}
+					if (!element && !hasTarget) {
+						const overlayWithInputs = overlays.find((overlay) => queryAll('input[type=file]', [overlay]).length > 0);
+						if (overlayWithInputs) {
+							const overlayInputs = queryAll('input[type=file]', [overlayWithInputs]);
+							if (overlayInputs.length === 1) element = overlayInputs[0];
+							else if (target.occurrence && overlayInputs[occurrenceIndex(target)]) element = overlayInputs[occurrenceIndex(target)];
+						}
 					}
 					if (!element) {
-						if (inputs.length !== 1) throw new Error('页面有 ' + inputs.length + ' 个上传入口，必须用 ref、selector 或可见文字指定明细，已停止以防附件传错');
+						if (hasTarget) throw new Error('指定目标附近没有唯一上传框，未回退到全页；请用隐藏 file input 的 ref 或 occurrence 精确指定');
+						if (inputs.length !== 1) throw new Error('页面有 ' + inputs.length + ' 个上传入口，必须用 ref、selector、scopeTexts 或 within 指定明细，已停止以防附件传错');
 						element = inputs[0];
 					}
 					const ownerWindow = element.ownerDocument.defaultView || window;
@@ -588,7 +1203,7 @@ export class AgentBrowserController {
 					const targetLabel = element.getAttribute('data-testid') || element.getAttribute('name') || readable(anchor || element) || '指定上传框';
 					return { ok: true, value: '已向“' + targetLabel.slice(0, 80) + '”选择 ' + selected.length + ' 个文件：' + selected.join('、') };
 				} catch (error) {
-					delete window.__piUploadFiles;
+					delete globalThis.__piUploadSession;
 					return { ok: false, error: error?.message || String(error) };
 				}
 			})()`, true);
@@ -601,6 +1216,9 @@ export class AgentBrowserController {
 			this.status = `附件上传失败：${error?.message || error}`;
 			this.emitState();
 			throw error;
+		} finally {
+			webContents.removeListener("did-start-navigation", onNavigation);
+			if (!webContents.isDestroyed()) await isolated(cleanupCode).catch(() => {});
 		}
 	}
 

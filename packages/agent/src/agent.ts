@@ -17,8 +17,10 @@ import type {
 	AgentLoopConfig,
 	AgentLoopTurnUpdate,
 	AgentMessage,
+	AgentPromptToolChoice,
 	AgentState,
 	AgentTool,
+	AgentToolResultChoicePolicy,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
 	PrepareNextTurnContext,
@@ -120,6 +122,13 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+}
+
+/** Options that apply only to the first provider request of one prompt run. */
+export interface AgentPromptOptions {
+	toolChoice?: AgentPromptToolChoice;
+	/** Override tool selection after a successful or failed tool result in this prompt. */
+	toolChoiceAfterToolResult?: AgentToolResultChoicePolicy;
 }
 
 class PendingMessageQueue {
@@ -345,20 +354,27 @@ export class Agent {
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
-	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
-	async prompt(input: string, images?: ImageContent[]): Promise<void>;
-	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+	async prompt(message: AgentMessage | AgentMessage[], options?: AgentPromptOptions): Promise<void>;
+	async prompt(input: string, options?: AgentPromptOptions): Promise<void>;
+	async prompt(input: string, images?: ImageContent[], options?: AgentPromptOptions): Promise<void>;
+	async prompt(
+		input: string | AgentMessage | AgentMessage[],
+		imagesOrOptions?: ImageContent[] | AgentPromptOptions,
+		options?: AgentPromptOptions,
+	): Promise<void> {
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 			);
 		}
+		const images = Array.isArray(imagesOrOptions) ? imagesOrOptions : undefined;
+		const promptOptions = Array.isArray(imagesOrOptions) ? options : imagesOrOptions;
 		const messages = this.normalizePromptInput(input, images);
-		await this.runPromptMessages(messages);
+		await this.runPromptMessages(messages, promptOptions);
 	}
 
 	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(): Promise<void> {
+	async continue(options?: AgentPromptOptions): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -371,20 +387,20 @@ export class Agent {
 		if (lastMessage.role === "assistant") {
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
-				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+				await this.runPromptMessages(queuedSteering, { ...options, skipInitialSteeringPoll: true });
 				return;
 			}
 
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
-				await this.runPromptMessages(queuedFollowUps);
+				await this.runPromptMessages(queuedFollowUps, options);
 				return;
 			}
 
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
-		await this.runContinuation();
+		await this.runContinuation(options);
 	}
 
 	private normalizePromptInput(
@@ -408,7 +424,7 @@ export class Agent {
 
 	private async runPromptMessages(
 		messages: AgentMessage[],
-		options: { skipInitialSteeringPoll?: boolean } = {},
+		options: AgentPromptOptions & { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
@@ -422,11 +438,11 @@ export class Agent {
 		});
 	}
 
-	private async runContinuation(): Promise<void> {
+	private async runContinuation(options: AgentPromptOptions = {}): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
-				this.createLoopConfig(),
+				this.createLoopConfig(options),
 				(event) => this.processEvents(event),
 				signal,
 				this.streamFunction,
@@ -442,11 +458,13 @@ export class Agent {
 		};
 	}
 
-	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
+	private createLoopConfig(options: AgentPromptOptions & { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		const shouldStopAfterTurn = this.shouldStopAfterTurn;
 		return {
 			model: this._state.model,
+			toolChoice: options.toolChoice,
+			toolChoiceAfterToolResult: options.toolChoiceAfterToolResult,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
 			onPayload: this.onPayload,

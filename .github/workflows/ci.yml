@@ -62,7 +62,7 @@ jobs:
         run: npm run build
 
       - name: Test Windows client
-        run: npm test --workspace=@pi/console
+        run: npm test --workspace=@pi/console -- --maxWorkers=1
 
       - name: Check packaged scripts
         run: |

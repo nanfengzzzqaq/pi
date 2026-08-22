@@ -109,9 +109,8 @@ describe("openai-completions tool_choice", () => {
 		mockState.chunks = undefined;
 	});
 
-	it("forwards toolChoice from simple options to payload", async () => {
-		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
-		const model = { ...baseModel, api: "openai-completions" } as const;
+	it("forwards required toolChoice for DeepSeek Flash to the OpenAI-compatible payload", async () => {
+		const model = getModel("deepseek", "deepseek-v4-flash")!;
 		const tools: Tool[] = [
 			{
 				name: "ping",

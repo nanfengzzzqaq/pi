@@ -1,9 +1,32 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
-import definePack from "../packs/travel-expense/index.ts";
+import definePack, {
+	durableAttachment,
+	fillTravelDraft,
+	type InvoiceAttachmentResult,
+	readAndPairRailwayAttachments,
+	travelExpenseResourceCandidates,
+} from "../packs/travel-expense/index.ts";
+import {
+	extractRailwayEmbeddedXml,
+	matchVerificationFiles,
+	parseVerificationFingerprint,
+	resolveLodgingInvoiceCandidate,
+} from "../packs/travel-expense/pdf-embedded.ts";
+import type {
+	TravelDraftApplication,
+	TravelDraftExpected,
+	TravelDraftHeaderExpected,
+	TravelDraftHotelExpected,
+	TravelDraftObservation,
+	TravelDraftPlan,
+	TravelDraftTransportExpected,
+} from "../packs/travel-expense/workflow.ts";
+import type { TravelDraftBrowserDriver } from "../packs/travel-expense/workflow-browser-driver.ts";
 
 const packWorkspace = mkdtempSync(join(tmpdir(), "pi-travel-pack-test-"));
 const attachmentFixtures = join(packWorkspace, "input-attachments");
@@ -34,6 +57,101 @@ function tool(name: string) {
 	return found;
 }
 
+class SentinelWorkflowDriver {
+	private readonly application: TravelDraftApplication;
+	private readonly onSave: () => void;
+	private readonly beforeSaveIntent: (() => void) | undefined;
+	private state: TravelDraftObservation = {
+		page: "closed",
+		details: [],
+		draft: { saveRequested: false, saved: false },
+	};
+
+	constructor(application: TravelDraftApplication, onSave: () => void, beforeSaveIntent?: () => void) {
+		this.application = structuredClone(application);
+		this.onSave = onSave;
+		this.beforeSaveIntent = beforeSaveIntent;
+	}
+
+	private output(): TravelDraftObservation {
+		return { ...structuredClone(this.state), detailCount: this.state.details.length };
+	}
+
+	private upsert(row: TravelDraftObservation["details"][number]): void {
+		const index = this.state.details.findIndex((item) => item.key === row.key);
+		if (index >= 0) this.state.details[index] = structuredClone(row);
+		else this.state.details.push(structuredClone(row));
+	}
+
+	async discoverApplication() {
+		this.state.page = "form";
+		this.state.application = structuredClone(this.application);
+		return {
+			status: "selected" as const,
+			application: structuredClone(this.application),
+			missing: [],
+			ambiguous: [],
+			candidates: [],
+		};
+	}
+
+	async precheck(_plan: TravelDraftPlan, _expected: TravelDraftExpected) {
+		return { observation: this.output(), missing: [], ambiguous: [] };
+	}
+
+	async observe(_expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+		return this.output();
+	}
+
+	async open(_url: string): Promise<TravelDraftObservation> {
+		this.state.page = "form";
+		return this.output();
+	}
+
+	async ensureApplication(application: TravelDraftApplication): Promise<TravelDraftObservation> {
+		this.state.application = structuredClone(application);
+		return this.output();
+	}
+
+	async ensureHeader(header: TravelDraftHeaderExpected): Promise<TravelDraftObservation> {
+		this.state.header = structuredClone(header);
+		return this.output();
+	}
+
+	async ensureTransport(row: TravelDraftTransportExpected): Promise<TravelDraftObservation> {
+		this.upsert(row);
+		return this.output();
+	}
+
+	async ensureHotel(row: TravelDraftHotelExpected): Promise<TravelDraftObservation> {
+		this.upsert(row);
+		return this.output();
+	}
+
+	async ensureAllowance(row: TravelDraftExpected["allowance"]): Promise<TravelDraftObservation> {
+		this.upsert(row);
+		this.beforeSaveIntent?.();
+		return this.output();
+	}
+
+	async verify(expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+		this.state.calculatedTotal = expected.totalAmount;
+		this.state.verification = { valid: true, errors: [] };
+		return this.output();
+	}
+
+	async saveDraft(_expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+		this.onSave();
+		this.state.draft = { saveRequested: true, saved: false };
+		return this.output();
+	}
+
+	async confirmDraftSaved(): Promise<TravelDraftObservation> {
+		this.state.draft = { saveRequested: true, saved: true, confirmationText: "草稿保存成功" };
+		return this.output();
+	}
+}
+
 interface FakeTicket {
 	invoiceNumber: string;
 	trainNumber: string;
@@ -43,13 +161,14 @@ interface FakeTicket {
 	amount: number;
 	xmlPrefix?: string;
 	omitXbrl?: boolean;
+	extraXbrl?: string;
 }
 
 /** 构造仿真铁路电子客票：外层 ZIP 可包含多组同名 OFD+PDF，每张票有独立 XBRL。 */
 function buildFakeInvoiceZip(
 	tickets: FakeTicket[] = [
 		{
-			invoiceNumber: "26329116804009553237",
+			invoiceNumber: "10000000000000000001",
 			trainNumber: "G7575",
 			fromStation: "南京南站",
 			toStation: "常州站",
@@ -115,6 +234,13 @@ function buildFakeInvoiceZip(
 		writeFileSync(join(ofdDir, "Doc_0", "Pages", "Page_0", "Content.xml"), xml, "utf8");
 		if (!ticket.omitXbrl) {
 			writeFileSync(join(ofdDir, "Doc_0", "Attachs", `rai_issuer_${ticket.invoiceNumber}.xml`), xbrl, "utf8");
+			if (ticket.extraXbrl) {
+				writeFileSync(
+					join(ofdDir, "Doc_0", "Attachs", `rai_issuer_${ticket.invoiceNumber}_extra.xml`),
+					ticket.extraXbrl,
+					"utf8",
+				);
+			}
 		}
 		const archiveStem = layout === "same-basename-directories" ? "ticket" : ticket.invoiceNumber;
 		const relativeDir = layout === "same-basename-directories" ? `leg-${index + 1}` : "";
@@ -131,14 +257,513 @@ function buildFakeInvoiceZip(
 	return join(outerDir, outerName);
 }
 
+function fakeRailwayXbrl(invoiceNumber = "10000000000000000001", trainNumber = "G7575", amount = 72): string {
+	return `<?xml version="1.0" encoding="utf-8"?>
+<rail:Invoice xmlns:rail="urn:railway:invoice">
+<rail:DepartureStation>南京南站</rail:DepartureStation>
+<rail:DestinationStation>常州站</rail:DestinationStation>
+<rail:TrainNumber>${trainNumber}</rail:TrainNumber>
+<rail:TravelDate>2026-08-21</rail:TravelDate>
+<rail:DepartureTime>12:12</rail:DepartureTime>
+<rail:SeatLevel>二等座</rail:SeatLevel>
+<rail:Fare>${amount.toFixed(2)}</rail:Fare>
+<rail:Name>苏爱健</rail:Name>
+<rail:ElectronicInvoiceRailwayETicketNumber>${invoiceNumber}</rail:ElectronicInvoiceRailwayETicketNumber>
+<rail:DateOfIssue>2026-08-21</rail:DateOfIssue>
+</rail:Invoice>`;
+}
+
+/** Minimal PDF sufficient to exercise an EmbeddedFiles name tree and FlateDecode stream. */
+function buildEmbeddedRailwayPdf(xml = fakeRailwayXbrl()): Buffer {
+	const compressed = deflateSync(Buffer.from(xml, "utf8"));
+	return Buffer.concat([
+		Buffer.from("%PDF-1.7\n"),
+		Buffer.from("1 0 obj\n<< /Type /Catalog /Names << /EmbeddedFiles 2 0 R >> >>\nendobj\n"),
+		Buffer.from("2 0 obj\n<< /Names [(rai_issuer_10000000000000000001.xml) 3 0 R] >>\nendobj\n"),
+		Buffer.from(
+			"3 0 obj\n<< /Type /Filespec /F (rai_issuer_10000000000000000001.xml) /UF (rai_issuer_10000000000000000001.xml) /EF << /F 4 0 R >> >>\nendobj\n",
+		),
+		Buffer.from(
+			`4 0 obj\n<< /Type /EmbeddedFile /Subtype /text#2Fxml /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n`,
+		),
+		compressed,
+		Buffer.from("\nendstream\nendobj\n%%EOF\n"),
+	]);
+}
+
+function buildTestPdf(objects: Array<[number, string | Buffer]>): Buffer {
+	return Buffer.concat([
+		Buffer.from("%PDF-1.7\n"),
+		...objects.flatMap(([id, body]) => [
+			Buffer.from(`${id} 0 obj\n`),
+			typeof body === "string" ? Buffer.from(`${body}\n`) : body,
+			Buffer.from("endobj\n"),
+		]),
+		Buffer.from("%%EOF\n"),
+	]);
+}
+
+function buildPdfOnlyZip(entries: Array<{ name: string; content: string | Buffer }>): string {
+	const dir = mkdtempSync(join(tmpdir(), "pi-pdf-archive-test-"));
+	const tar = join(process.env.SystemRoot ?? process.env.WINDIR ?? "", "System32", "tar.exe");
+	for (const entry of entries) writeFileSync(join(dir, entry.name), entry.content);
+	const archive = join(dir, "pdf-attachments.zip");
+	execFileSync(tar, ["-a", "-cf", basename(archive), ...entries.map((entry) => entry.name)], {
+		cwd: dir,
+		windowsHide: true,
+		timeout: 30000,
+	});
+	return archive;
+}
+
+function embeddedXmlStream(xml = fakeRailwayXbrl(), type = "EmbeddedFile"): Buffer {
+	const compressed = deflateSync(Buffer.from(xml, "utf8"));
+	return Buffer.concat([
+		Buffer.from(`<< /Type /${type} /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n`),
+		compressed,
+		Buffer.from("\nendstream\n"),
+	]);
+}
+
 describe("差旅报销能力包", () => {
-	it("注册规则速查、票据解析与费用明细计划三个工具", () => {
+	it("注册单入口自动草稿与三个只读诊断工具", () => {
 		expect(tools.map((item) => item.name).sort()).toEqual([
+			"travel_fill_draft",
 			"travel_plan_details",
 			"travel_read_invoices",
 			"travel_reimbursement_guide",
 		]);
 	});
+
+	it("安装版 OCR 脚本优先使用 app.asar.unpacked 物理路径", () => {
+		const modulePath =
+			process.platform === "win32"
+				? "C:\\Program Files\\Pi\\resources\\app.asar\\packs\\travel-expense\\index.ts"
+				: "/opt/Pi/resources/app.asar/packs/travel-expense/index.ts";
+		const candidates = travelExpenseResourceCandidates(modulePath);
+		expect(candidates[0]).toContain("app.asar.unpacked");
+		expect(candidates[0]).toMatch(/pdf-ocr\.ps1$/);
+	});
+
+	it("同名但内容不同的查验附件持久化为不同短文件名", () => {
+		const leftDir = join(packWorkspace, "same-name-left");
+		const rightDir = join(packWorkspace, "same-name-right");
+		mkdirSync(leftDir, { recursive: true });
+		mkdirSync(rightDir, { recursive: true });
+		const left = join(leftDir, "查验结果.pdf");
+		const right = join(rightDir, "查验结果.pdf");
+		writeFileSync(left, "verification-left");
+		writeFileSync(right, "verification-right");
+		const persisted = [
+			durableAttachment(packWorkspace, left, "left"),
+			durableAttachment(packWorkspace, right, "right"),
+		];
+		expect(new Set(persisted.map((file) => basename(file))).size).toBe(2);
+		expect(persisted.every((file) => /^T[a-f0-9]{12}\.pdf$/.test(basename(file)))).toBe(true);
+	});
+
+	it("短摘要目标已存在但完整内容不同时拒绝覆盖或删除旧文件", () => {
+		const source = join(attachmentFixtures, "durable-collision-source.pdf");
+		writeFileSync(source, "original-source-content");
+		const durable = durableAttachment(packWorkspace, source, "collision");
+		writeFileSync(durable, "pre-existing-different-content");
+
+		expect(() => durableAttachment(packWorkspace, source, "collision")).toThrow("拒绝覆盖");
+		expect(readFileSync(durable, "utf8")).toBe("pre-existing-different-content");
+	});
+
+	it("内容相同的查验附件在浏览器操作前直接 fail closed", () => {
+		const ticket = join(attachmentFixtures, "duplicate-verification-ticket.pdf");
+		writeFileSync(ticket, buildEmbeddedRailwayPdf());
+		const verificationText =
+			"国家税务总局全国增值税发票查验平台 查验结果一致 查验时间 2026-08-22 发票号码 10000000000000000001";
+		const first = join(attachmentFixtures, "duplicate-verification-a.pdf");
+		const second = join(attachmentFixtures, "duplicate-verification-b.pdf");
+		writeFileSync(first, verificationText);
+		writeFileSync(second, verificationText);
+		const result = readAndPairRailwayAttachments([ticket, first, second], packWorkspace, {
+			ocrTravelDocument: (file) => {
+				const text = readFileSync(file, "utf8");
+				return { file, text, fingerprint: parseVerificationFingerprint(text) };
+			},
+		});
+
+		expect(result.pairingStatus).toBe("ambiguous");
+		expect(result.invoices[0].verificationFiles).toHaveLength(1);
+		expect(result.unmatched).toHaveLength(1);
+		expect(result.unmatched[0].reason).toContain("内容");
+		expect(result.unmatched[0].reason).toContain("重复");
+	});
+
+	it("PNG/JPG 查验截图进入受限 OCR 配对而不被误当成铁路票据", () => {
+		const screenshot = join(attachmentFixtures, "verification-screenshot.png");
+		writeFileSync(
+			screenshot,
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		let observedTimeoutMs = 0;
+		const result = readAndPairRailwayAttachments([screenshot], packWorkspace, {
+			ocrTravelDocument: (file, timeoutMs) => {
+				observedTimeoutMs = timeoutMs;
+				return {
+					file,
+					text: "",
+					fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+					error: "测试 OCR 未识别到配对标识",
+				};
+			},
+		});
+		expect(result.invoices).toEqual([]);
+		expect(observedTimeoutMs).toBeGreaterThan(0);
+		expect(observedTimeoutMs).toBeLessThanOrEqual(150_000);
+		expect(result.ocrDocuments).toHaveLength(1);
+		expect(result.ocrDocuments[0].file).toBe(screenshot);
+		expect(result.unmatched).toHaveLength(1);
+		expect(result.unmatched[0].reason).not.toContain("只支持 .ofd");
+	});
+
+	it("高层草稿工具在附件缺失时一次性停止且不打开浏览器", async () => {
+		const output = await tool("travel_fill_draft").execute(
+			"draft-missing",
+			{
+				url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail",
+				paths: [join(packWorkspace, "missing-ticket.pdf")],
+				applicationHint: "常州8月21",
+			},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		const details = output.details as { status?: string; stage?: string; draftSaved?: boolean };
+		expect(details).toMatchObject({ status: "needs_input", stage: "PRECHECK", draftSaved: false });
+		expect((output.content ?? []).map((block) => (block.type === "text" ? block.text : "")).join("")).toContain(
+			"未保存、未提交",
+		);
+	});
+
+	it("住宿票据歧义或已有住宿件却缺少唯一主票时，在创建浏览器前停止", async () => {
+		const readyRailway: InvoiceAttachmentResult = {
+			invoices: [
+				{
+					source: "railway-ticket.pdf",
+					uploadFile: "railway-ticket.pdf",
+					trainNumber: "G7001",
+					fromStation: "南京站",
+					toStation: "常州站",
+					fromCity: "南京",
+					toCity: "常州",
+					date: "2026-08-21",
+					seatClass: "二等座",
+					amount: 72,
+					passenger: "苏爱健",
+					invoiceNumber: "TEST-PRECHECK-RAIL-001",
+					verificationFiles: ["railway-verification.pdf"],
+					verificationStatus: "ready",
+				},
+			],
+			pairingStatus: "ready",
+			lodging: { status: "missing", candidates: [], issues: [], classifiedFiles: [] },
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		const cases: InvoiceAttachmentResult["lodging"][] = [
+			{
+				status: "ambiguous",
+				candidates: [],
+				issues: [
+					{
+						file: "hotel-conflict.pdf",
+						kind: "ambiguous",
+						reason: "住宿主发票字段冲突",
+						invoiceNumbers: [],
+						amounts: [],
+					},
+				],
+				classifiedFiles: ["hotel-conflict.pdf"],
+			},
+			{
+				status: "missing",
+				candidates: [],
+				issues: [
+					{
+						file: "hotel-related.pdf",
+						kind: "missing",
+						reason: "住宿相关附件缺少唯一票号或金额",
+						invoiceNumbers: [],
+						amounts: [],
+					},
+				],
+				classifiedFiles: ["hotel-related.pdf"],
+			},
+		];
+
+		for (const lodging of cases) {
+			let driverCreations = 0;
+			const output = await fillTravelDraft(
+				{
+					url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail",
+					paths: ["railway-ticket.pdf", "railway-verification.pdf", ...lodging.classifiedFiles],
+				},
+				packWorkspace,
+				undefined,
+				undefined,
+				{
+					readAttachments: () => ({ ...structuredClone(readyRailway), lodging: structuredClone(lodging) }),
+					createDriver: () => {
+						driverCreations += 1;
+						throw new Error("browser driver must not be created");
+					},
+				},
+			);
+			const details = output.details as { status?: string; stage?: string; draftSaved?: boolean };
+			expect(details).toMatchObject({ status: "needs_input", stage: "PRECHECK", draftSaved: false });
+			expect(driverCreations).toBe(0);
+		}
+	});
+
+	it("同一行程跨调用和进程重建命中持久化保存意图，新行程不受影响且记录不含敏感值", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-save-intent-test-"));
+		const application: TravelDraftApplication = {
+			id: "TEST-APPLICATION-001",
+			title: "测试出差申请",
+			reason: "测试业务事由",
+			startDate: "2026-08-21",
+			endDate: "2026-08-21",
+			expenseNature: "部门费用",
+		};
+		const attachments: InvoiceAttachmentResult = {
+			invoices: [
+				{
+					source: "C:\\private\\original-secret-ticket.pdf",
+					uploadFile: "C:\\private\\original-secret-ticket.pdf",
+					trainNumber: "G7001",
+					fromStation: "南京站",
+					toStation: "常州站",
+					fromCity: "南京",
+					toCity: "常州",
+					date: "2026-08-21",
+					seatClass: "二等座",
+					amount: 72,
+					passenger: "苏爱健",
+					invoiceNumber: "TEST-SAVE-INTENT-INVOICE-001",
+					verificationFiles: ["C:\\private\\original-secret-verification.png"],
+					verificationStatus: "ready",
+				},
+			],
+			pairingStatus: "ready",
+			lodging: { status: "missing", candidates: [], issues: [], classifiedFiles: [] },
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		let saveClicks = 0;
+		const dependencies = (selectedApplication: TravelDraftApplication, parsed = attachments) => ({
+			readAttachments: () => structuredClone(parsed),
+			createDriver: () =>
+				new SentinelWorkflowDriver(selectedApplication, () => {
+					saveClicks += 1;
+				}) as unknown as TravelDraftBrowserDriver,
+		});
+
+		try {
+			const first = await fillTravelDraft(
+				{
+					url: "https://app.ekuaibao.com/web/app.html?accessToken=first-secret#/billEntryDetail",
+					paths: ["C:\\private\\original-secret-ticket.pdf"],
+				},
+				cwd,
+				undefined,
+				undefined,
+				dependencies(application),
+			);
+			expect(first.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
+			expect(saveClicks).toBe(1);
+
+			const intentDirectory = join(cwd, ".pi", "travel-expense");
+			const intentFiles = readdirSync(intentDirectory);
+			expect(intentFiles).toHaveLength(1);
+			expect(intentFiles[0]).toMatch(/^save-intent-[a-f0-9]{64}\.json$/);
+			const intentContent = readFileSync(join(intentDirectory, intentFiles[0]), "utf8");
+			expect(intentContent).not.toContain("accessToken");
+			expect(intentContent).not.toContain("original-secret");
+			expect(intentContent).not.toContain(application.id);
+			expect(intentContent).not.toContain("TEST-SAVE-INTENT-INVOICE-001");
+
+			const renamedAttachments = structuredClone(attachments);
+			renamedAttachments.invoices[0].source = "D:\\renamed\\second-private-ticket.pdf";
+			renamedAttachments.invoices[0].uploadFile = "D:\\renamed\\second-private-ticket.pdf";
+			renamedAttachments.invoices[0].verificationFiles = ["D:\\renamed\\second-private-check.png"];
+			const rebuiltProcessCall = await fillTravelDraft(
+				{
+					url: "https://app.ekuaibao.com/web/app.html?accessToken=second-secret#/billEntryDetail",
+					paths: ["D:\\renamed\\second-private-ticket.pdf"],
+				},
+				cwd,
+				undefined,
+				undefined,
+				dependencies(structuredClone(application), renamedAttachments),
+			);
+			expect(rebuiltProcessCall.details).toMatchObject({
+				status: "blocked",
+				stage: "CONFIRM",
+				draftSaved: false,
+				draftSaveStateUncertain: true,
+				draftSaveRequested: true,
+			});
+			expect(saveClicks).toBe(1);
+
+			const newApplication = { ...application, id: "TEST-APPLICATION-002" };
+			const newTrip = await fillTravelDraft(
+				{
+					url: "https://app.ekuaibao.com/web/app.html?accessToken=third-secret#/billEntryDetail",
+					paths: ["D:\\renamed\\second-private-ticket.pdf"],
+				},
+				cwd,
+				undefined,
+				undefined,
+				dependencies(newApplication, renamedAttachments),
+			);
+			expect(newTrip.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
+			expect(saveClicks).toBe(2);
+			expect(readdirSync(intentDirectory)).toHaveLength(2);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("保存意图写入失败时在调用保存驱动前 fail closed", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-save-intent-failure-test-"));
+		const application: TravelDraftApplication = {
+			id: "TEST-APPLICATION-WRITE-FAILURE",
+			title: "测试出差申请",
+			reason: "测试业务事由",
+			startDate: "2026-08-21",
+			endDate: "2026-08-21",
+			expenseNature: "部门费用",
+		};
+		const attachments: InvoiceAttachmentResult = {
+			invoices: [
+				{
+					source: "ticket.pdf",
+					uploadFile: "ticket.pdf",
+					trainNumber: "G7001",
+					fromStation: "南京站",
+					toStation: "常州站",
+					fromCity: "南京",
+					toCity: "常州",
+					date: "2026-08-21",
+					seatClass: "二等座",
+					amount: 72,
+					passenger: "苏爱健",
+					invoiceNumber: "TEST-SAVE-INTENT-WRITE-FAILURE",
+					verificationFiles: ["verification.png"],
+					verificationStatus: "ready",
+				},
+			],
+			pairingStatus: "ready",
+			lodging: { status: "missing", candidates: [], issues: [], classifiedFiles: [] },
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		let saveClicks = 0;
+		let sabotaged = false;
+
+		try {
+			const output = await fillTravelDraft(
+				{ url: "https://app.ekuaibao.com/example", paths: ["ticket.pdf"] },
+				cwd,
+				undefined,
+				undefined,
+				{
+					readAttachments: () => structuredClone(attachments),
+					createDriver: () =>
+						new SentinelWorkflowDriver(
+							application,
+							() => {
+								saveClicks += 1;
+							},
+							() => {
+								if (sabotaged) return;
+								sabotaged = true;
+								writeFileSync(join(cwd, ".pi"), "not-a-directory", "utf8");
+							},
+						) as unknown as TravelDraftBrowserDriver,
+				},
+			);
+			expect(output.details).toMatchObject({
+				status: "blocked",
+				stage: "SAVE_DRAFT",
+				draftSaved: false,
+				draftSaveStateUncertain: true,
+				draftSaveRequested: true,
+			});
+			expect(saveClicks).toBe(0);
+			expect((output.content ?? []).map((block) => (block.type === "text" ? block.text : "")).join("\n")).toContain(
+				"保存意图无法持久化",
+			);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("高层草稿工具缺少链接和附件时一次性 needs_input 且零浏览器动作", async () => {
+		const output = await tool("travel_fill_draft").execute(
+			"draft-missing-inputs",
+			{},
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		const details = output.details as {
+			status?: string;
+			stage?: string;
+			missing?: Array<{ code?: string }>;
+			draftSaved?: boolean;
+		};
+		expect(details).toMatchObject({ status: "needs_input", stage: "PRECHECK", draftSaved: false });
+		expect(details.missing?.map((issue) => issue.code)).toEqual(["missing_url", "missing_attachments"]);
+	});
+
+	it("拒绝超过单批上限的附件，避免弱模型触发无界 OCR", () => {
+		expect(() =>
+			readAndPairRailwayAttachments(
+				Array.from({ length: 21 }, (_, index) => join(packWorkspace, `missing-${index}.pdf`)),
+				packWorkspace,
+			),
+		).toThrow("一次最多 20 个");
+	});
+
+	it.runIf(process.platform === "win32")(
+		"跨多个压缩包共享 50MB 解压预算",
+		() => {
+			const tar = join(process.env.SystemRoot ?? process.env.WINDIR ?? "", "System32", "tar.exe");
+			const archives: string[] = [];
+			for (let index = 0; index < 2; index++) {
+				const source = join(packWorkspace, `large-archive-${index}`);
+				mkdirSync(source, { recursive: true });
+				writeFileSync(join(source, "payload.bin"), Buffer.alloc(26 * 1024 * 1024));
+				const archive = join(packWorkspace, `large-archive-${index}.zip`);
+				execFileSync(tar, ["-a", "-cf", archive, "payload.bin"], {
+					cwd: source,
+					windowsHide: true,
+					timeout: 30_000,
+				});
+				rmSync(source, { recursive: true, force: true });
+				archives.push(archive);
+			}
+			const result = readAndPairRailwayAttachments(archives, packWorkspace);
+			expect(result.invoices.some((invoice) => invoice.error?.includes("累计解压量超过 50MB"))).toBe(true);
+		},
+		60_000,
+	);
 
 	it("规则速查包含固定取值与安全红线", async () => {
 		const output = await tool("travel_reimbursement_guide").execute(
@@ -581,6 +1206,387 @@ describe("差旅报销能力包", () => {
 		).rejects.toThrow(/电子客票.*重复绑定/);
 	});
 
+	it("直接从铁路电子客票 PDF 的 FlateDecode EmbeddedFiles 提取 XBRL", async () => {
+		const pdf = buildEmbeddedRailwayPdf();
+		const embedded = extractRailwayEmbeddedXml(pdf);
+		expect(embedded).toHaveLength(1);
+		expect(embedded[0].name).toBe("rai_issuer_10000000000000000001.xml");
+		expect(embedded[0].xml).toContain("<rail:TrainNumber>G7575</rail:TrainNumber>");
+		expect(() => extractRailwayEmbeddedXml(pdf, { maxTotalEmbeddedBytes: 32 })).toThrow("累计解压后超过");
+
+		const ticketPath = join(attachmentFixtures, "direct-railway-ticket.pdf");
+		writeFileSync(ticketPath, pdf);
+		const output = await tool("travel_read_invoices").execute(
+			"pdf-ticket",
+			{ paths: [ticketPath] },
+			undefined,
+			undefined,
+			undefined as never,
+		);
+		const details = output.details as {
+			pairingStatus?: string;
+			invoices?: Array<Record<string, unknown>>;
+			missing?: Array<Record<string, unknown>>;
+		};
+		expect(details.pairingStatus).toBe("missing");
+		expect(details.invoices).toHaveLength(1);
+		expect(details.invoices?.[0]).toMatchObject({
+			invoiceNumber: "10000000000000000001",
+			trainNumber: "G7575",
+			fromStation: "南京南站",
+			toStation: "常州站",
+			fromCity: "南京",
+			toCity: "常州",
+			amount: 72,
+			passenger: "苏爱健",
+			verificationFiles: [],
+			verificationStatus: "missing",
+		});
+		expect(details.missing).toHaveLength(1);
+		expect(String(details.invoices?.[0].uploadFile)).toMatch(/\.pdf$/);
+		expect(readFileSync(String(details.invoices?.[0].uploadFile))).toEqual(pdf);
+
+		const direct = readAndPairRailwayAttachments([ticketPath], packWorkspace);
+		expect(direct.pairingStatus).toBe("missing");
+		expect(direct.invoices[0]).toMatchObject({
+			invoiceNumber: "10000000000000000001",
+			trainNumber: "G7575",
+			verificationStatus: "missing",
+		});
+	});
+
+	it("只沿唯一 Catalog 的 EmbeddedFiles 名称树读取 Filespec，支持有界 Kids 节点", () => {
+		const pdf = buildTestPdf([
+			[1, "<< /Type /Catalog /Names 2 0 R >>"],
+			[2, "<< /EmbeddedFiles 3 0 R >>"],
+			[3, "<< /Kids [4 0 R] >>"],
+			[4, "<< /Names [(rai_issuer_10000000000000000001.xml) 5 0 R] >>"],
+			[
+				5,
+				"<< /Type /Filespec /F (rai_issuer_10000000000000000001.xml) /UF (rai_issuer_10000000000000000001.xml) /EF << /F 6 0 R /UF 6 0 R >> >>",
+			],
+			[6, embeddedXmlStream()],
+		]);
+		const embedded = extractRailwayEmbeddedXml(pdf);
+		expect(embedded).toHaveLength(1);
+		expect(embedded[0]).toMatchObject({
+			name: "rai_issuer_10000000000000000001.xml",
+			objectRef: "6 0",
+		});
+	});
+
+	it("忽略不在 Catalog 名称树中的孤立 Filespec，不读取旧增量对象", () => {
+		const pdf = buildTestPdf([
+			[1, "<< /Type /Catalog >>"],
+			[2, "<< /EmbeddedFiles 3 0 R >>"],
+			[3, "<< /Type /Filespec /F (rai_issuer_10000000000000000001.xml) /EF << /F 4 0 R >> >>"],
+			[4, embeddedXmlStream()],
+		]);
+		expect(extractRailwayEmbeddedXml(pdf)).toEqual([]);
+	});
+
+	it("多 Catalog、名称树循环或非 Filespec→EmbeddedFile 链路均 fail closed", () => {
+		const multipleCatalogs = buildTestPdf([
+			[1, "<< /Type /Catalog /Names << /EmbeddedFiles << /Names [] >> >> >>"],
+			[2, "<< /Type /Catalog >>"],
+		]);
+		expect(() => extractRailwayEmbeddedXml(multipleCatalogs)).toThrow("唯一 Catalog");
+
+		const cycle = buildTestPdf([
+			[1, "<< /Type /Catalog /Names << /EmbeddedFiles 2 0 R >> >>"],
+			[2, "<< /Kids [2 0 R] >>"],
+		]);
+		expect(() => extractRailwayEmbeddedXml(cycle)).toThrow("循环引用");
+
+		const unresolvedTree = buildTestPdf([[1, "<< /Type /Catalog /Names << /EmbeddedFiles 99 0 R >> >>"]]);
+		expect(() => extractRailwayEmbeddedXml(unresolvedTree)).toThrow("不存在或非字典对象");
+
+		const wrongFilespecType = buildTestPdf([
+			[1, "<< /Type /Catalog /Names << /EmbeddedFiles 2 0 R >> >>"],
+			[2, "<< /Names [(rai_issuer_10000000000000000001.xml) 3 0 R] >>"],
+			[3, "<< /Type /NotFilespec /F (rai_issuer_10000000000000000001.xml) /EF << /F 4 0 R >> >>"],
+			[4, embeddedXmlStream()],
+		]);
+		expect(() => extractRailwayEmbeddedXml(wrongFilespecType)).toThrow("不是 /Type /Filespec");
+
+		const wrongEmbeddedType = buildTestPdf([
+			[1, "<< /Type /Catalog /Names << /EmbeddedFiles 2 0 R >> >>"],
+			[2, "<< /Names [(rai_issuer_10000000000000000001.xml) 3 0 R] >>"],
+			[3, "<< /Type /Filespec /F (rai_issuer_10000000000000000001.xml) /EF << /F 4 0 R >> >>"],
+			[4, embeddedXmlStream(fakeRailwayXbrl(), "NotEmbeddedFile")],
+		]);
+		expect(() => extractRailwayEmbeddedXml(wrongEmbeddedType)).toThrow("不是 /Type /EmbeddedFile");
+	});
+
+	it("OCR 文本须有明确查验证据，再按发票号或车次加金额唯一配对", () => {
+		const invoices = [
+			{ invoiceNumber: "10000000000000000001", trainNumber: "G7575", amount: 72 },
+			{ invoiceNumber: "10000000000000000002", trainNumber: "G7018", amount: 75 },
+		];
+		const outbound = parseVerificationFingerprint(
+			"全国增值税发票查验平台 发 票 号 码：1000 0000 0000 0000 0001 车次 G 7575 价税合计 ¥72.00",
+		);
+		const returnTrip = parseVerificationFingerprint("铁路电子客票查验 车次 G7018 发票金额 75.00 元");
+		expect(outbound).toMatchObject({
+			invoiceNumbers: ["10000000000000000001"],
+			trainNumbers: ["G7575"],
+			amounts: [72],
+		});
+		const pairing = matchVerificationFiles(invoices, [
+			{ file: "查验-去程.pdf", fingerprint: outbound },
+			{ file: "查验-回程.pdf", fingerprint: returnTrip },
+		]);
+		expect(pairing.verificationFilesByInvoice).toEqual([["查验-去程.pdf"], ["查验-回程.pdf"]]);
+		expect(pairing.missingInvoiceIndexes).toEqual([]);
+		expect(pairing.ambiguous).toEqual([]);
+		expect(pairing.unmatched).toEqual([]);
+
+		const amountOnly = matchVerificationFiles(invoices, [
+			{
+				file: "G7575-看似匹配但不可猜.pdf",
+				fingerprint: parseVerificationFingerprint("发票查验结果 金额 ¥72.00"),
+			},
+		]);
+		expect(amountOnly.verificationFilesByInvoice).toEqual([[], []]);
+		expect(amountOnly.missingInvoiceIndexes).toEqual([0, 1]);
+		expect(amountOnly.unmatched[0].reason).toContain("车次与金额");
+	});
+
+	it("查验 OCR 同时匹配多张票时返回 AMBIGUOUS，不自动绑定", () => {
+		const pairing = matchVerificationFiles(
+			[
+				{ invoiceNumber: "TICKET-A", trainNumber: "G7001", amount: 70 },
+				{ invoiceNumber: "TICKET-B", trainNumber: "G7001", amount: 70 },
+			],
+			[
+				{
+					file: "multi.pdf",
+					fingerprint: parseVerificationFingerprint("全国增值税发票查验平台 车次 G7001 票价 70.00"),
+				},
+			],
+		);
+		expect(pairing.verificationFilesByInvoice).toEqual([[], []]);
+		expect(pairing.missingInvoiceIndexes).toEqual([0, 1]);
+		expect(pairing.ambiguous).toEqual([
+			{
+				file: "multi.pdf",
+				candidateInvoiceIndexes: [0, 1],
+				signals: ["trainNumber", "amount"],
+			},
+		]);
+	});
+
+	it("一个查验 PDF 含目标票号和额外票号时不静默绑定", () => {
+		const invoices = [
+			{ invoiceNumber: "10000000000000000001", trainNumber: "G7575", amount: 72 },
+			{ invoiceNumber: "10000000000000000002", trainNumber: "G7018", amount: 75 },
+		];
+		for (const invoiceNumbers of [
+			["10000000000000000001", "99999999999999999999"],
+			["10000000000000000001", "10000000000000000002"],
+		]) {
+			const pairing = matchVerificationFiles(invoices, [
+				{
+					file: "multi-invoice.pdf",
+					fingerprint: {
+						invoiceNumbers,
+						trainNumbers: [],
+						amounts: [],
+						verificationEvidence: ["verificationResult"],
+					},
+				},
+			]);
+			expect(pairing.verificationFilesByInvoice).toEqual([[], []]);
+			expect(pairing.ambiguous[0]?.signals).toEqual(["multipleInvoiceNumbers"]);
+		}
+	});
+
+	it("票面副本即使票号、车次和金额一致也不能冒充铁路查验件", () => {
+		const invoices = [{ invoiceNumber: "10000000000000000001", trainNumber: "G7575", amount: 72 }];
+		const duplicateTicket = parseVerificationFingerprint(
+			"铁路电子客票 发票号码：10000000000000000001 南京南站 G7575 常州站 二等座 票价 ¥72.00",
+		);
+		const pairing = matchVerificationFiles(invoices, [{ file: "ticket-copy.png", fingerprint: duplicateTicket }]);
+
+		expect(duplicateTicket.verificationEvidence).toEqual([]);
+		expect(pairing.verificationFilesByInvoice).toEqual([[]]);
+		expect(pairing.missingInvoiceIndexes).toEqual([0]);
+		expect(pairing.unmatched[0]?.reason).toContain("明确查验证据");
+	});
+
+	describe("住宿 OCR 主发票与查验件分类", () => {
+		const invoiceNumber = "25320119000012345678";
+		const otherInvoiceNumber = "25320119000087654321";
+		const lodgingInvoiceText = (number = invoiceNumber, amount = 488) =>
+			[
+				"电子发票（普通发票）",
+				`发票号码：${number}`,
+				"开票日期：2026年08月21日",
+				"购买方信息 名称：赛昇",
+				"销售方信息 名称：常州酒店",
+				"项目名称：*住宿服务*住宿费",
+				"税率：6% 税额：27.62",
+				`价税合计（小写）：¥${amount.toFixed(2)}`,
+				"开票人：张三",
+			].join(" ");
+		const lodgingVerificationText = (numbers: string[]) =>
+			[
+				"全国增值税发票查验平台 发票查验结果",
+				...numbers.map((number) => `发票号码：${number}`),
+				"项目名称：*住宿服务*住宿费",
+				"价税合计：488.00 查验时间：2026-08-22",
+			].join(" ");
+
+		it("单张明确版式的住宿主发票可直接使用", () => {
+			const result = resolveLodgingInvoiceCandidate([{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() }]);
+			expect(result).toMatchObject({
+				status: "ready",
+				invoice: {
+					invoiceNumber,
+					amount: 488,
+					uploadFile: "hotel-invoice.pdf",
+					verificationFiles: [],
+				},
+				classifiedFiles: ["hotel-invoice.pdf"],
+			});
+		});
+
+		it("同票号住宿查验件绑定到主发票而不成为第二张候选", () => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() },
+				{ file: "hotel-verification.pdf", text: lodgingVerificationText([invoiceNumber]) },
+			]);
+			expect(result).toMatchObject({
+				status: "ready",
+				invoice: {
+					uploadFile: "hotel-invoice.pdf",
+					verificationFiles: ["hotel-verification.pdf"],
+				},
+				candidates: [{ verificationFiles: ["hotel-verification.pdf"] }],
+				classifiedFiles: ["hotel-invoice.pdf", "hotel-verification.pdf"],
+			});
+		});
+
+		it("长文件名住宿主发票和查验件都会持久化为互不覆盖的短稳定名", () => {
+			const invoiceFile = join(attachmentFixtures, "常州住宿电子发票-这是一个非常长的原始文件名-20260821.png");
+			const verificationFile = join(
+				attachmentFixtures,
+				"国家税务总局发票查验平台-住宿发票查验结果-这是一个非常长的原始文件名.png",
+			);
+			writeFileSync(invoiceFile, "lodging-invoice-content", "utf8");
+			writeFileSync(verificationFile, "lodging-verification-content", "utf8");
+
+			const result = readAndPairRailwayAttachments([invoiceFile, verificationFile], packWorkspace, {
+				ocrTravelDocument: (file) => ({
+					file,
+					text: file === invoiceFile ? lodgingInvoiceText() : lodgingVerificationText([invoiceNumber]),
+					fingerprint: parseVerificationFingerprint(
+						file === invoiceFile ? lodgingInvoiceText() : lodgingVerificationText([invoiceNumber]),
+					),
+				}),
+			});
+
+			expect(result.lodging.status).toBe("ready");
+			const durableInvoice = result.lodging.invoice;
+			expect(durableInvoice).toBeDefined();
+			expect(basename(durableInvoice!.uploadFile)).toMatch(/^T[a-f0-9]{12}\.png$/);
+			expect(durableInvoice!.verificationFiles).toHaveLength(1);
+			expect(basename(durableInvoice!.verificationFiles[0])).toMatch(/^T[a-f0-9]{12}\.png$/);
+			expect(durableInvoice!.verificationFiles[0]).not.toBe(durableInvoice!.uploadFile);
+			expect(readFileSync(durableInvoice!.uploadFile, "utf8")).toBe("lodging-invoice-content");
+			expect(readFileSync(durableInvoice!.verificationFiles[0], "utf8")).toBe("lodging-verification-content");
+		});
+
+		it("裁剪的住宿票面副本不能冒充住宿查验件", () => {
+			const croppedInvoiceCopy = `常州酒店 住宿费 发票号码：${invoiceNumber} 价税合计：488.00`;
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() },
+				{ file: "hotel-invoice-copy.png", text: croppedInvoiceCopy },
+			]);
+
+			expect(result.status).not.toBe("ready");
+			expect(result.invoice).toBeUndefined();
+			expect(result.issues).toContainEqual(
+				expect.objectContaining({ file: "hotel-invoice-copy.png", kind: "missing" }),
+			);
+		});
+
+		it("住宿查验件票号与主发票不同时拒绝绑定", () => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() },
+				{ file: "hotel-verification.pdf", text: lodgingVerificationText([otherInvoiceNumber]) },
+			]);
+			expect(result.status).toBe("ambiguous");
+			expect(result.invoice).toBeUndefined();
+			expect(result.issues).toEqual([
+				expect.objectContaining({
+					file: "hotel-verification.pdf",
+					kind: "ambiguous",
+					reason: expect.stringContaining("不一致"),
+				}),
+			]);
+		});
+
+		it("即使票号相同，两个住宿主发票版式也拒绝自动选择", () => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice-a.pdf", text: lodgingInvoiceText() },
+				{ file: "hotel-invoice-b.pdf", text: lodgingInvoiceText() },
+			]);
+			expect(result.status).toBe("ambiguous");
+			expect(result.invoice).toBeUndefined();
+			expect(result.candidates).toHaveLength(2);
+			expect(result.issues).toContainEqual(
+				expect.objectContaining({ kind: "ambiguous", reason: expect.stringContaining("多个住宿主发票") }),
+			);
+		});
+
+		it("一个住宿查验件含多个票号时拒绝自动绑定", () => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() },
+				{
+					file: "hotel-multi-verification.pdf",
+					text: lodgingVerificationText([invoiceNumber, otherInvoiceNumber]),
+				},
+			]);
+			expect(result.status).toBe("ambiguous");
+			expect(result.invoice).toBeUndefined();
+			expect(result.issues).toContainEqual(
+				expect.objectContaining({ file: "hotel-multi-verification.pdf", kind: "ambiguous" }),
+			);
+		});
+
+		it("只有住宿查验件而没有明确主发票时停止处理", () => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-verification.pdf", text: lodgingVerificationText([invoiceNumber]) },
+			]);
+			expect(result.status).toBe("missing");
+			expect(result.invoice).toBeUndefined();
+			expect(result.candidates).toEqual([]);
+			expect(result.issues).toContainEqual(
+				expect.objectContaining({ reason: expect.stringContaining("唯一主发票") }),
+			);
+		});
+
+		it("铁路查验件即使含宾馆字样也不进入住宿分类", () => {
+			const railwayVerification = {
+				file: "railway-verification.pdf",
+				text: "中国铁路 12306 铁路电子客票 发票号码 10000000000000000001 车次 G7575 出发站 南京南 到达站 常州 销售方地址 南京铁路宾馆路",
+			};
+			const railOnly = resolveLodgingInvoiceCandidate([railwayVerification]);
+			expect(railOnly).toMatchObject({ status: "missing", candidates: [], classifiedFiles: [] });
+
+			const withInvoice = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: lodgingInvoiceText() },
+				railwayVerification,
+			]);
+			expect(withInvoice).toMatchObject({
+				status: "ready",
+				invoice: { verificationFiles: [] },
+				classifiedFiles: ["hotel-invoice.pdf"],
+			});
+		});
+	});
+
 	it.runIf(process.platform === "win32")(
 		"解析铁路电子客票 OFD 压缩包",
 		async () => {
@@ -599,7 +1605,7 @@ describe("差旅报销能力包", () => {
 			expect(text).toContain("二等座");
 			expect(text).toContain("72");
 			expect(text).toContain("苏爱健");
-			expect(text).toContain("26329116804009553237");
+			expect(text).toContain("10000000000000000001");
 			const details = (output.details as { invoices?: Array<Record<string, unknown>> }).invoices ?? [];
 			expect(details[0].date).toBe("2026-08-21");
 			expect(details[0].amount).toBe(72);
@@ -612,6 +1618,8 @@ describe("差旅报销能力包", () => {
 			expect(details[0].trainNumber).toBe("G7575");
 			expect(details[0].issueDate).toBe("2026-08-21");
 			expect(String(details[0].uploadFile)).toContain(".pdf");
+			expect(basename(String(details[0].uploadFile))).toMatch(/^T[a-f0-9]{12}\.pdf$/);
+			expect(basename(String(details[0].uploadFile)).length).toBeLessThanOrEqual(20);
 			const secondOutput = await tool("travel_read_invoices").execute(
 				"i1-again",
 				{ paths: [zipPath] },
@@ -620,8 +1628,8 @@ describe("差旅报销能力包", () => {
 				undefined as never,
 			);
 			const secondDetails = (secondOutput.details as { invoices?: Array<Record<string, unknown>> }).invoices ?? [];
-			expect(secondDetails[0].uploadFile).not.toBe(details[0].uploadFile);
-			expect(readFileSync(String(secondDetails[0].uploadFile), "utf8")).toBe("%PDF-fake-26329116804009553237");
+			expect(secondDetails[0].uploadFile).toBe(details[0].uploadFile);
+			expect(readFileSync(String(secondDetails[0].uploadFile), "utf8")).toBe("%PDF-fake-10000000000000000001");
 		},
 		45000,
 	);
@@ -632,7 +1640,7 @@ describe("差旅报销能力包", () => {
 			const zipPath = buildFakeInvoiceZip(
 				[
 					{
-						invoiceNumber: "26329116804009553237",
+						invoiceNumber: "10000000000000000001",
 						trainNumber: "G7575",
 						fromStation: "南京南站",
 						toStation: "常州站",
@@ -640,7 +1648,7 @@ describe("差旅报销能力包", () => {
 						amount: 72,
 					},
 					{
-						invoiceNumber: "26329116804009553238",
+						invoiceNumber: "10000000000000000002",
 						trainNumber: "G7018",
 						fromStation: "常州站",
 						toStation: "南京站",
@@ -665,14 +1673,144 @@ describe("差旅报销能力包", () => {
 			expect(details.map((invoice) => invoice.toCity)).toEqual(["常州", "南京"]);
 			const uploadFiles = details.map((invoice) => String(invoice.uploadFile));
 			expect(new Set(uploadFiles).size).toBe(2);
-			expect(uploadFiles[0]).toContain("26329116804009553237");
-			expect(uploadFiles[1]).toContain("26329116804009553238");
+			expect(uploadFiles.every((file) => /^T[a-f0-9]{12}\.pdf$/.test(basename(file)))).toBe(true);
 			expect(uploadFiles.every((file) => file.endsWith(".pdf"))).toBe(true);
-			expect(readFileSync(uploadFiles[0], "utf8")).toBe("%PDF-fake-26329116804009553237");
-			expect(readFileSync(uploadFiles[1], "utf8")).toBe("%PDF-fake-26329116804009553238");
+			expect(readFileSync(uploadFiles[0], "utf8")).toBe("%PDF-fake-10000000000000000001");
+			expect(readFileSync(uploadFiles[1], "utf8")).toBe("%PDF-fake-10000000000000000002");
 		},
 		45000,
 	);
+
+	it.runIf(process.platform === "win32")(
+		"同一 OFD 含多份铁路 XBRL 时拒绝任选第一份",
+		async () => {
+			const zipPath = buildFakeInvoiceZip([
+				{
+					invoiceNumber: "10000000000000000001",
+					trainNumber: "G7575",
+					fromStation: "南京南站",
+					toStation: "常州站",
+					departTime: "12:12",
+					amount: 72,
+					extraXbrl: fakeRailwayXbrl("10000000000000000002", "G7018", 75),
+				},
+			]);
+			const result = readAndPairRailwayAttachments([zipPath], packWorkspace);
+			expect(result.invoices).toHaveLength(1);
+			expect(result.invoices[0].error).toContain("2 份铁路票据 XBRL");
+			expect(result.invoices[0].invoiceNumber).toBeUndefined();
+		},
+		45000,
+	);
+
+	it.runIf(process.platform === "win32")("纯 PDF 压缩包会逐份识别电子客票并把普通 PDF 留给查验配对", () => {
+		const outboundXml = fakeRailwayXbrl("10000000000000000001", "G7575", 72);
+		const returnXml = fakeRailwayXbrl("10000000000000000002", "G7018", 75)
+			.replace(
+				"<rail:DepartureStation>南京南站</rail:DepartureStation>",
+				"<rail:DepartureStation>常州站</rail:DepartureStation>",
+			)
+			.replace(
+				"<rail:DestinationStation>常州站</rail:DestinationStation>",
+				"<rail:DestinationStation>南京站</rail:DestinationStation>",
+			);
+		const zipPath = buildPdfOnlyZip([
+			{ name: "ticket-out.pdf", content: buildEmbeddedRailwayPdf(outboundXml) },
+			{ name: "ticket-return.pdf", content: buildEmbeddedRailwayPdf(returnXml) },
+			{
+				name: "verification-out.pdf",
+				content: "%PDF-1.7\n铁路电子客票查验 发票号码 10000000000000000001 车次 G7575 票价 72.00\n%%EOF",
+			},
+			{
+				name: "verification-return.pdf",
+				content: "%PDF-1.7\n铁路电子客票查验 发票号码 10000000000000000002 车次 G7018 票价 75.00\n%%EOF",
+			},
+		]);
+		const result = readAndPairRailwayAttachments([zipPath], packWorkspace, {
+			ocrTravelDocument: (file) => {
+				const text = readFileSync(file, "utf8");
+				return { file, text, fingerprint: parseVerificationFingerprint(text) };
+			},
+		});
+
+		expect(result.pairingStatus).toBe("ready");
+		expect(result.invoices).toHaveLength(2);
+		expect(result.invoices.map((invoice) => invoice.invoiceNumber).sort()).toEqual([
+			"10000000000000000001",
+			"10000000000000000002",
+		]);
+		expect(result.invoices.every((invoice) => invoice.verificationFiles?.length === 1)).toBe(true);
+		expect(result.unmatched).toEqual([]);
+	});
+
+	it.runIf(process.platform === "win32")("压缩包内单张电子客票可配对查验，普通查验 PDF 不会伪造铁路票据", () => {
+		const zipPath = buildPdfOnlyZip([
+			{ name: "ticket.pdf", content: buildEmbeddedRailwayPdf() },
+			{
+				name: "verification.pdf",
+				content: "%PDF-1.7\n铁路电子客票查验 发票号码 10000000000000000001 车次 G7575 票价 72.00\n%%EOF",
+			},
+		]);
+		const result = readAndPairRailwayAttachments([zipPath], packWorkspace, {
+			ocrTravelDocument: (file) => {
+				const text = readFileSync(file, "utf8");
+				return { file, text, fingerprint: parseVerificationFingerprint(text) };
+			},
+		});
+
+		expect(result.pairingStatus).toBe("ready");
+		expect(result.invoices).toHaveLength(1);
+		expect(result.invoices[0]).toMatchObject({
+			invoiceNumber: "10000000000000000001",
+			verificationStatus: "ready",
+		});
+		expect(result.ocrDocuments).toHaveLength(1);
+	});
+
+	it.runIf(process.platform === "win32")("压缩包内 PDF 含多份铁路 XBRL 时 fail closed", () => {
+		const pdf = buildTestPdf([
+			[1, "<< /Type /Catalog /Names << /EmbeddedFiles 2 0 R >> >>"],
+			[2, "<< /Names [(rai_issuer_1.xml) 3 0 R (rai_issuer_2.xml) 5 0 R] >>"],
+			[3, "<< /Type /Filespec /F (rai_issuer_1.xml) /EF << /F 4 0 R >> >>"],
+			[4, embeddedXmlStream(fakeRailwayXbrl("10000000000000000001"))],
+			[5, "<< /Type /Filespec /F (rai_issuer_2.xml) /EF << /F 6 0 R >> >>"],
+			[6, embeddedXmlStream(fakeRailwayXbrl("10000000000000000002"))],
+		]);
+		const zipPath = buildPdfOnlyZip([{ name: "ambiguous-ticket.pdf", content: pdf }]);
+		const result = readAndPairRailwayAttachments([zipPath], packWorkspace);
+
+		expect(result.invoices).toHaveLength(1);
+		expect(result.invoices[0].error).toContain("2 份铁路票据 XBRL");
+		expect(result.invoices[0].invoiceNumber).toBeUndefined();
+	});
+
+	it("铁路 XBRL 的关键字段或票号别名冲突时 fail closed，一致重复值仍兼容", () => {
+		const cases = [
+			["出发站", "<rail:DepartureStation>上海虹桥站</rail:DepartureStation>"],
+			["乘车日期", "<rail:TravelDate>2026-08-22</rail:TravelDate>"],
+			["票价", "<rail:Fare>99.00</rail:Fare>"],
+			["乘车人", "<rail:Name>其他乘车人</rail:Name>"],
+			["票号", "<rail:InvoiceNumber>10000000000000000002</rail:InvoiceNumber>"],
+		] as const;
+		for (const [label, conflict] of cases) {
+			const file = join(attachmentFixtures, `conflicting-${label}.pdf`);
+			const xml = fakeRailwayXbrl().replace("</rail:Invoice>", `${conflict}</rail:Invoice>`);
+			writeFileSync(file, buildEmbeddedRailwayPdf(xml));
+			const result = readAndPairRailwayAttachments([file], packWorkspace);
+			expect(result.invoices[0].error, label).toContain(`字段“${label}”存在多个冲突值`);
+			expect(result.invoices[0].invoiceNumber, label).toBeUndefined();
+		}
+
+		const duplicate = join(attachmentFixtures, "duplicate-consistent-fare.pdf");
+		const xml = fakeRailwayXbrl().replace(
+			"<rail:Fare>72.00</rail:Fare>",
+			"<rail:Fare>72.00</rail:Fare><rail:Fare>72.00</rail:Fare>",
+		);
+		writeFileSync(duplicate, buildEmbeddedRailwayPdf(xml));
+		const result = readAndPairRailwayAttachments([duplicate], packWorkspace);
+		expect(result.invoices[0]).toMatchObject({ invoiceNumber: "10000000000000000001", amount: 72 });
+		expect(result.invoices[0].error).toBeUndefined();
+	});
 
 	it.runIf(process.platform === "win32")(
 		"Content.xml fallback 兼容无前缀和其他 XML 前缀",

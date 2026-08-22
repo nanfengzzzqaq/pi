@@ -2,9 +2,9 @@
 	"name": "travel-expense",
 	"displayName": "差旅报销",
 	"description": "在客户端内置浏览器中自动填报易快报（合思）差旅费用报销单：关联出差申请、按规则填写字段与费用明细、上传票据附件，最后保存草稿",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"activation": {
-		"extensions": [".zip", ".ofd", ".pdf"],
+		"extensions": [".zip", ".ofd", ".pdf", ".png", ".jpg", ".jpeg"],
 		"keywords": [
 			"报销",
 			"差旅",
@@ -35,42 +35,33 @@
 			"存为草稿"
 		],
 		"minimumScore": 2,
-		"defaultGroups": [
-			"reimburse"
-		]
+		"defaultGroups": ["inspect"]
 	},
 	"toolGroups": [
 		{
 			"name": "reimburse",
 			"displayName": "差旅报销填报",
-			"description": "差旅费用报销单的规则速查与费用明细计划",
-			"tools": [
-				"travel_read_invoices",
-				"travel_reimbursement_guide",
-				"travel_plan_details"
-			],
+			"description": "一次完成票据预检、关联申请、确定性填报、核验并只保存草稿",
+			"tools": ["travel_fill_draft"],
 			"keywords": [
-				"报销",
-				"差旅",
-				"费用",
-				"补贴",
-				"住宿",
-				"火车",
-				"高铁",
-				"草稿",
-				"易快报",
-				"合思",
-				"发票",
-				"票据",
-				"火车票",
-				"高铁票",
-				"车票",
-				"查验",
+				"自动",
+				"填写",
+				"填报",
+				"办理",
+				"帮我报销",
+				"帮我做报销",
 				"继续",
 				"接着",
 				"保存草稿",
 				"存为草稿"
 			]
+		},
+		{
+			"name": "inspect",
+			"displayName": "差旅票据与规则检查",
+			"description": "只读解析票据、查看规则或生成明细计划，不操作网页",
+			"tools": ["travel_read_invoices", "travel_reimbursement_guide", "travel_plan_details"],
+			"keywords": ["规则", "说明", "解析", "读取", "检查", "票据", "发票", "查验", "火车票", "高铁票", "明细计划"]
 		}
 	]
 }

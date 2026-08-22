@@ -214,11 +214,19 @@ async function runLoop(
 						: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
+				const resultChoice = toolResults.some((result) => result.isError)
+					? config.toolChoiceAfterToolResult?.error
+					: config.toolChoiceAfterToolResult?.success;
+				config = { ...config, toolChoice: resultChoice };
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+			} else if (config.toolChoice !== undefined) {
+				// A non-tool assistant response consumes the one-shot choice. If another
+				// queued turn follows, it starts with the provider's normal behavior.
+				config = { ...config, toolChoice: undefined };
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
