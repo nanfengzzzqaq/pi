@@ -28,8 +28,22 @@ import type { Static, TSchema } from "typebox";
 export type StreamFn = (
 	model: Model<Api>,
 	context: Context,
-	options?: SimpleStreamOptions,
+	options?: AgentStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
+
+/** OpenAI-compatible string modes supported by one-shot agent prompts. */
+export type AgentPromptToolChoice = "auto" | "none" | "required";
+
+/** Selection to apply after a tool result within the same prompt run. */
+export interface AgentToolResultChoicePolicy {
+	success: AgentPromptToolChoice;
+	error: AgentPromptToolChoice;
+}
+
+/** Stream options used internally by the agent loop. */
+export interface AgentStreamOptions extends SimpleStreamOptions {
+	toolChoice?: AgentPromptToolChoice;
+}
 
 /**
  * Configuration for how tool calls from a single assistant message are executed.
@@ -146,8 +160,9 @@ export interface AgentLoopTurnUpdate {
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
-export interface AgentLoopConfig extends SimpleStreamOptions {
+export interface AgentLoopConfig extends AgentStreamOptions {
 	model: Model<any>;
+	toolChoiceAfterToolResult?: AgentToolResultChoicePolicy;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.

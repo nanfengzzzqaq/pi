@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import {
 	type AgentBrowserTarget,
 	type AgentBrowserUploadFile,
+	agentBrowserUploadOrigin,
 	getAgentBrowserRuntime,
 	redactSensitiveText,
 	resolveSensitiveBrowserUrl,
@@ -32,9 +33,17 @@ const UPLOAD_MIME_TYPES: Record<string, string> = {
 };
 const MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 50 * 1024 * 1024;
+const SNAPSHOT_MIN_CHARS = 1000;
+const SNAPSHOT_MAX_CHARS = 12000;
+const SNAPSHOT_MIN_ELEMENTS = 20;
+const SNAPSHOT_MAX_ELEMENTS = 1000;
+
+function clampSnapshotLimit(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
+	return Math.max(minimum, Math.min(value ?? fallback, maximum));
+}
 
 /** 读取要上传的本地文件：支持工作区相对路径与绝对路径，限制单文件与总体积。 */
-function readUploadFiles(cwd: string, paths: string[]): AgentBrowserUploadFile[] {
+export function readAgentBrowserUploadFiles(cwd: string, paths: string[]): AgentBrowserUploadFile[] {
 	const files: AgentBrowserUploadFile[] = [];
 	let total = 0;
 	for (const requested of paths) {
@@ -64,14 +73,22 @@ function result(text: string): AgentToolResult<unknown> {
 	return { content: [{ type: "text", text: redactSensitiveText(text) }], details: {} };
 }
 
-function optionalTarget(params: { ref?: string; selector?: string; text?: string }): AgentBrowserTarget | undefined {
-	if (!params.ref && !params.selector && !params.text) return undefined;
-	return { ref: params.ref, selector: params.selector, text: params.text };
+function optionalTarget(params: AgentBrowserTarget): AgentBrowserTarget | undefined {
+	if (!params.ref && !params.selector && !params.text && !params.scopeTexts?.length && !params.within)
+		return undefined;
+	return {
+		ref: params.ref,
+		selector: params.selector,
+		text: params.text,
+		occurrence: params.occurrence,
+		scopeTexts: params.scopeTexts,
+		within: params.within,
+	};
 }
 
-function target(params: { ref?: string; selector?: string; text?: string }): AgentBrowserTarget {
+function target(params: AgentBrowserTarget): AgentBrowserTarget {
 	const resolved = optionalTarget(params);
-	if (!resolved) {
+	if (!resolved?.ref && !resolved?.selector && !resolved?.text) {
 		throw new Error("请提供页面快照中的 ref、CSS selector 或可见文字之一");
 	}
 	return resolved;
@@ -84,10 +101,29 @@ function workspaceOutput(cwd: string, requested: string | undefined): string {
 	return output;
 }
 
-const targetParameters = {
+const locatorParameters = {
 	ref: Type.Optional(Type.String({ description: "browser_snapshot 返回的元素编号，如 e12" })),
 	selector: Type.Optional(Type.String({ description: "CSS 选择器；优先使用稳定的 ref" })),
-	text: Type.Optional(Type.String({ description: "元素的可见文字；找不到 ref 时使用" })),
+	text: Type.Optional(Type.String({ description: "元素的可见文字；找不到 ref 时使用精确匹配" })),
+	occurrence: Type.Optional(
+		Type.Integer({ minimum: 1, maximum: 1000, description: "匹配到多个元素时选择第几个（从 1 开始）" }),
+	),
+};
+
+const targetParameters = {
+	...locatorParameters,
+	scopeTexts: Type.Optional(
+		Type.Array(Type.String(), {
+			minItems: 1,
+			maxItems: 8,
+			description: "目标附近同一容器内必须同时出现的文字，例如出发城市、到达城市和金额",
+		}),
+	),
+	within: Type.Optional(
+		Type.Object(locatorParameters, {
+			description: "先定位一个容器，再只在该容器内查找目标",
+		}),
+	),
 };
 
 export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
@@ -116,35 +152,90 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			name: "browser_snapshot",
 			label: "获取页面状态",
 			description:
-				"读取当前网页的精简语义结构和可操作元素编号。优先用它定位元素；不会把完整 HTML 或截图送入上下文。",
+				"读取当前网页的精简语义结构和可操作元素编号，优先返回最上层弹窗/抽屉；可用 scopeTexts 只看某条明细。隐藏的文件输入框也会带 ref。",
 			parameters: Type.Object({
 				maxChars: Type.Optional(
-					Type.Integer({ minimum: 1000, maximum: 12000, description: "最多返回字符数，默认 6000" }),
+					Type.Integer({
+						minimum: 100,
+						maximum: 50000,
+						description: "期望返回的字符数；运行时会安全限制在 1000–12000，默认 6000",
+					}),
+				),
+				maxElements: Type.Optional(
+					Type.Integer({
+						minimum: 1,
+						maximum: 5000,
+						description: "期望返回的元素数；运行时会安全限制在 20–1000，默认 500",
+					}),
+				),
+				scopeTexts: Type.Optional(
+					Type.Array(Type.String(), {
+						minItems: 1,
+						maxItems: 8,
+						description: "只返回同一页面区域内同时包含这些文字的元素",
+					}),
 				),
 			}),
-			execute: async (_id, params) => result(await browser().snapshot(params.maxChars ?? 6000)),
+			execute: async (_id, params) =>
+				result(
+					await browser().snapshot({
+						maxChars: clampSnapshotLimit(params.maxChars, 6000, SNAPSHOT_MIN_CHARS, SNAPSHOT_MAX_CHARS),
+						maxElements: clampSnapshotLimit(
+							params.maxElements,
+							500,
+							SNAPSHOT_MIN_ELEMENTS,
+							SNAPSHOT_MAX_ELEMENTS,
+						),
+						scopeTexts: params.scopeTexts,
+					}),
+				),
 		}),
 		defineTool({
 			name: "browser_click",
 			label: "点击页面元素",
-			description: "点击页面快照中的元素。优先传 ref，必要时使用 CSS selector 或可见文字。",
+			description:
+				"用真实鼠标事件点击页面元素。优先传 ref；重复元素用 occurrence，或用 scopeTexts/within 限定到同一条明细。",
 			parameters: Type.Object(targetParameters),
 			execute: async (_id, params) => result(await browser().click(target(params))),
 		}),
 		defineTool({
+			name: "browser_hover",
+			label: "悬浮页面元素",
+			description: "把真实鼠标移动到页面元素上，用于显示悬浮菜单（如“添加发票”下的“智能识票”）。",
+			parameters: Type.Object(targetParameters),
+			execute: async (_id, params) => result(await browser().hover(target(params))),
+		}),
+		defineTool({
 			name: "browser_type",
 			label: "输入页面内容",
-			description: "向输入框、文本框或可编辑元素写入内容，可在输入后按回车提交。",
+			description:
+				"向输入框、文本框或可编辑元素写入内容，可在普通网页输入后按回车确认；易快报页面强制禁止按回车，避免意外提交整张表单。",
 			parameters: Type.Object({
 				...targetParameters,
 				value: Type.String({ description: "要输入的内容" }),
-				submit: Type.Optional(Type.Boolean({ description: "输入后是否按回车确认，默认否；不会提交整张表单" })),
+				submit: Type.Optional(
+					Type.Boolean({ description: "输入后是否按回车确认，默认否；易快报页面不允许设为 true" }),
+				),
 				commit: Type.Optional(
 					Type.Boolean({ description: "输入后是否失焦以持久化字段，默认是；搜索下拉候选时设为否" }),
 				),
 			}),
-			execute: async (_id, params) =>
-				result(await browser().type(target(params), params.value, params.submit === true, params.commit !== false)),
+			execute: async (_id, params) => {
+				const runtime = browser();
+				if (params.submit === true) {
+					try {
+						const hostname = new URL(runtime.state().url).hostname;
+						if (/(^|\.)ekuaibao\.com$/i.test(hostname)) {
+							throw new Error("安全策略已禁止在易快报页面通过回车确认，以免触发表单提交；请点击明确的候选项");
+						}
+					} catch (error) {
+						if (error instanceof Error && error.message.startsWith("安全策略已禁止")) throw error;
+					}
+				}
+				return result(
+					await runtime.type(target(params), params.value, params.submit === true, params.commit !== false),
+				);
+			},
 		}),
 		defineTool({
 			name: "browser_scroll",
@@ -202,7 +293,7 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			name: "browser_upload",
 			label: "上传附件",
 			description:
-				"把本地文件定向上传到当前网页的文件上传框（如某一条报销明细的火车票附件）。页面有多个上传入口时必须传 ref、selector 或附近可见文字，工具不会猜测。路径可写工作区内相对路径或绝对路径；单文件 ≤20MB，总量 ≤50MB。",
+				"把本地文件定向上传到当前网页的文件输入框。先悬浮/点击打开上传弹窗并重新快照，优先传弹窗内隐藏 file input 的 ref；重复 selector 必须给 occurrence，也可用 scopeTexts/within 限定明细。指定目标不存在时绝不回退到全页。单文件 ≤20MB，总量 ≤50MB。",
 			parameters: Type.Object({
 				paths: Type.Array(Type.String(), {
 					minItems: 1,
@@ -211,8 +302,10 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 				...targetParameters,
 			}),
 			execute: async (_id, params) => {
-				const files = readUploadFiles(cwd, params.paths);
-				return result(await browser().uploadFiles(files, optionalTarget(params)));
+				const runtime = browser();
+				const allowedOrigin = agentBrowserUploadOrigin(runtime.state().url);
+				const files = readAgentBrowserUploadFiles(cwd, params.paths);
+				return result(await runtime.uploadFiles(files, optionalTarget(params), allowedOrigin));
 			},
 		}),
 	];

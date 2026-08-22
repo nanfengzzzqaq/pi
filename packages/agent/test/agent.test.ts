@@ -134,6 +134,99 @@ describe("Agent", () => {
 		expect(agent.state.thinkingLevel).toBe("low");
 	});
 
+	it("applies required tool choice only to the first successful provider request", async () => {
+		const choices: Array<string | undefined> = [];
+		let callCount = 0;
+		const tool: AgentTool = {
+			name: "travel_fill_draft",
+			label: "Travel Draft",
+			description: "Fill one deterministic travel draft",
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text", text: "draft saved" }], details: undefined }),
+		};
+		const agent = new Agent({
+			initialState: { model: getModel("deepseek", "deepseek-v4-flash")!, tools: [tool] },
+			streamFn: (_model, _context, options) => {
+				choices.push(options?.toolChoice);
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message =
+						callCount === 1
+							? createAssistantToolUseMessage([
+									{ type: "toolCall", id: "travel-1", name: "travel_fill_draft", arguments: {} },
+								])
+							: createAssistantMessage("已完成");
+					stream.push({ type: "done", reason: callCount === 1 ? "toolUse" : "stop", message });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("填写差旅报销", {
+			toolChoice: "required",
+			toolChoiceAfterToolResult: { success: "none", error: "required" },
+		});
+
+		expect(callCount).toBe(2);
+		expect(choices).toEqual(["required", "none"]);
+	});
+
+	it("keeps required after a tool error before switching to none after success", async () => {
+		const choices: Array<string | undefined> = [];
+		let callCount = 0;
+		let executions = 0;
+		const tool: AgentTool = {
+			name: "travel_fill_draft",
+			label: "Travel Draft",
+			description: "Fill one deterministic travel draft",
+			parameters: Type.Object({ url: Type.String() }),
+			execute: async () => {
+				executions++;
+				return { content: [{ type: "text", text: "needs input" }], details: { status: "needs_input" } };
+			},
+		};
+		const agent = new Agent({
+			initialState: { model: getModel("deepseek", "deepseek-v4-flash")!, tools: [tool] },
+			streamFn: (_model, _context, options) => {
+				choices.push(options?.toolChoice);
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const message =
+						callCount === 1
+							? createAssistantToolUseMessage([
+									{ type: "toolCall", id: "bad-1", name: "travel_fill_draft", arguments: {} },
+								])
+							: callCount === 2
+								? createAssistantToolUseMessage([
+										{
+											type: "toolCall",
+											id: "good-1",
+											name: "travel_fill_draft",
+											arguments: { url: "https://app.ekuaibao.com/" },
+										},
+									])
+								: createAssistantMessage("请补充附件");
+					stream.push({
+						type: "done",
+						reason: callCount <= 2 ? "toolUse" : "stop",
+						message,
+					});
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("填写差旅报销", {
+			toolChoice: "required",
+			toolChoiceAfterToolResult: { success: "none", error: "required" },
+		});
+
+		expect(executions).toBe(1);
+		expect(choices).toEqual(["required", "required", "none"]);
+	});
+
 	it("should subscribe to events", () => {
 		const agent = new Agent({ streamFn: unusedStreamFunction });
 
@@ -652,6 +745,61 @@ describe("Agent", () => {
 		expect(hasQueuedFollowUp).toBe(true);
 		expect(agent.state.messages[agent.state.messages.length - 1].role).toBe("assistant");
 	});
+
+	it.each(["steer", "followUp"] as const)(
+		"continue() preserves the tool-result choice policy for queued %s messages",
+		async (queueMethod) => {
+			const choices: Array<string | undefined> = [];
+			let callCount = 0;
+			const tool: AgentTool = {
+				name: "travel_fill_draft",
+				label: "Travel Draft",
+				description: "Fill one deterministic travel draft",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "done" }], details: undefined }),
+			};
+			const agent = new Agent({
+				initialState: { tools: [tool] },
+				streamFn: (_model, _context, options) => {
+					choices.push(options?.toolChoice);
+					callCount++;
+					const stream = new MockAssistantStream();
+					queueMicrotask(() => {
+						const message =
+							callCount === 1
+								? createAssistantToolUseMessage([
+										{ type: "toolCall", id: "travel-queued", name: "travel_fill_draft", arguments: {} },
+									])
+								: createAssistantMessage("summary");
+						stream.push({
+							type: "done",
+							reason: callCount === 1 ? "toolUse" : "stop",
+							message,
+						});
+					});
+					return stream;
+				},
+			});
+			agent.state.messages = [
+				{ role: "user", content: [{ type: "text", text: "Initial" }], timestamp: Date.now() - 10 },
+				createAssistantMessage("Initial response"),
+			];
+			const queuedMessage = {
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "Queued travel request" }],
+				timestamp: Date.now(),
+			};
+			if (queueMethod === "steer") agent.steer(queuedMessage);
+			else agent.followUp(queuedMessage);
+
+			await agent.continue({
+				toolChoice: "required",
+				toolChoiceAfterToolResult: { success: "none", error: "required" },
+			});
+
+			expect(choices).toEqual(["required", "none"]);
+		},
+	);
 
 	it("continue() should keep one-at-a-time steering semantics from assistant tail", async () => {
 		let responseCount = 0;

@@ -56,6 +56,10 @@ jobs:
           fi
 
           RELEASE_TAG="v${VERSION}"
+          release_marker="<!-- pi-console-release-workflow-owned:v1 tag=${RELEASE_TAG} source=${SOURCE_SHA} -->"
+          has_exact_release_marker() {
+            jq -e --arg marker "${release_marker}" '((.body // "") | split("\n") | map(rtrimstr("\r")) | map(select(. == $marker)) | length) == 1' >/dev/null
+          }
           response_file="$(mktemp)"
           http_status="$(curl --silent --show-error \
             --output "${response_file}" \
@@ -83,12 +87,42 @@ jobs:
                 --header "X-GitHub-Api-Version: 2022-11-28" \
                 "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
               if [[ "${release_status}" == "404" ]]; then
+                if ! release_inventory="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json isDraft,tagName)"; then
+                  echo "::error::Unable to inspect releases while preparing recovery for ${RELEASE_TAG}."
+                  exit 1
+                fi
+                release_matches="$(jq -c --arg tag "${RELEASE_TAG}" '[.[] | select(.tagName == $tag)]' <<< "${release_inventory}")"
+                release_match_count="$(jq 'length' <<< "${release_matches}")"
+                if [[ "${release_match_count}" == "1" ]]; then
+                  if [[ "$(jq -r '.[0].isDraft' <<< "${release_matches}")" != "true" ]]; then
+                    echo "::error::${RELEASE_TAG} exists in the release inventory but is not a draft."
+                    exit 1
+                  fi
+                  draft_file="$(mktemp)"
+                  if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json body,databaseId,isDraft,tagName > "${draft_file}"; then
+                    echo "::error::Unable to inspect the draft for ${RELEASE_TAG}."
+                    exit 1
+                  fi
+                  if [[ "$(jq -r '.tagName' "${draft_file}")" != "${RELEASE_TAG}" \
+                    || "$(jq -r '.isDraft' "${draft_file}")" != "true" ]] \
+                    || ! has_exact_release_marker < "${draft_file}"; then
+                    echo "::error::${RELEASE_TAG} is an unowned or legacy draft; refusing workflow recovery."
+                    exit 1
+                  fi
+                elif [[ "${release_match_count}" != "0" ]]; then
+                  echo "::error::Found ${release_match_count} releases for ${RELEASE_TAG}; refusing ambiguous recovery."
+                  exit 1
+                fi
                 release_needed=true
                 release_mode=recover
-                echo "::warning::${RELEASE_TAG} has no GitHub Release; rebuilding the installer and recovering the release."
+                echo "::warning::${RELEASE_TAG} is recoverable; rebuilding the installer and recovering the release."
               elif [[ "${release_status}" == "200" ]]; then
                 is_draft="$(jq -r '.draft' "${release_file}")"
                 if [[ "${is_draft}" == "true" ]]; then
+                  if ! has_exact_release_marker < "${release_file}"; then
+                    echo "::error::${RELEASE_TAG} is an unowned or legacy draft; refusing workflow recovery."
+                    exit 1
+                  fi
                   release_needed=true
                   release_mode=recover
                   echo "::warning::${RELEASE_TAG} is still a draft; rebuilding the installer and recovering the release."
@@ -212,7 +246,7 @@ jobs:
         run: npm run build
 
       - name: Test Windows client
-        run: npm test --workspace=@pi/console
+        run: npm test --workspace=@pi/console -- --maxWorkers=1
 
       - name: Check packaged scripts
         run: |
@@ -367,29 +401,35 @@ jobs:
             exit 1
           fi
 
-          tag_created=false
-          cleanup_enabled=false
-          cleanup_failed_publish() {
+          failure_guard_enabled=false
+          active_release_id=""
+          release_operation=create
+          target_name="$(basename "${asset}")"
+          release_marker="<!-- pi-console-release-workflow-owned:v1 tag=${RELEASE_TAG} source=${SOURCE_SHA} -->"
+          asset_marker="pi-console-release-workflow-owned:v1:${RELEASE_TAG}:${SOURCE_SHA}"
+          stale_prefix="${target_name}.pi-console-stale-"
+          has_exact_release_marker() {
+            jq -e --arg marker "${release_marker}" '((.body // "") | split("\n") | map(rtrimstr("\r")) | map(select(. == $marker)) | length) == 1' >/dev/null
+          }
+          preserve_failed_publish() {
             failure_status="$?"
             set +e
-            if [[ "${cleanup_enabled}" == "true" ]]; then
-              release_state="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
-              if [[ "${release_state}" == "true" ]]; then
-                gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
-                release_state=missing
-              elif [[ "${release_state}" != "missing" ]]; then
-                echo "::warning::A non-draft release now exists for ${RELEASE_TAG}; it was not removed."
-              fi
-              if [[ "${tag_created}" == "true" && "${release_state}" == "missing" ]]; then
-                current_tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha 2>/dev/null || true)"
-                if [[ "${current_tag_sha}" == "${SOURCE_SHA}" ]]; then
-                  gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" >/dev/null
+            if [[ "${failure_guard_enabled}" == "true" ]]; then
+              if cleanup_inventory="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json isDraft,tagName 2>/dev/null)"; then
+                cleanup_matches="$(jq -c --arg tag "${RELEASE_TAG}" '[.[] | select(.tagName == $tag)]' <<< "${cleanup_inventory}")"
+                cleanup_match_count="$(jq 'length' <<< "${cleanup_matches}")"
+                if [[ "${cleanup_match_count}" == "0" ]]; then
+                  echo "::warning::No release currently uses ${RELEASE_TAG}; the exact source tag was preserved for a safe retry."
+                else
+                  echo "::warning::A release now uses ${RELEASE_TAG}; it and all of its assets were preserved for fail-closed recovery."
                 fi
+              else
+                echo "::warning::Unable to inspect releases after failure; no release, asset, or tag was removed."
               fi
             fi
             exit "${failure_status}"
           }
-          trap cleanup_failed_publish ERR
+          trap preserve_failed_publish ERR
 
           case "${RELEASE_MODE}" in
             create)
@@ -408,8 +448,7 @@ jobs:
               gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
                 --field ref="refs/tags/${RELEASE_TAG}" \
                 --field sha="${SOURCE_SHA}" >/dev/null
-              tag_created=true
-              cleanup_enabled=true
+              failure_guard_enabled=true
               ;;
             recover)
               tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
@@ -417,25 +456,36 @@ jobs:
                 echo "::error::${RELEASE_TAG} changed while the installer was building; refusing recovery."
                 exit 1
               fi
-              release_file="$(mktemp)"
-              release_status="$(curl --silent --show-error \
-                --output "${release_file}" \
-                --write-out '%{http_code}' \
-                --header "Accept: application/vnd.github+json" \
-                --header "Authorization: Bearer ${GH_TOKEN}" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-              if [[ "${release_status}" == "200" ]]; then
-                if [[ "$(jq -r '.draft' "${release_file}")" != "true" ]]; then
+              # The REST /releases/tags endpoint intentionally hides draft releases.
+              # `gh release list` includes drafts unless --exclude-drafts is given.
+              # A query failure is not equivalent to an absent release: recovery must
+              # fail closed rather than risk deleting or replacing an unknown object.
+              if ! release_inventory="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json isDraft,tagName)"; then
+                echo "::error::Unable to inspect releases while recovering ${RELEASE_TAG}."
+                exit 1
+              fi
+              release_matches="$(jq -c --arg tag "${RELEASE_TAG}" '[.[] | select(.tagName == $tag)]' <<< "${release_inventory}")"
+              release_match_count="$(jq 'length' <<< "${release_matches}")"
+              if [[ "${release_match_count}" == "1" ]]; then
+                if [[ "$(jq -r '.[0].isDraft' <<< "${release_matches}")" != "true" ]]; then
                   echo "::error::${RELEASE_TAG} became public while the installer was building; refusing to replace it."
                   exit 1
                 fi
-                gh release delete "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --yes
-              elif [[ "${release_status}" != "404" ]]; then
-                echo "::error::Unable to inspect ${RELEASE_TAG} during recovery; GitHub API returned HTTP ${release_status}."
+                existing_release_json="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json body,databaseId,isDraft,tagName)"
+                active_release_id="$(jq -r '.databaseId' <<< "${existing_release_json}")"
+                if [[ ! "${active_release_id}" =~ ^[0-9]+$ \
+                  || "$(jq -r '.tagName' <<< "${existing_release_json}")" != "${RELEASE_TAG}" \
+                  || "$(jq -r '.isDraft' <<< "${existing_release_json}")" != "true" ]] \
+                  || ! has_exact_release_marker <<< "${existing_release_json}"; then
+                  echo "::error::The draft for ${RELEASE_TAG} is unowned, legacy, or could not be identified uniquely; refusing recovery."
+                  exit 1
+                fi
+                release_operation=reuse
+              elif [[ "${release_match_count}" != "0" ]]; then
+                echo "::error::Found ${release_match_count} releases for ${RELEASE_TAG}; refusing ambiguous recovery."
                 exit 1
               fi
-              cleanup_enabled=true
+              failure_guard_enabled=true
               ;;
             *)
               echo "::error::Unknown Console release mode: ${RELEASE_MODE}."
@@ -455,41 +505,341 @@ jobs:
           {
             echo '## 本版关键修复'
             echo
-            echo '- 修复差旅报销自动化的票据解析、附件上传和表单填写稳定性。'
-            echo '- 增加只保存草稿的安全约束，并强化敏感链接脱敏。'
-            echo '- 改进本地模型与内置浏览器工具协作的可靠性。'
+            echo '- 新增一键式差旅草稿状态机，弱模型无需逐项猜测网页操作。'
+            echo '- 直接解析铁路电子票 PDF，并自动配对查验 PDF 与住宿票据。'
+            echo '- 修复可信点击、悬浮菜单、精确附件上传和动态表格定位。'
+            echo '- 增加动作预算、无进展熔断和保存前总额/收款人校验；仍只保存草稿。'
             echo
             printf '构建来源：`%s`。\n' "${SOURCE_SHA}"
+            printf '%s\n' "${release_marker}"
           } > "${notes_file}"
-          gh release create "${RELEASE_TAG}" "${asset}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --draft \
-            --title "Pi Console ${RELEASE_TAG}" \
-            --notes-file "${notes_file}"
 
-          draft_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
-          draft_asset_count="$(jq '.assets | length' <<< "${draft_json}")"
-          draft_valid_asset_count="$(jq --arg name "$(basename "${asset}")" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${draft_json}")"
-          if [[ "$(jq -r '.draft' <<< "${draft_json}")" != "true" || "${draft_asset_count}" != "1" || "${draft_valid_asset_count}" != "1" ]]; then
-            echo "::error::Draft release validation failed for ${RELEASE_TAG}."
+          load_active_draft() {
+            local current_release
+            local current_inventory
+            local current_matches
+            if [[ ! "${active_release_id}" =~ ^[0-9]+$ ]]; then
+              echo "::error::No numeric active release ID is available." >&2
+              return 1
+            fi
+            if ! current_inventory="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json isDraft,tagName)"; then
+              echo "::error::Unable to verify release uniqueness for ${RELEASE_TAG}." >&2
+              return 1
+            fi
+            current_matches="$(jq -c --arg tag "${RELEASE_TAG}" '[.[] | select(.tagName == $tag)]' <<< "${current_inventory}")"
+            if [[ "$(jq 'length' <<< "${current_matches}")" != "1" \
+              || "$(jq -r '.[0].isDraft' <<< "${current_matches}")" != "true" ]]; then
+              echo "::error::Release ${active_release_id} is no longer the unique draft for ${RELEASE_TAG}." >&2
+              return 1
+            fi
+            if ! current_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${active_release_id}")"; then
+              echo "::error::Unable to reload release ${active_release_id}." >&2
+              return 1
+            fi
+            if [[ "$(jq -r '.id' <<< "${current_release}")" != "${active_release_id}" \
+              || "$(jq -r '.tag_name' <<< "${current_release}")" != "${RELEASE_TAG}" \
+              || "$(jq -r '.draft' <<< "${current_release}")" != "true" ]]; then
+              echo "::error::Release ${active_release_id} is no longer the expected draft for ${RELEASE_TAG}." >&2
+              return 1
+            fi
+            if ! has_exact_release_marker <<< "${current_release}"; then
+              echo "::error::Release ${active_release_id} no longer has the exact workflow ownership marker." >&2
+              return 1
+            fi
+            printf '%s' "${current_release}"
+          }
+
+          assert_known_asset_set() {
+            jq -e \
+              --arg target "${target_name}" \
+              --arg marker "${asset_marker}" \
+              --arg prefix "${stale_prefix}" '
+                def owned_stale:
+                  .label == $marker
+                  and (.name | startswith($prefix))
+                  and ((.name | ltrimstr($prefix)) | test("^(run-[0-9]+-[0-9]+|asset-[0-9]+)$"));
+                ((.assets // []) | map(select(.name == $target)) | length) <= 1
+                and ((.assets // []) | map(select(.name != $target and (owned_stale | not))) | length) == 0
+              ' >/dev/null
+          }
+
+          local_asset_size="$(stat -c '%s' "${asset}")"
+          local_asset_sha256="$(sha256sum "${asset}" | awk '{print $1}')"
+          if [[ ! "${local_asset_size}" =~ ^[1-9][0-9]*$ || ! "${local_asset_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Unable to fingerprint the verified installer."
             exit 1
           fi
 
-          gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --latest
-          cleanup_enabled=false
+          asset_matches_local() {
+            local asset_id="$1"
+            local asset_size="$2"
+            local asset_digest="${3:-}"
+            local downloaded_asset
+            local downloaded_sha256
+            if [[ ! "${asset_id}" =~ ^[0-9]+$ || ! "${asset_size}" =~ ^[0-9]+$ ]]; then
+              echo "::error::A release asset has invalid identity metadata." >&2
+              return 2
+            fi
+            if [[ "${asset_size}" != "${local_asset_size}" ]]; then
+              return 1
+            fi
+            if [[ "${asset_digest}" =~ ^sha256:([0-9a-fA-F]{64})$ ]]; then
+              [[ "${BASH_REMATCH[1],,}" == "${local_asset_sha256}" ]]
+              return
+            fi
+            downloaded_asset="$(mktemp)"
+            if ! curl --fail --location --silent --show-error \
+              --output "${downloaded_asset}" \
+              --header "Accept: application/octet-stream" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"; then
+              echo "::error::Unable to download release asset ${asset_id} for exact verification." >&2
+              return 2
+            fi
+            downloaded_sha256="$(sha256sum "${downloaded_asset}" | awk '{print $1}')"
+            [[ "${downloaded_sha256}" == "${local_asset_sha256}" ]]
+          }
+
+          upload_candidate_asset() {
+            local current_draft
+            local upload_url
+            local expected_upload_url
+            local encoded_name
+            local encoded_label
+            local upload_response
+            local upload_status
+            current_draft="$(load_active_draft)"
+            upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<< "${current_draft}")"
+            expected_upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${active_release_id}/assets"
+            if [[ "${upload_url}" != "${expected_upload_url}" ]]; then
+              echo "::error::Unexpected upload endpoint for release ${active_release_id}." >&2
+              return 1
+            fi
+            candidate_name="${stale_prefix}run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            encoded_name="$(jq -nr --arg value "${candidate_name}" '$value | @uri')"
+            encoded_label="$(jq -nr --arg value "${asset_marker}" '$value | @uri')"
+            upload_response="$(mktemp)"
+            if ! upload_status="$(curl --fail --silent --show-error \
+              --output "${upload_response}" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary @"${asset}" \
+              "${upload_url}?name=${encoded_name}&label=${encoded_label}")"; then
+              echo "::error::Unable to upload the marked candidate installer." >&2
+              return 1
+            fi
+            candidate_asset_id="$(jq -r '.id' "${upload_response}")"
+            candidate_asset_size="$(jq -r '.size' "${upload_response}")"
+            candidate_asset_digest="$(jq -r '.digest // ""' "${upload_response}")"
+            if [[ "${upload_status}" != "201" \
+              || ! "${candidate_asset_id}" =~ ^[0-9]+$ \
+              || "$(jq -r '.name' "${upload_response}")" != "${candidate_name}" \
+              || "$(jq -r '.label' "${upload_response}")" != "${asset_marker}" \
+              || "${candidate_asset_size}" != "${local_asset_size}" ]]; then
+              echo "::error::GitHub did not confirm the marked candidate installer asset." >&2
+              return 1
+            fi
+          }
+
+          if [[ "${release_operation}" == "create" ]]; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "Pi Console ${RELEASE_TAG}" \
+              --notes-file "${notes_file}"
+
+            # Draft releases are not returned by REST /releases/tags/{tag}; resolve
+            # the unique marked draft before uploading any asset.
+            draft_summary="$(gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --json body,databaseId,isDraft,tagName)"
+            active_release_id="$(jq -r '.databaseId' <<< "${draft_summary}")"
+            if [[ ! "${active_release_id}" =~ ^[0-9]+$ \
+              || "$(jq -r '.tagName' <<< "${draft_summary}")" != "${RELEASE_TAG}" \
+              || "$(jq -r '.isDraft' <<< "${draft_summary}")" != "true" ]] \
+              || ! has_exact_release_marker <<< "${draft_summary}"; then
+              echo "::error::The newly created draft could not be identified as workflow-owned."
+              exit 1
+            fi
+          fi
+
+          # Refuse to touch arbitrary assets. The only non-target assets accepted are
+          # exact stale names carrying this release's workflow ownership label.
+          draft_json="$(load_active_draft)"
+          if ! assert_known_asset_set <<< "${draft_json}"; then
+            echo "::error::The draft contains an unknown or ambiguously named asset; nothing was changed."
+            exit 1
+          fi
+          target_count="$(jq --arg name "${target_name}" '[.assets[] | select(.name == $name)] | length' <<< "${draft_json}")"
+          target_is_current=false
+          if [[ "${target_count}" == "1" ]]; then
+            target_asset_id="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .id' <<< "${draft_json}")"
+            target_asset_size="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .size' <<< "${draft_json}")"
+            target_asset_digest="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | (.digest // "")' <<< "${draft_json}")"
+            target_asset_label="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | (.label // "")' <<< "${draft_json}")"
+            if asset_matches_local "${target_asset_id}" "${target_asset_size}" "${target_asset_digest}"; then
+              target_is_current=true
+            else
+              match_status="$?"
+              if [[ "${match_status}" == "2" ]]; then
+                exit 1
+              fi
+              if [[ "${target_asset_label}" != "${asset_marker}" ]]; then
+                echo "::error::The existing target installer differs from this build and is not workflow-marked; it was preserved."
+                exit 1
+              fi
+            fi
+          fi
+
+          if [[ "${target_is_current}" != "true" ]]; then
+            upload_candidate_asset
+            draft_json="$(load_active_draft)"
+            if ! assert_known_asset_set <<< "${draft_json}"; then
+              echo "::error::The draft asset set changed after upload; it was preserved."
+              exit 1
+            fi
+            candidate_count="$(jq --argjson id "${candidate_asset_id}" --arg name "${candidate_name}" --arg marker "${asset_marker}" '[.assets[] | select(.id == $id and .name == $name and .label == $marker)] | length' <<< "${draft_json}")"
+            if [[ "${candidate_count}" != "1" ]]; then
+              echo "::error::The marked candidate installer could not be identified uniquely."
+              exit 1
+            fi
+            if asset_matches_local "${candidate_asset_id}" "${candidate_asset_size}" "${candidate_asset_digest}"; then
+              :
+            else
+              match_status="$?"
+              echo "::error::The uploaded candidate installer did not pass exact verification (status ${match_status})."
+              exit 1
+            fi
+
+            if [[ "${target_count}" == "1" ]]; then
+              current_target_count="$(jq --argjson id "${target_asset_id}" --arg name "${target_name}" --arg marker "${asset_marker}" '[.assets[] | select(.id == $id and .name == $name and .label == $marker)] | length' <<< "${draft_json}")"
+              if [[ "${current_target_count}" != "1" ]]; then
+                echo "::error::The workflow-owned target installer changed before replacement; refusing to rename it."
+                exit 1
+              fi
+              old_stale_name="${stale_prefix}asset-${target_asset_id}"
+              load_active_draft >/dev/null
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${target_asset_id}" \
+                --raw-field name="${old_stale_name}" \
+                --raw-field label="${asset_marker}" >/dev/null
+            fi
+
+            draft_json="$(load_active_draft)"
+            if ! assert_known_asset_set <<< "${draft_json}" \
+              || [[ "$(jq --arg name "${target_name}" '[.assets[] | select(.name == $name)] | length' <<< "${draft_json}")" != "0" \
+              || "$(jq --argjson id "${candidate_asset_id}" --arg name "${candidate_name}" --arg marker "${asset_marker}" '[.assets[] | select(.id == $id and .name == $name and .label == $marker)] | length' <<< "${draft_json}")" != "1" ]]; then
+              echo "::error::The draft changed before candidate activation; it was preserved."
+              exit 1
+            fi
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/assets/${candidate_asset_id}" \
+              --raw-field name="${target_name}" \
+              --raw-field label="${asset_marker}" >/dev/null
+          fi
+
+          draft_json="$(load_active_draft)"
+          if ! assert_known_asset_set <<< "${draft_json}"; then
+            echo "::error::The draft contains an unknown asset after target reconciliation; it was preserved."
+            exit 1
+          fi
+          active_target_count="$(jq --arg name "${target_name}" '[.assets[] | select(.name == $name)] | length' <<< "${draft_json}")"
+          if [[ "${active_target_count}" != "1" ]]; then
+            echo "::error::The draft does not have one active target installer."
+            exit 1
+          fi
+          active_target_id="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .id' <<< "${draft_json}")"
+          active_target_size="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .size' <<< "${draft_json}")"
+          active_target_digest="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | (.digest // "")' <<< "${draft_json}")"
+          if asset_matches_local "${active_target_id}" "${active_target_size}" "${active_target_digest}"; then
+            :
+          else
+            match_status="$?"
+            echo "::error::The active installer failed exact verification (status ${match_status})."
+            exit 1
+          fi
+
+          load_active_draft >/dev/null
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${active_release_id}" \
+            --raw-field name="Pi Console ${RELEASE_TAG}" \
+            --raw-field body="$(< "${notes_file}")" \
+            --field draft=true >/dev/null
+
+          # Delete only stale assets with both the exact owned label and an exact
+          # workflow stale name. Unknown assets are never renamed or deleted.
+          draft_json="$(load_active_draft)"
+          while IFS= read -r stale_asset_id; do
+            [[ -n "${stale_asset_id}" ]] || continue
+            if [[ ! "${stale_asset_id}" =~ ^[0-9]+$ ]]; then
+              echo "::error::A workflow stale asset ID is invalid; the draft was preserved."
+              exit 1
+            fi
+            draft_json="$(load_active_draft)"
+            if ! assert_known_asset_set <<< "${draft_json}" \
+              || [[ "$(jq --argjson id "${stale_asset_id}" --arg marker "${asset_marker}" --arg prefix "${stale_prefix}" '[.assets[] | select(.id == $id and .label == $marker and (.name | startswith($prefix)) and ((.name | ltrimstr($prefix)) | test("^(run-[0-9]+-[0-9]+|asset-[0-9]+)$")))] | length' <<< "${draft_json}")" != "1" ]]; then
+              echo "::error::A stale asset lost its workflow ownership proof; refusing deletion."
+              exit 1
+            fi
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${stale_asset_id}" >/dev/null
+          done < <(jq -r --arg marker "${asset_marker}" --arg prefix "${stale_prefix}" '.assets[] | select(.label == $marker and (.name | startswith($prefix)) and ((.name | ltrimstr($prefix)) | test("^(run-[0-9]+-[0-9]+|asset-[0-9]+)$"))) | .id' <<< "${draft_json}")
+
+          draft_json="$(load_active_draft)"
+          draft_asset_count="$(jq '.assets | length' <<< "${draft_json}")"
+          draft_valid_asset_count="$(jq --arg name "${target_name}" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${draft_json}")"
+          final_draft_target_id="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .id' <<< "${draft_json}")"
+          final_draft_target_size="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .size' <<< "${draft_json}")"
+          final_draft_target_digest="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | (.digest // "")' <<< "${draft_json}")"
+          if [[ ! "${active_release_id}" =~ ^[0-9]+$ \
+            || "$(jq -r '.id' <<< "${draft_json}")" != "${active_release_id}" \
+            || "$(jq -r '.tag_name' <<< "${draft_json}")" != "${RELEASE_TAG}" \
+            || "$(jq -r '.draft' <<< "${draft_json}")" != "true" \
+            || "${draft_asset_count}" != "1" \
+            || "${draft_valid_asset_count}" != "1" \
+            || "${final_draft_target_id}" != "${active_target_id}" ]] \
+            || ! assert_known_asset_set <<< "${draft_json}"; then
+            echo "::error::Draft release validation failed for ${RELEASE_TAG}."
+            exit 1
+          fi
+          if asset_matches_local "${final_draft_target_id}" "${final_draft_target_size}" "${final_draft_target_digest}"; then
+            :
+          else
+            match_status="$?"
+            echo "::error::The final draft installer failed exact verification (status ${match_status})."
+            exit 1
+          fi
+
+          load_active_draft >/dev/null
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${active_release_id}" \
+            --field draft=false \
+            --raw-field make_latest=true >/dev/null
+          failure_guard_enabled=false
           trap - ERR
 
-          published_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}")"
+          published_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${active_release_id}")"
           published_asset_count="$(jq '.assets | length' <<< "${published_json}")"
-          published_valid_asset_count="$(jq --arg name "$(basename "${asset}")" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${published_json}")"
+          published_valid_asset_count="$(jq --arg name "${target_name}" '[.assets[] | select(.name == $name and .size > 0)] | length' <<< "${published_json}")"
+          published_target_id="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .id' <<< "${published_json}")"
+          published_target_size="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | .size' <<< "${published_json}")"
+          published_target_digest="$(jq -r --arg name "${target_name}" '.assets[] | select(.name == $name) | (.digest // "")' <<< "${published_json}")"
           final_tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
           if [[ "$(jq -r '.draft' <<< "${published_json}")" != "false" \
+            || "$(jq -r '.id' <<< "${published_json}")" != "${active_release_id}" \
+            || "$(jq -r '.tag_name' <<< "${published_json}")" != "${RELEASE_TAG}" \
             || "${published_asset_count}" != "1" \
             || "${published_valid_asset_count}" != "1" \
+            || "${published_target_id}" != "${active_target_id}" \
             || "$(jq -r '.object.type' <<< "${final_tag_json}")" != "commit" \
             || "$(jq -r '.object.sha' <<< "${final_tag_json}")" != "${SOURCE_SHA}" ]]; then
             echo "::error::Published release validation failed for ${RELEASE_TAG}."
+            exit 1
+          fi
+          if asset_matches_local "${published_target_id}" "${published_target_size}" "${published_target_digest}"; then
+            :
+          else
+            match_status="$?"
+            echo "::error::The published installer failed exact verification (status ${match_status})."
             exit 1
           fi
           echo "Published ${RELEASE_TAG} from ${SOURCE_SHA} with $(basename "${asset}")."

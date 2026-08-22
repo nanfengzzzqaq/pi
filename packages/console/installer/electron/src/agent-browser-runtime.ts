@@ -18,10 +18,121 @@ export interface AgentBrowserState {
 	downloadPath?: string;
 }
 
-export interface AgentBrowserTarget {
+export interface AgentBrowserLocator {
 	ref?: string;
 	selector?: string;
 	text?: string;
+	/** 1-based match index when a locator intentionally matches more than one element. */
+	occurrence?: number;
+}
+
+export interface AgentBrowserTarget extends AgentBrowserLocator {
+	/** All strings must occur in a nearby ancestor of the target. */
+	scopeTexts?: string[];
+	/** Restrict target lookup to the element resolved by this locator. */
+	within?: AgentBrowserLocator;
+}
+
+export interface AgentBrowserSnapshotOptions {
+	maxChars: number;
+	maxElements?: number;
+	scopeTexts?: string[];
+}
+
+export interface AgentBrowserSnapshotCandidate {
+	text: string;
+	dedupeText?: string;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	dedupeDepth?: number;
+	dedupeActivationKey?: string;
+}
+
+/**
+ * Collapse DOM wrappers/clones that describe the same visible control row.
+ * Geometry alone is insufficient: distinct activation roots are never merged,
+ * even when a framework temporarily stacks them during an animation.
+ */
+export function deduplicateAgentBrowserSnapshotCandidates<T extends AgentBrowserSnapshotCandidate>(
+	candidates: readonly T[],
+	maxElements = Number.MAX_SAFE_INTEGER,
+): T[] {
+	const normalize = (value: string) => value.replace(/[\s/：:（）()_-]+/g, "").toLocaleLowerCase("zh-CN");
+	const entries = candidates.map((candidate, index) => ({
+		candidate,
+		index,
+		text: normalize(candidate.dedupeText ?? candidate.text),
+		activationKey: candidate.dedupeActivationKey?.trim() ?? "",
+	}));
+	const parent = entries.map((_entry, index) => index);
+	const activationKeys = entries.map((entry) => entry.activationKey);
+	const find = (index: number): number => {
+		let root = index;
+		while (parent[root] !== root) root = parent[root] as number;
+		while (parent[index] !== index) {
+			const next = parent[index] as number;
+			parent[index] = root;
+			index = next;
+		}
+		return root;
+	};
+	const overlap = (left: T, right: T): boolean => {
+		const overlapWidth = Math.min(left.x + left.width, right.x + right.width) - Math.max(left.x, right.x);
+		const overlapHeight = Math.min(left.y + left.height, right.y + right.height) - Math.max(left.y, right.y);
+		return (
+			overlapWidth > 0 &&
+			overlapHeight > 0 &&
+			overlapWidth >= Math.min(left.width, right.width) * 0.5 &&
+			overlapHeight >= Math.min(left.height, right.height) * 0.5
+		);
+	};
+	const groups = new Map<string, number[]>();
+	for (const entry of entries) {
+		if (!entry.text || entry.candidate.width <= 0 || entry.candidate.height <= 0) continue;
+		const group = groups.get(entry.text) ?? [];
+		group.push(entry.index);
+		groups.set(entry.text, group);
+	}
+	for (const group of groups.values()) {
+		for (let leftIndex = 0; leftIndex < group.length; leftIndex++) {
+			for (let rightIndex = leftIndex + 1; rightIndex < group.length; rightIndex++) {
+				const left = group[leftIndex] as number;
+				const right = group[rightIndex] as number;
+				if (!overlap(entries[left]!.candidate, entries[right]!.candidate)) continue;
+				const leftRoot = find(left);
+				const rightRoot = find(right);
+				if (leftRoot === rightRoot) continue;
+				const leftKey = activationKeys[leftRoot] ?? "";
+				const rightKey = activationKeys[rightRoot] ?? "";
+				if (leftKey && rightKey && leftKey !== rightKey) continue;
+				parent[rightRoot] = leftRoot;
+				activationKeys[leftRoot] = leftKey || rightKey;
+			}
+		}
+	}
+	const clusters = new Map<number, Array<(typeof entries)[number]>>();
+	for (const entry of entries) {
+		const root = find(entry.index);
+		const cluster = clusters.get(root) ?? [];
+		cluster.push(entry);
+		clusters.set(root, cluster);
+	}
+	return [...clusters.values()]
+		.map(
+			(cluster) =>
+				cluster.sort((left, right) => {
+					const depth = (right.candidate.dedupeDepth ?? 0) - (left.candidate.dedupeDepth ?? 0);
+					if (depth !== 0) return depth;
+					const area =
+						left.candidate.width * left.candidate.height - right.candidate.width * right.candidate.height;
+					return area || left.index - right.index;
+				})[0]!,
+		)
+		.sort((left, right) => left.index - right.index)
+		.slice(0, Math.max(0, maxElements))
+		.map((entry) => entry.candidate);
 }
 
 const SENSITIVE_QUERY_PARAMETER =
@@ -66,6 +177,54 @@ function transformHttpUrls(value: string, transform: (url: string) => string): s
 	});
 }
 
+function decodedUrlCredential(value: string): string {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return value;
+	}
+}
+
+function transformedSearchParams(params: URLSearchParams, transform: (secret: string) => string): URLSearchParams {
+	const rewritten = new URLSearchParams();
+	for (const [key, value] of params) {
+		rewritten.append(key, SENSITIVE_QUERY_PARAMETER.test(key) ? transform(value) : value);
+	}
+	return rewritten;
+}
+
+/**
+ * Rewrite credentials through parsed URL components so encoded parameter names
+ * cannot bypass the vault. Hash-router query strings and URL userinfo need
+ * explicit handling because URL.searchParams covers neither.
+ */
+function transformParsedUrlCredentials(input: string, transform: (secret: string) => string): string | undefined {
+	let url: URL;
+	try {
+		url = new URL(input);
+	} catch {
+		return undefined;
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") return input;
+	if (url.username) url.username = transform(decodedUrlCredential(url.username));
+	if (url.password) url.password = transform(decodedUrlCredential(url.password));
+	const query = transformedSearchParams(url.searchParams, transform);
+	url.search = query.size > 0 ? `?${query.toString()}` : "";
+
+	const rawHash = url.hash.slice(1);
+	if (rawHash) {
+		const queryIndex = rawHash.indexOf("?");
+		const hashIsOnlyQuery = queryIndex === -1 && rawHash.includes("=") && !rawHash.includes("/");
+		if (queryIndex >= 0 || hashIsOnlyQuery) {
+			const prefix = queryIndex >= 0 ? rawHash.slice(0, queryIndex + 1) : "";
+			const rawQuery = queryIndex >= 0 ? rawHash.slice(queryIndex + 1) : rawHash;
+			const hashQuery = transformedSearchParams(new URLSearchParams(rawQuery), transform);
+			url.hash = `${prefix}${hashQuery.toString()}`;
+		}
+	}
+	return url.toString();
+}
+
 function rememberBrowserUrlSecret(secret: string): string {
 	if (browserUrlSecretVault.size >= MAX_VAULTED_VALUES) {
 		const oldest = browserUrlSecretVault.keys().next().value as string | undefined;
@@ -82,16 +241,10 @@ function rememberBrowserUrlSecret(secret: string): string {
  */
 export function redactSensitiveUrl(value: string): string {
 	const input = String(value ?? "");
-	try {
-		const url = new URL(input);
-		for (const key of [...url.searchParams.keys()]) {
-			if (SENSITIVE_QUERY_PARAMETER.test(key)) url.searchParams.set(key, "[REDACTED]");
-		}
-		// URLSearchParams 不解析 hash 路由内部的 query；再次扫完整序列化结果。
-		return transformSensitiveParameterValues(url.toString(), () => "[REDACTED]");
-	} catch {
-		return transformSensitiveParameterValues(input, () => "[REDACTED]");
-	}
+	const parsed = transformParsedUrlCredentials(input, () => "[REDACTED]");
+	const redacted = transformSensitiveParameterValues(parsed ?? input, () => "[REDACTED]");
+	// Keep the established human-readable marker in UI text after URL serialization.
+	return redacted.replaceAll("%5BREDACTED%5D", "[REDACTED]");
 }
 
 /** 对工具输出中的每一个 HTTP(S) URL 做同样的脱敏，作为日志边界的兜底。 */
@@ -106,20 +259,17 @@ export function redactSensitiveText(value: string): string {
  */
 export function vaultSensitiveUrlsInText(value: string): string {
 	return transformHttpUrls(String(value ?? ""), (candidate) => {
-		let parsed: URL;
-		try {
-			parsed = new URL(candidate);
-		} catch {
-			return candidate;
-		}
-		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return candidate;
-		return transformSensitiveParameterValues(candidate, rememberBrowserUrlSecret);
+		const vault = (secret: string) =>
+			secret.startsWith(VAULT_REFERENCE_PREFIX) ? secret : rememberBrowserUrlSecret(secret);
+		const parsed = transformParsedUrlCredentials(candidate, vault);
+		return transformSensitiveParameterValues(parsed ?? candidate, vault);
 	});
 }
 
 /** 仅供 browser_navigate 使用：将安全引用还原成用户最初提供的原始 URL。 */
 export function resolveSensitiveBrowserUrl(value: string): string {
-	return transformSensitiveParameterValues(String(value ?? ""), (reference) => {
+	const input = String(value ?? "");
+	const resolveReference = (reference: string) => {
 		let normalizedReference = reference;
 		try {
 			normalizedReference = decodeURIComponent(reference);
@@ -132,13 +282,31 @@ export function resolveSensitiveBrowserUrl(value: string): string {
 			throw new Error("安全网址凭据已过期，请重新粘贴原始链接后再打开");
 		}
 		return secret;
-	});
+	};
+	const parsed = transformParsedUrlCredentials(input, resolveReference);
+	return transformSensitiveParameterValues(parsed ?? input, resolveReference);
 }
 
 export interface AgentBrowserUploadFile {
 	name: string;
 	mimeType: string;
 	dataBase64: string;
+}
+
+/**
+ * Capture the exact HTTP(S) origin before local attachment bytes are read.
+ * The controller compares this lock with its live WebContents URL before any
+ * bytes are injected, closing the state-check/upload redirect race.
+ */
+export function agentBrowserUploadOrigin(value: string): string {
+	try {
+		const url = new URL(String(value ?? "").trim());
+		if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("unsupported protocol");
+		if (url.username || url.password || url.origin === "null") throw new Error("unsafe origin");
+		return url.origin;
+	} catch {
+		throw new Error("附件只能上传到当前已打开的 HTTP(S) 页面");
+	}
 }
 
 export interface AgentBrowserRuntime {
@@ -150,14 +318,20 @@ export interface AgentBrowserRuntime {
 	back(): AgentBrowserState;
 	forward(): AgentBrowserState;
 	reload(): AgentBrowserState;
-	snapshot(maxChars: number): Promise<string>;
+	snapshot(options: AgentBrowserSnapshotOptions): Promise<string>;
 	click(target: AgentBrowserTarget): Promise<string>;
+	hover(target: AgentBrowserTarget): Promise<string>;
 	type(target: AgentBrowserTarget, value: string, pressEnter: boolean, commit: boolean): Promise<string>;
 	scroll(direction: "up" | "down" | "left" | "right", amount: number): Promise<string>;
 	extract(selector: string | undefined, maxChars: number): Promise<string>;
 	screenshot(path: string): Promise<string>;
 	wait(milliseconds: number, text?: string): Promise<string>;
-	uploadFiles(files: AgentBrowserUploadFile[], target?: AgentBrowserTarget): Promise<string>;
+	/** allowedOrigin is mandatory and must have been captured before reading local file bytes. */
+	uploadFiles(
+		files: AgentBrowserUploadFile[],
+		target: AgentBrowserTarget | undefined,
+		allowedOrigin: string,
+	): Promise<string>;
 }
 
 let runtime: AgentBrowserRuntime | null = null;
