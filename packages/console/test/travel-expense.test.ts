@@ -404,8 +404,21 @@ describe("差旅报销能力包", () => {
 				"base64",
 			),
 		);
-		const result = readAndPairRailwayAttachments([screenshot], packWorkspace);
+		let observedTimeoutMs = 0;
+		const result = readAndPairRailwayAttachments([screenshot], packWorkspace, {
+			ocrTravelDocument: (file, timeoutMs) => {
+				observedTimeoutMs = timeoutMs;
+				return {
+					file,
+					text: "",
+					fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+					error: "测试 OCR 未识别到配对标识",
+				};
+			},
+		});
 		expect(result.invoices).toEqual([]);
+		expect(observedTimeoutMs).toBeGreaterThan(0);
+		expect(observedTimeoutMs).toBeLessThanOrEqual(150_000);
 		expect(result.ocrDocuments).toHaveLength(1);
 		expect(result.ocrDocuments[0].file).toBe(screenshot);
 		expect(result.unmatched).toHaveLength(1);
