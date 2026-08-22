@@ -29,7 +29,10 @@ import { extractFileReferences } from "./artifacts.ts";
 import {
 	hasTravelDraftSaveConfirmation,
 	isTravelDraftSaveClick,
+	isTravelDraftWorkflowCompletion,
 	isTravelWorkflowCancellation,
+	routeTravelCapabilityMatches,
+	travelWorkflowPromptToolChoice,
 } from "./capability-workflow.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
@@ -186,6 +189,7 @@ interface ConsoleSession {
 }
 
 const sessions = new Map<string, ConsoleSession>();
+const restoringSessions = new Map<string, Promise<ConsoleSession | null>>();
 
 const SENSITIVE_TOOL_FIELD =
 	/^(?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)$/i;
@@ -213,12 +217,13 @@ function redactToolValue(value: unknown, seen = new WeakMap<object, unknown>()):
 	return copy;
 }
 
-/** 会话当前应生效的工具名单 = 原生/兼容工具 + 本轮命中的最小工具组。 */
+/** 会话当前应生效的工具名单。确定性差旅工作流运行时只暴露它自身，降低弱模型选错工具和 schema token。 */
 function effectiveToolNames(
 	enabledPacks: Set<string>,
 	activePackTools: Map<string, Set<string>>,
 	pinnedPackTools: Map<string, Set<string>> = new Map(),
 ): string[] {
+	if (pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft")) return ["travel_fill_draft"];
 	const names = baseToolNames(enabledPacks);
 	for (const toolNames of [...activePackTools.values(), ...pinnedPackTools.values()]) {
 		for (const toolName of toolNames) {
@@ -253,6 +258,8 @@ interface SessionIndexEntry {
 	sessionFile?: string;
 	/** 会话绑定的助手。旧索引没有该字段时，在恢复时迁移一次。 */
 	enabledPacks?: string[];
+	/** 跨客户端重启保留尚未完成的确定性工作流；完成或取消时立即清除。 */
+	pinnedPackTools?: Record<string, string[]>;
 	title: string;
 	createdAt: number;
 	updatedAt: number;
@@ -278,6 +285,7 @@ function touchSessionIndex(
 	cwd: string,
 	sessionFile: string | undefined,
 	enabledPacks: Iterable<string>,
+	pinnedPackTools?: Map<string, Set<string>>,
 ): void {
 	const index = readSessionIndex();
 	const existing = index[sessionId];
@@ -285,10 +293,22 @@ function touchSessionIndex(
 		cwd,
 		sessionFile: sessionFile ?? existing?.sessionFile,
 		enabledPacks: [...enabledPacks],
+		pinnedPackTools: pinnedPackTools
+			? Object.fromEntries([...pinnedPackTools].map(([pack, tools]) => [pack, [...tools]]))
+			: existing?.pinnedPackTools,
 		title: existing?.title ?? "",
 		createdAt: existing?.createdAt ?? Date.now(),
 		updatedAt: Date.now(),
 	};
+	writeSessionIndex(index);
+}
+
+function persistPinnedPackTools(cs: ConsoleSession): void {
+	const index = readSessionIndex();
+	const entry = index[cs.sessionId];
+	if (!entry) return;
+	entry.pinnedPackTools = Object.fromEntries([...cs.pinnedPackTools].map(([pack, tools]) => [pack, [...tools]]));
+	entry.updatedAt = Date.now();
 	writeSessionIndex(index);
 }
 
@@ -326,6 +346,7 @@ function deactivatePackForAllSessions(packName: string): boolean {
 	const index = readSessionIndex();
 	for (const entry of Object.values(index)) {
 		entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
+		if (entry.pinnedPackTools) delete entry.pinnedPackTools[packName];
 	}
 	writeSessionIndex(index);
 	return changed;
@@ -570,7 +591,7 @@ function historicalCapabilityTrace(
 	timestamp: number,
 	enabledPacks: Set<string>,
 ): CapabilityTrace {
-	const selectedCapabilities = selectCapabilities(text, enabledPacks);
+	const selectedCapabilities = routeTravelCapabilities(selectCapabilities(text, enabledPacks), text);
 	const selectedTools = new Map<string, Set<string>>();
 	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
 	const names = effectiveToolNames(enabledPacks, selectedTools);
@@ -584,18 +605,27 @@ function historicalCapabilityTrace(
 	};
 }
 
+/** 差旅填报只暴露单个确定性业务工具，避免弱模型退回通用网页自由点击。 */
+function routeTravelCapabilities(matches: CapabilityMatch[], text: string, forceWorkflow = false): CapabilityMatch[] {
+	return routeTravelCapabilityMatches(matches, text, forceWorkflow);
+}
+
 function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTrace {
 	cs.activePackTools.clear();
 	const cancelledTravelWorkflow = isTravelWorkflowCancellation(text);
 	if (cancelledTravelWorkflow) releaseTravelWorkflow(cs);
-	const selectedCapabilities = cancelledTravelWorkflow ? [] : selectCapabilities(text, cs.enabledPacks);
+	const workflowPinned = cs.pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft") === true;
+	const selectedCapabilities = cancelledTravelWorkflow
+		? []
+		: routeTravelCapabilities(selectCapabilities(text, cs.enabledPacks), text, workflowPinned);
 	for (const match of selectedCapabilities) {
 		cs.activePackTools.set(match.packName, new Set(match.toolNames));
 	}
-	if (selectedCapabilities.some((match) => match.packName === TRAVEL_EXPENSE_PACK_NAME)) {
-		for (const packName of [TRAVEL_EXPENSE_PACK_NAME, AGENT_BROWSER_PACK_NAME]) {
-			if (cs.enabledPacks.has(packName)) cs.pinnedPackTools.set(packName, new Set(fullPackToolNames(packName)));
-		}
+	const travelMatch = selectedCapabilities.find((match) => match.packName === TRAVEL_EXPENSE_PACK_NAME);
+	if (travelMatch?.toolNames.includes("travel_fill_draft")) {
+		cs.pinnedPackTools.set(TRAVEL_EXPENSE_PACK_NAME, new Set(travelMatch.toolNames));
+		cs.pinnedPackTools.delete(AGENT_BROWSER_PACK_NAME);
+		persistPinnedPackTools(cs);
 	}
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
 	const trace: CapabilityTrace = {
@@ -619,8 +649,11 @@ function releaseTurnCapabilities(cs: ConsoleSession): void {
 function releaseTravelWorkflow(cs: ConsoleSession): void {
 	cs.pinnedPackTools.delete(TRAVEL_EXPENSE_PACK_NAME);
 	cs.pinnedPackTools.delete(AGENT_BROWSER_PACK_NAME);
+	cs.activePackTools.delete(TRAVEL_EXPENSE_PACK_NAME);
+	cs.activePackTools.delete(AGENT_BROWSER_PACK_NAME);
 	cs.pendingDraftSaveCalls.clear();
 	cs.awaitingDraftSaveConfirmation = false;
+	persistPinnedPackTools(cs);
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
 }
 
@@ -651,6 +684,7 @@ async function buildSession(
 	enabledPackNames: Iterable<string>,
 	modelOverride?: SessionModel,
 	sessionFile?: string,
+	restoredPinnedPackTools?: Record<string, string[]>,
 ): Promise<{
 	session: AgentSession;
 	sessionFile: string | undefined;
@@ -668,6 +702,14 @@ async function buildSession(
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
 	const pinnedPackTools = new Map<string, Set<string>>();
+	for (const [packName, names] of Object.entries(restoredPinnedPackTools ?? {})) {
+		// 当前唯一允许跨重启续作的是确定性差旅状态机。不要相信旧/损坏索引里
+		// 任意包名和工具名，否则可能永久恢复通用 browser 写操作。
+		if (packName !== TRAVEL_EXPENSE_PACK_NAME || !enabledPacks.has(packName) || !Array.isArray(names)) continue;
+		if (names.includes("travel_fill_draft") && fullPackToolNames(packName).includes("travel_fill_draft")) {
+			pinnedPackTools.set(packName, new Set(["travel_fill_draft"]));
+		}
+	}
 	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
@@ -739,7 +781,9 @@ function subscribeConsoleSession(cs: ConsoleSession): void {
 		if (ev.type === "tool_execution_end") {
 			const wasDraftClick = cs.pendingDraftSaveCalls.delete(ev.toolCallId);
 			if (wasDraftClick) cs.awaitingDraftSaveConfirmation = !ev.isError;
-			else if (cs.awaitingDraftSaveConfirmation && !ev.isError && hasTravelDraftSaveConfirmation(ev.result)) {
+			else if (!ev.isError && isTravelDraftWorkflowCompletion(ev.toolName, ev.result)) {
+				releaseTravelWorkflow(cs);
+			} else if (cs.awaitingDraftSaveConfirmation && !ev.isError && hasTravelDraftSaveConfirmation(ev.result)) {
 				releaseTravelWorkflow(cs);
 			}
 		}
@@ -776,7 +820,7 @@ async function createConsoleSession(
 		activePrompt: null,
 	};
 	sessions.set(sessionId, cs);
-	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
+	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks, pinnedPackTools);
 	subscribeConsoleSession(cs);
 
 	// 默认模型解析失败时（如未配置任何 Key），通过 SSE 告知前端
@@ -796,7 +840,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
 		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
 		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, pinnedPackTools } =
-			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
+			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile, entry.pinnedPackTools);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -814,7 +858,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			activePrompt: null,
 		};
 		sessions.set(sessionId, cs);
-		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
+		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks, pinnedPackTools);
 		subscribeConsoleSession(cs);
 		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
 		return cs;
@@ -828,7 +872,13 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 async function getOrRestoreSession(sessionId: string): Promise<ConsoleSession | null> {
 	const cs = sessions.get(sessionId);
 	if (cs) return cs;
-	return restoreConsoleSession(sessionId);
+	const existing = restoringSessions.get(sessionId);
+	if (existing) return existing;
+	const pending = restoreConsoleSession(sessionId).finally(() => {
+		if (restoringSessions.get(sessionId) === pending) restoringSessions.delete(sessionId);
+	});
+	restoringSessions.set(sessionId, pending);
+	return pending;
 }
 
 // ---------------------------------------------------------------------------
@@ -973,7 +1023,7 @@ async function buildCapabilityCatalog() {
 				category: "效率工具",
 				formats: ["网页", "网站", "表单", "下载"],
 				installed: isAgentBrowserRuntimeAvailable(),
-				version: "1.0.0",
+				version: browserPack?.version ?? "1.0.0",
 				installPath: "Pi 控制台内置",
 				platform: `${process.platform}-${process.arch}`,
 				iconText: "网",
@@ -2092,6 +2142,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
+			const promptToolChoice = travelWorkflowPromptToolChoice(
+				cs.session.model?.api,
+				cs.session.getActiveToolNames(),
+			);
 			if (cs.enabledPacks.size > 0) {
 				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			}
@@ -2107,7 +2161,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			});
 			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve() };
 			activePrompt.done = cs.session
-				.prompt(promptText, { images, preflightResult: resolvePreflight })
+				.prompt(promptText, { images, preflightResult: resolvePreflight, ...promptToolChoice })
 				.catch((error) => {
 					releaseTurnCapabilities(cs);
 					bufferAndBroadcast(cs, {

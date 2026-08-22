@@ -2,7 +2,7 @@
 	"name": "agent-browser",
 	"displayName": "客户端浏览器",
 	"description": "在 Pi 客户端内使用独立浏览器访问、读取和操作网页",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"activation": {
 		"extensions": [
 			".zip",
@@ -128,6 +128,7 @@
 			"description": "点击、输入、滚动并等待页面响应",
 			"tools": [
 				"browser_snapshot",
+				"browser_hover",
 				"browser_click",
 				"browser_type",
 				"browser_scroll",
@@ -137,6 +138,8 @@
 				"browser_upload"
 			],
 			"keywords": [
+				"悬浮",
+				"鼠标悬停",
 				"点击",
 				"输入",
 				"填写",

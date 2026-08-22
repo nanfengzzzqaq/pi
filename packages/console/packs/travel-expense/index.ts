@@ -2,28 +2,64 @@
  * “差旅报销”能力包。
  *
  * 易快报（合思）差旅费用报销单的自动填报助手：提供报销规则速查、费用明细
- * 计划与铁路电子客票（OFD/压缩包）解析工具；页面操作复用客户端内置浏览器
- * （browser_* 工具），本包不直接接触页面。
+ * 计划与铁路电子客票（PDF/OFD/压缩包）、查验 PDF/图片配对，以及由固定状态机
+ * 驱动客户端内置浏览器完成草稿填报。
  */
 import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+	constants as fsConstants,
+	closeSync,
+	copyFileSync,
+	existsSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	openSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { redactSensitiveText } from "../../src/agent-browser-runtime.ts";
 import type { PackContext } from "../../src/packs.ts";
+import {
+	extractRailwayEmbeddedXml,
+	matchVerificationFiles,
+	parseVerificationFingerprint,
+	resolveLodgingInvoiceCandidate,
+	type LodgingInvoiceResolution,
+	type TravelOcrDocument,
+	type VerificationCandidate,
+} from "./pdf-embedded.ts";
+import { TravelDraftBrowserDriver, type TravelDraftBrowserDriverOptions } from "./workflow-browser-driver.ts";
+import {
+	runTravelDraft,
+	TRAVEL_DRAFT_CURRENT_USER,
+	travelDraftSaveIdentity,
+	type TravelDraftIssue,
+	type TravelDraftPlan,
+	type TravelDraftRunResult,
+} from "./workflow.ts";
+export type { LodgingInvoiceCandidate, LodgingInvoiceResolution, TravelOcrDocument } from "./pdf-embedded.ts";
 
 function textResult(text: string, details: Record<string, unknown> = {}): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details };
+	return { content: [{ type: "text", text: redactSensitiveText(text) }], details };
 }
 
 // ---------------------------------------------------------------------------
 // 铁路电子客票（OFD）解析：OFD 本质是 zip，解包后读 Content.xml 里的文本
 // ---------------------------------------------------------------------------
 
-interface RailwayInvoice {
+export interface RailwayInvoice {
 	source: string;
 	uploadFile: string;
 	trainNumber?: string;
@@ -38,13 +74,39 @@ interface RailwayInvoice {
 	passenger?: string;
 	invoiceNumber?: string;
 	issueDate?: string;
+	verificationFiles?: string[];
+	verificationStatus?: "ready" | "missing";
 	error?: string;
 }
+
+export interface InvoiceAttachmentResult {
+	invoices: RailwayInvoice[];
+	pairingStatus: "ready" | "missing" | "ambiguous";
+	lodging: LodgingInvoiceResolution;
+	/** Bounded OCR text for deterministic callers such as travel_fill_draft. */
+	ocrDocuments: TravelOcrDocument[];
+	missing: Array<{ invoiceIndex: number; invoiceNumber?: string; source: string }>;
+	ambiguous: Array<{ file: string; candidateInvoiceIndexes: number[]; candidateInvoiceNumbers: string[]; signals: string[] }>;
+	unmatched: Array<{ file: string; reason: string }>;
+}
+
+const MAX_OCR_DOCUMENT_BYTES = 20 * 1024 * 1024;
+const MAX_TICKET_PDF_BYTES = 32 * 1024 * 1024;
+const OCR_TIMEOUT_MS = 45_000;
+const OCR_MAX_PAGES = 4;
+const MAX_TRAVEL_INPUT_FILES = 20;
+const MAX_TRAVEL_INPUT_BYTES = 50 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES = 200;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
+const MAX_ARCHIVE_DEPTH = 8;
+const MAX_OCR_DOCUMENTS = 8;
+const MAX_OCR_WALL_MS = 150_000;
 
 interface ExtractedDocument {
 	source: string;
 	root: string;
 	attachment?: string;
+	error?: string;
 }
 
 function systemTarExecutable(): string {
@@ -52,15 +114,151 @@ function systemTarExecutable(): string {
 	return root ? join(root, "System32", "tar.exe") : "tar";
 }
 
-/** 递归列出目录下全部文件。 */
-function listFilesRecursive(root: string): string[] {
+/** 递归列出受限解包目录；拒绝符号链接、深层目录和超大解压结果。 */
+function listFilesRecursive(root: string, current = root, depth = 0, state = { entries: 0, bytes: 0 }): string[] {
+	if (depth > MAX_ARCHIVE_DEPTH) throw new Error(`压缩包目录深度超过 ${MAX_ARCHIVE_DEPTH} 层安全上限`);
 	const output: string[] = [];
-	for (const entry of readdirSync(root, { withFileTypes: true })) {
-		const full = join(root, entry.name);
-		if (entry.isDirectory()) output.push(...listFilesRecursive(full));
-		else output.push(full);
+	for (const entry of readdirSync(current, { withFileTypes: true })) {
+		state.entries += 1;
+		if (state.entries > MAX_ARCHIVE_ENTRIES) throw new Error(`压缩包条目超过 ${MAX_ARCHIVE_ENTRIES} 个安全上限`);
+		const full = join(current, entry.name);
+		const stats = lstatSync(full);
+		if (stats.isSymbolicLink()) throw new Error("压缩包包含符号链接，已拒绝解包");
+		if (stats.isDirectory()) output.push(...listFilesRecursive(root, full, depth + 1, state));
+		else if (stats.isFile()) {
+			state.bytes += stats.size;
+			if (state.bytes > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
+				throw new Error(`压缩包解压后超过 ${MAX_ARCHIVE_UNCOMPRESSED_BYTES / 1024 / 1024}MB 安全上限`);
+			}
+			output.push(full);
+		} else {
+			throw new Error("压缩包包含不支持的特殊文件");
+		}
 	}
 	return output;
+}
+
+interface ZipArchiveSummary {
+	entries: number;
+	uncompressedBytes: number;
+}
+
+interface ExtractionBudget {
+	entries: number;
+	bytes: number;
+}
+
+function assertSafeArchivePath(rawName: string): void {
+	const normalized = rawName.replaceAll("\\", "/");
+	const parts = normalized.split("/");
+	const pathParts = normalized.endsWith("/") ? parts.slice(0, -1) : parts;
+	if (!normalized || normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.includes("\0")) {
+		throw new Error(`压缩包包含不安全路径：${rawName.slice(0, 120)}`);
+	}
+	if (pathParts.length === 0 || pathParts.length > MAX_ARCHIVE_DEPTH + 1) {
+		throw new Error(`压缩包路径深度超过 ${MAX_ARCHIVE_DEPTH} 层安全上限`);
+	}
+	for (const component of pathParts) {
+		const trimmed = component.replace(/[ .]+$/g, "");
+		const base = trimmed.split(".")[0]?.toLocaleUpperCase("en-US") ?? "";
+		if (
+			!component ||
+			component === "." ||
+			component === ".." ||
+			trimmed !== component ||
+			component.includes(":") ||
+			/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/.test(base)
+		) {
+			throw new Error(`压缩包包含 Windows 不安全路径：${rawName.slice(0, 120)}`);
+		}
+	}
+}
+
+/** Read ZIP central-directory metadata before extraction to reject traversal and bombs. */
+function inspectZipArchive(file: string): ZipArchiveSummary {
+	const data = readFileSync(file);
+	const minimum = Math.max(0, data.length - 65_557);
+	let eocd = -1;
+	for (let offset = data.length - 22; offset >= minimum; offset--) {
+		if (
+			data.readUInt32LE(offset) === 0x06054b50 &&
+			offset + 22 <= data.length &&
+			offset + 22 + data.readUInt16LE(offset + 20) === data.length
+		) {
+			eocd = offset;
+			break;
+		}
+	}
+	if (eocd < 0) throw new Error("压缩包缺少有效 ZIP 中央目录");
+	const diskNumber = data.readUInt16LE(eocd + 4);
+	const directoryDisk = data.readUInt16LE(eocd + 6);
+	const diskEntries = data.readUInt16LE(eocd + 8);
+	const entries = data.readUInt16LE(eocd + 10);
+	const directorySize = data.readUInt32LE(eocd + 12);
+	const directoryOffset = data.readUInt32LE(eocd + 16);
+	const commentLength = data.readUInt16LE(eocd + 20);
+	if (diskNumber !== 0 || directoryDisk !== 0 || diskEntries !== entries) {
+		throw new Error("不支持跨卷 ZIP 压缩包");
+	}
+	if (eocd + 22 + commentLength !== data.length) throw new Error("ZIP 末尾边界或注释长度无效");
+	if (entries === 0xffff || directorySize === 0xffffffff || directoryOffset === 0xffffffff) {
+		throw new Error("不支持 ZIP64 压缩包；请拆分为普通 PDF/OFD 附件");
+	}
+	if (entries === 0 || entries > MAX_ARCHIVE_ENTRIES) {
+		throw new Error(`压缩包条目数 ${entries} 超出 1-${MAX_ARCHIVE_ENTRIES} 安全范围`);
+	}
+	if (directoryOffset + directorySize !== eocd || directoryOffset < 0) throw new Error("ZIP 中央目录边界无效");
+	let offset = directoryOffset;
+	let uncompressedBytes = 0;
+	const paths = new Set<string>();
+	for (let index = 0; index < entries; index++) {
+		if (offset + 46 > data.length || data.readUInt32LE(offset) !== 0x02014b50) {
+			throw new Error("ZIP 中央目录条目损坏");
+		}
+		const flags = data.readUInt16LE(offset + 8);
+		const compressionMethod = data.readUInt16LE(offset + 10);
+		const compressedSize = data.readUInt32LE(offset + 20);
+		const size = data.readUInt32LE(offset + 24);
+		const nameLength = data.readUInt16LE(offset + 28);
+		const extraLength = data.readUInt16LE(offset + 30);
+		const commentLength = data.readUInt16LE(offset + 32);
+		const externalAttributes = data.readUInt32LE(offset + 38);
+		const localHeaderOffset = data.readUInt32LE(offset + 42);
+		const end = offset + 46 + nameLength + extraLength + commentLength;
+		if (end > data.length) throw new Error("ZIP 中央目录文件名边界无效");
+		if ((flags & 0x0001) !== 0) throw new Error("不支持加密 ZIP 压缩包");
+		if (compressionMethod !== 0 && compressionMethod !== 8) throw new Error(`不支持 ZIP 压缩算法 ${compressionMethod}`);
+		const encoding = (flags & 0x0800) !== 0 ? "utf8" : "latin1";
+		const centralNameBytes = data.subarray(offset + 46, offset + 46 + nameLength);
+		const rawName = centralNameBytes.toString(encoding);
+		assertSafeArchivePath(rawName);
+		const normalizedIdentity = rawName.replaceAll("\\", "/").toLocaleLowerCase("en-US");
+		if (paths.has(normalizedIdentity)) throw new Error(`压缩包包含重复路径：${rawName.slice(0, 120)}`);
+		paths.add(normalizedIdentity);
+		if (localHeaderOffset + 30 > directoryOffset || data.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+			throw new Error(`ZIP 本地文件头无效：${rawName.slice(0, 120)}`);
+		}
+		const localNameLength = data.readUInt16LE(localHeaderOffset + 26);
+		const localExtraLength = data.readUInt16LE(localHeaderOffset + 28);
+		const localNameEnd = localHeaderOffset + 30 + localNameLength;
+		if (localNameEnd + localExtraLength > directoryOffset) throw new Error("ZIP 本地文件头边界无效");
+		if (data.readUInt16LE(localHeaderOffset + 6) !== flags || data.readUInt16LE(localHeaderOffset + 8) !== compressionMethod) {
+			throw new Error("ZIP 中央目录与本地文件头参数不一致");
+		}
+		const localNameBytes = data.subarray(localHeaderOffset + 30, localNameEnd);
+		if (!localNameBytes.equals(centralNameBytes)) throw new Error("ZIP 中央目录与本地文件名不一致");
+		const compressedDataStart = localNameEnd + localExtraLength;
+		if (compressedDataStart + compressedSize > directoryOffset) throw new Error("ZIP 压缩数据边界无效");
+		const unixType = (externalAttributes >>> 16) & 0xf000;
+		if (unixType === 0xa000) throw new Error("压缩包包含符号链接，已拒绝解包");
+		uncompressedBytes += size;
+		if (uncompressedBytes > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
+			throw new Error(`压缩包解压后超过 ${MAX_ARCHIVE_UNCOMPRESSED_BYTES / 1024 / 1024}MB 安全上限`);
+		}
+		offset = end;
+	}
+	if (offset !== eocd) throw new Error("ZIP 中央目录长度与条目不一致");
+	return { entries, uncompressedBytes };
 }
 
 /**
@@ -124,10 +322,22 @@ function decodeXml(value: string): string {
 		.trim();
 }
 
-function xmlLocalValue(xml: string, localName: string): string | undefined {
+function xmlLocalValues(xml: string, localName: string): string[] {
 	const escaped = localName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const match = new RegExp(`<(?:[\\w.-]+:)?${escaped}\\b[^>]*>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?${escaped}>`, "i").exec(xml);
-	return match ? decodeXml(match[1].replace(/<[^>]+>/g, "")) : undefined;
+	const expression = new RegExp(
+		`<(?:[\\w.-]+:)?${escaped}\\b[^>]*>([\\s\\S]*?)<\\/(?:[\\w.-]+:)?${escaped}>`,
+		"gi",
+	);
+	const values = [...xml.matchAll(expression)]
+		.map((match) => decodeXml(match[1].replace(/<[^>]+>/g, "")))
+		.filter(Boolean);
+	return [...new Set(values)];
+}
+
+function uniqueXmlLocalValue(xml: string, localNames: string[], label: string): string | undefined {
+	const values = [...new Set(localNames.flatMap((localName) => xmlLocalValues(xml, localName)))];
+	if (values.length > 1) throw new Error(`铁路票据 XBRL 字段“${label}”存在多个冲突值，已拒绝自动选取`);
+	return values[0];
 }
 
 const STATION_CITY_ALIASES: Record<string, string> = {
@@ -155,22 +365,24 @@ function stationToCity(station: string | undefined): string | undefined {
 }
 
 function parseRailwayXbrl(xml: string): Partial<RailwayInvoice> {
-	const fare = xmlLocalValue(xml, "Fare");
-	const rawDate = xmlLocalValue(xml, "TravelDate");
-	const rawIssueDate = xmlLocalValue(xml, "DateOfIssue");
+	const value = (localName: string, label: string) => uniqueXmlLocalValue(xml, [localName], label);
+	const fare = value("Fare", "票价");
+	const rawDate = value("TravelDate", "乘车日期");
+	const rawIssueDate = value("DateOfIssue", "开票日期");
 	return {
-		fromStation: xmlLocalValue(xml, "DepartureStation"),
-		toStation: xmlLocalValue(xml, "DestinationStation"),
-		trainNumber: xmlLocalValue(xml, "TrainNumber"),
+		fromStation: value("DepartureStation", "出发站"),
+		toStation: value("DestinationStation", "到达站"),
+		trainNumber: value("TrainNumber", "车次"),
 		date: rawDate ? normalizeDate(rawDate) : undefined,
-		departTime: xmlLocalValue(xml, "DepartureTime")?.match(/\d{1,2}:\d{2}/)?.[0],
-		seatClass: xmlLocalValue(xml, "SeatLevel"),
+		departTime: value("DepartureTime", "出发时间")?.match(/\d{1,2}:\d{2}/)?.[0],
+		seatClass: value("SeatLevel", "席别"),
 		amount: fare && Number.isFinite(Number(fare.replace(/[^\d.]/g, ""))) ? Number(fare.replace(/[^\d.]/g, "")) : undefined,
-		passenger: xmlLocalValue(xml, "Name"),
-		invoiceNumber:
-			xmlLocalValue(xml, "InvoiceNumber") ??
-			xmlLocalValue(xml, "ElectronicTicketNumber") ??
-			xmlLocalValue(xml, "TicketNumber"),
+		passenger: value("Name", "乘车人"),
+		invoiceNumber: uniqueXmlLocalValue(
+			xml,
+			["InvoiceNumber", "ElectronicInvoiceRailwayETicketNumber", "ElectronicTicketNumber", "TicketNumber"],
+			"票号",
+		),
 		issueDate: rawIssueDate ? normalizeDate(rawIssueDate) : undefined,
 	};
 }
@@ -232,11 +444,40 @@ function parseRailwayText(text: string): Partial<RailwayInvoice> {
 	return result;
 }
 
-function unpackArchive(file: string, destination: string): string | undefined {
+function unpackArchive(file: string, destination: string, budget: ExtractionBudget): string | undefined {
+	let reserved: ZipArchiveSummary | undefined;
+	let chargedEntries = 0;
+	let chargedBytes = 0;
 	try {
+		reserved = inspectZipArchive(file);
+		if (budget.entries + reserved.entries > MAX_ARCHIVE_ENTRIES) {
+			throw new Error(`本批压缩包累计条目超过 ${MAX_ARCHIVE_ENTRIES} 个安全上限`);
+		}
+		if (budget.bytes + reserved.uncompressedBytes > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
+			throw new Error(`本批压缩包累计解压量超过 ${MAX_ARCHIVE_UNCOMPRESSED_BYTES / 1024 / 1024}MB 安全上限`);
+		}
+		budget.entries += reserved.entries;
+		budget.bytes += reserved.uncompressedBytes;
+		chargedEntries = reserved.entries;
+		chargedBytes = reserved.uncompressedBytes;
 		execFileSync(systemTarExecutable(), ["-xf", file, "-C", destination], { windowsHide: true, timeout: 15000 });
+		const actual = { entries: 0, bytes: 0 };
+		listFilesRecursive(destination, destination, 0, actual);
+		const extraEntries = Math.max(0, actual.entries - reserved.entries);
+		const extraBytes = Math.max(0, actual.bytes - reserved.uncompressedBytes);
+		if (budget.entries + extraEntries > MAX_ARCHIVE_ENTRIES || budget.bytes + extraBytes > MAX_ARCHIVE_UNCOMPRESSED_BYTES) {
+			throw new Error("压缩包实际解压结果超过本批共享安全预算");
+		}
+		budget.entries += extraEntries;
+		budget.bytes += extraBytes;
+		chargedEntries += extraEntries;
+		chargedBytes += extraBytes;
 		return undefined;
 	} catch (error) {
+		budget.entries -= chargedEntries;
+		budget.bytes -= chargedBytes;
+		rmSync(destination, { recursive: true, force: true });
+		mkdirSync(destination, { recursive: true });
 		return error instanceof Error ? error.message : String(error);
 	}
 }
@@ -245,40 +486,73 @@ function fileDigest(file: string): string {
 	return createHash("sha256").update(readFileSync(file)).digest("hex");
 }
 
-function safeAttachmentStem(value: string): string {
-	const cleaned = value.replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "");
-	return cleaned || "railway-ticket";
-}
-
 /**
- * 把解压目录里的票据复制到工作区的持久目录。每次解析都创建独立文件并校验内容，
- * 避免旧文件或同名往返票互相覆盖；失败必须显式报错，绝不回退上传整个压缩包。
+ * 把解压目录里的票据复制到工作区的持久目录。文件名同时包含票号与内容摘要：
+ * 同一附件重试时复用稳定路径，不同内容即使同名也绝不会互相覆盖。
  */
-function durableAttachment(workspaceRoot: string, picked: string | undefined, identity: string): string {
+export function durableAttachment(workspaceRoot: string, picked: string | undefined, identity: string): string {
 	if (!picked) throw new Error("没有找到可上传的铁路电子客票附件");
 	if (!existsSync(picked) || !statSync(picked).isFile()) throw new Error(`票据附件不存在：${picked}`);
-	const extension = /\.pdf$/i.test(picked) ? ".pdf" : ".ofd";
-	const stem = safeAttachmentStem(identity || basename(picked).replace(/\.(?:pdf|ofd)$/i, ""));
+	const pickedExtension = extname(picked).toLocaleLowerCase("en-US");
+	const extension = [".pdf", ".ofd", ".png", ".jpg", ".jpeg"].includes(pickedExtension) ? pickedExtension : ".bin";
+	// 智能识票明确要求文件名为不超过 20 个字符的字母/数字；票号仍保留在结构化计划中，
+	// 上传显示名只使用稳定内容摘要，避免中文名、长票号或 UUID 导致无法预览。
+	void identity;
 	const durableDir = join(workspaceRoot, ".pi", "travel-expense", "attachments");
 	mkdirSync(durableDir, { recursive: true });
-	const durable = join(durableDir, `${stem}-${randomUUID()}${extension}`);
+	const sourceDigest = fileDigest(picked);
+	const durable = join(durableDir, `T${sourceDigest.slice(0, 12)}${extension}`);
+	const matchesSource = () =>
+		existsSync(durable) &&
+		lstatSync(durable).isFile() &&
+		statSync(durable).size === statSync(picked).size &&
+		fileDigest(durable) === sourceDigest;
+	if (existsSync(durable)) {
+		if (matchesSource()) return durable;
+		throw new Error("票据附件持久化失败：短摘要目标已存在但完整内容不同，已拒绝覆盖");
+	}
+	let created = false;
 	try {
-		copyFileSync(picked, durable);
-		if (!existsSync(durable) || statSync(durable).size !== statSync(picked).size || fileDigest(durable) !== fileDigest(picked)) {
+		copyFileSync(picked, durable, fsConstants.COPYFILE_EXCL);
+		created = true;
+		if (!existsSync(durable) || statSync(durable).size !== statSync(picked).size || fileDigest(durable) !== sourceDigest) {
 			throw new Error("复制后的文件内容校验失败");
 		}
 		return durable;
 	} catch (error) {
-		rmSync(durable, { force: true });
+		if (created) rmSync(durable, { force: true });
+		else if (matchesSource()) return durable;
 		const reason = error instanceof Error ? error.message : String(error);
 		throw new Error(`票据附件持久化失败：${reason}`);
 	}
 }
 
 function parseExtractedDocument(document: ExtractedDocument, requested: string, workspaceRoot: string): RailwayInvoice {
+	if (document.error) {
+		return { source: `${requested}#${document.source}`, uploadFile: document.attachment ?? "", error: document.error };
+	}
 	const files = listFilesRecursive(document.root);
-	const xbrlFile = files.find((path) => /[\\/]Doc_0[\\/]Attachs[\\/]rai_issuer_[^\\/]+\.xml$/i.test(path));
-	const xbrl = xbrlFile ? parseRailwayXbrl(readFileSync(xbrlFile, "utf8")) : {};
+	const xbrlFiles = files.filter((path) => /[\\/]Doc_0[\\/]Attachs[\\/]rai_issuer_[^\\/]+\.xml$/i.test(path));
+	if (xbrlFiles.length > 1) {
+		return {
+			source: `${requested}#${document.source}`,
+			uploadFile: document.attachment ?? "",
+			error: `OFD 内含 ${xbrlFiles.length} 份铁路票据 XBRL，无法确定该 OFD 应绑定哪一程`,
+		};
+	}
+	const xbrlFile = xbrlFiles[0];
+	let xbrl: Partial<RailwayInvoice> = {};
+	if (xbrlFile) {
+		try {
+			xbrl = parseRailwayXbrl(readFileSync(xbrlFile, "utf8"));
+		} catch (error) {
+			return {
+				source: `${requested}#${document.source}`,
+				uploadFile: document.attachment ?? "",
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
 	const content = files
 		.filter((path) => /content\.xml$/i.test(path))
 		.map((path) => ofdXmlText(readFileSync(path, "utf8")))
@@ -316,24 +590,38 @@ function parseExtractedDocument(document: ExtractedDocument, requested: string, 
 	};
 }
 
-/** 解析一个输入文件中的全部票据；每个 OFD 独立解析，严禁跨票拼接 XML。 */
-function readRailwayInvoices(requested: string, workspaceRoot: string): RailwayInvoice[] {
+interface RailwayArchiveResult {
+	invoices: RailwayInvoice[];
+	ocrDocuments: TravelOcrDocument[];
+}
+
+/** 解析压缩输入中的 OFD、铁路电子客票 PDF 和待 OCR 查验/住宿附件。 */
+function readRailwayInvoices(
+	requested: string,
+	workspaceRoot: string,
+	extractionBudget: ExtractionBudget,
+	readOcrDocument: (file: string) => TravelOcrDocument,
+): RailwayArchiveResult {
 	const file = isAbsolute(requested) ? resolve(requested) : resolve(workspaceRoot, requested);
 	if (!existsSync(file) || !statSync(file).isFile()) {
-		return [{ source: requested, uploadFile: file, error: "文件不存在" }];
+		return { invoices: [{ source: requested, uploadFile: file, error: "文件不存在" }], ocrDocuments: [] };
 	}
 	const lower = file.toLocaleLowerCase("en-US");
 	if (!lower.endsWith(".ofd") && !lower.endsWith(".zip")) {
-		return [{
-			source: requested,
-			uploadFile: file,
-			error: "只支持 .ofd 或含 ofd/pdf 的 .zip 压缩包；扫描件 PDF 请让用户改发电子发票（OFD）",
-		}];
+		return {
+			invoices: [{ source: requested, uploadFile: file, error: "只支持 .ofd 或含 OFD/PDF 的 .zip 压缩包" }],
+			ocrDocuments: [],
+		};
 	}
 	const workDir = mkdtempSync(join(tmpdir(), "pi-invoice-"));
 	try {
-		const unpackError = unpackArchive(file, workDir);
-		if (unpackError) return [{ source: requested, uploadFile: file, error: `解压失败：${unpackError}` }];
+		const unpackError = unpackArchive(file, workDir, extractionBudget);
+		if (unpackError) {
+			return {
+				invoices: [{ source: requested, uploadFile: file, error: `解压失败：${unpackError}` }],
+				ocrDocuments: [],
+			};
+		}
 		const outerFiles = listFilesRecursive(workDir).sort((a, b) => a.localeCompare(b, "en"));
 		const nestedOfds = outerFiles.filter((path) => /\.ofd$/i.test(path));
 		const documents: ExtractedDocument[] = [];
@@ -342,9 +630,9 @@ function readRailwayInvoices(requested: string, workspaceRoot: string): RailwayI
 			for (const [index, ofd] of nestedOfds.entries()) {
 				const inner = join(workDir, `ofd-inner-${index}`);
 				mkdirSync(inner, { recursive: true });
-				const error = unpackArchive(ofd, inner);
+				const error = unpackArchive(ofd, inner, extractionBudget);
 				if (error) {
-					documents.push({ source: relative(workDir, ofd), root: inner, attachment: ofd });
+					documents.push({ source: relative(workDir, ofd), root: inner, attachment: ofd, error: `解压失败：${error}` });
 					continue;
 				}
 				const stem = basename(ofd).replace(/\.ofd$/i, "");
@@ -362,22 +650,410 @@ function readRailwayInvoices(requested: string, workspaceRoot: string): RailwayI
 				usedAttachments.add(resolve(attachment).toLocaleLowerCase("en-US"));
 				documents.push({ source: relative(workDir, ofd), root: inner, attachment });
 			}
-		} else {
+		} else if (
+			lower.endsWith(".ofd") ||
+			outerFiles.some((path) =>
+				/[\\/]Doc_0[\\/](?:Attachs[\\/]rai_issuer_[^\\/]+\.xml|Pages[\\/].*[\\/]Content\.xml)$/i.test(path),
+			)
+		) {
 			documents.push({ source: basename(file), root: workDir, attachment: file });
 		}
 		const invoices = documents.map((document) => parseExtractedDocument(document, requested, workspaceRoot));
-		if (invoices.every((invoice) => invoice.error)) {
-			if (invoices.some((invoice) => invoice.error?.includes("票据附件"))) return invoices;
-			return [{
-				source: requested,
-				uploadFile: file,
-				error: "压缩包里没有可解析的铁路电子客票；请提供原始 OFD 或含 OFD 的压缩包，不要只发截图",
-			}];
+		const ocrDocuments: TravelOcrDocument[] = [];
+		const remainingPdfs = outerFiles.filter(
+			(path) => /\.pdf$/i.test(path) && !usedAttachments.has(resolve(path).toLocaleLowerCase("en-US")),
+		);
+		for (const pdf of remainingPdfs) {
+			const archiveSource = `${requested}#${relative(workDir, pdf).replaceAll("\\", "/")}`;
+			try {
+				const pdfInvoices = readRailwayPdfFile(pdf, archiveSource, workspaceRoot);
+				if (pdfInvoices) {
+					invoices.push(...pdfInvoices);
+					continue;
+				}
+				try {
+					const durable = durableAttachment(workspaceRoot, pdf, basename(pdf, ".pdf"));
+					ocrDocuments.push(readOcrDocument(durable));
+				} catch (error) {
+					ocrDocuments.push({
+						file: archiveSource,
+						text: "",
+						fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			} catch (error) {
+				invoices.push({
+					source: archiveSource,
+					uploadFile: pdf,
+					error: `PDF 票据解析失败：${error instanceof Error ? error.message : String(error)}`,
+				});
+			}
 		}
-		return invoices;
+		if (invoices.length === 0 && ocrDocuments.length === 0) {
+			invoices.push({ source: requested, uploadFile: file, error: "压缩包里没有可解析的 OFD 或 PDF 差旅附件" });
+		}
+		return { invoices, ocrDocuments };
 	} finally {
 		rmSync(workDir, { recursive: true, force: true });
 	}
+}
+
+function resolveAttachmentPath(requested: string, workspaceRoot: string): string {
+	return isAbsolute(requested) ? resolve(requested) : resolve(workspaceRoot, requested);
+}
+
+/** Parse the authoritative rai_issuer XBRL embedded in a railway e-ticket PDF. */
+function readRailwayPdfFile(file: string, source: string, workspaceRoot: string): RailwayInvoice[] | undefined {
+	const size = statSync(file).size;
+	if (size > MAX_TICKET_PDF_BYTES) {
+		throw new Error(`电子客票 PDF 超过 ${MAX_TICKET_PDF_BYTES / 1024 / 1024}MB 安全上限`);
+	}
+	const embedded = extractRailwayEmbeddedXml(readFileSync(file), { maxPdfBytes: MAX_TICKET_PDF_BYTES });
+	if (embedded.length === 0) return undefined;
+	if (embedded.length > 1) {
+		return [{
+			source,
+			uploadFile: file,
+			error: `PDF 内含 ${embedded.length} 份铁路票据 XBRL，无法确定该 PDF 应绑定哪一程；请分别提供单张电子客票 PDF`,
+		}];
+	}
+	const item = embedded[0];
+	const parsed = parseRailwayXbrl(item.xml);
+	const fromStation = parsed.fromStation;
+	const toStation = parsed.toStation;
+	let uploadFile = "";
+	try {
+		uploadFile = durableAttachment(workspaceRoot, file, parsed.invoiceNumber ?? basename(file, ".pdf"));
+	} catch (error) {
+		return [{
+			source: `${source}#${item.name}`,
+			uploadFile,
+			...parsed,
+			fromStation,
+			toStation,
+			fromCity: stationToCity(fromStation),
+			toCity: stationToCity(toStation),
+			error: error instanceof Error ? error.message : String(error),
+		}];
+	}
+	return [{
+		source: `${source}#${item.name}`,
+		uploadFile,
+		...parsed,
+		fromStation,
+		toStation,
+		fromCity: stationToCity(fromStation),
+		toCity: stationToCity(toStation),
+	}];
+}
+
+function readRailwayPdf(requested: string, workspaceRoot: string): RailwayInvoice[] | undefined {
+	return readRailwayPdfFile(resolveAttachmentPath(requested, workspaceRoot), requested, workspaceRoot);
+}
+
+interface OcrScriptOutput {
+	ok: boolean;
+	pageCount?: number;
+	processedPages?: number;
+	truncated?: boolean;
+	text?: string;
+	error?: string;
+}
+
+function parseOcrScriptOutput(value: string): OcrScriptOutput | undefined {
+	const lines = value.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+	for (let index = lines.length - 1; index >= 0; index--) {
+		try {
+			const parsed = JSON.parse(lines[index]) as OcrScriptOutput;
+			if (typeof parsed.ok === "boolean") return parsed;
+		} catch {
+			// PowerShell may emit a localized prelude; only the final JSON object is authoritative.
+		}
+	}
+	return undefined;
+}
+
+/** External PowerShell cannot read Electron's virtual app.asar path. */
+export function travelExpenseResourceCandidates(
+	moduleFile = fileURLToPath(import.meta.url),
+	resourceName = "pdf-ocr.ps1",
+): string[] {
+	const direct = join(dirname(moduleFile), resourceName);
+	const unpacked = direct.replace(/([\\/])app\.asar([\\/])/i, "$1app.asar.unpacked$2");
+	return unpacked !== direct ? [unpacked, direct] : [direct];
+}
+
+function travelExpenseResourcePath(resourceName: string): string {
+	const candidates = travelExpenseResourceCandidates(fileURLToPath(import.meta.url), resourceName);
+	const resource = candidates.find((candidate) => existsSync(candidate));
+	if (!resource) throw new Error(`安装包缺少差旅资源：${resourceName}`);
+	return resource;
+}
+
+/** Windows-only bounded OCR for scanned verification PDFs and screenshots. */
+export function ocrTravelDocument(file: string, timeoutMs = OCR_TIMEOUT_MS): TravelOcrDocument {
+	const empty = { invoiceNumbers: [], trainNumbers: [], amounts: [] };
+	if (process.platform !== "win32") {
+		return { file, text: "", fingerprint: empty, error: "扫描 PDF/图片需要 Windows OCR；当前平台无法识别" };
+	}
+	if (!/\.(?:pdf|png|jpe?g)$/i.test(file)) {
+		return { file, text: "", fingerprint: empty, error: "OCR 只支持 PDF、PNG 或 JPEG" };
+	}
+	const size = statSync(file).size;
+	if (size > MAX_OCR_DOCUMENT_BYTES) {
+		return {
+			file,
+			text: "",
+			fingerprint: empty,
+			error: `扫描 PDF/图片超过 ${MAX_OCR_DOCUMENT_BYTES / 1024 / 1024}MB 安全上限`,
+		};
+	}
+	const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+	const bundled = systemRoot ? join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe") : "";
+	const executable = bundled && existsSync(bundled) ? bundled : "powershell.exe";
+	const script = travelExpenseResourcePath("pdf-ocr.ps1");
+	try {
+		const output = execFileSync(
+			executable,
+			[
+				"-NoLogo",
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy",
+				"Bypass",
+				"-File",
+				script,
+				"-Path",
+				file,
+				"-MaxPages",
+				String(OCR_MAX_PAGES),
+				"-MaxDimension",
+				"2200",
+			],
+			{
+				encoding: "utf8",
+				shell: false,
+				windowsHide: true,
+				timeout: Math.max(1_000, Math.min(OCR_TIMEOUT_MS, Math.floor(timeoutMs))),
+				maxBuffer: 512 * 1024,
+			},
+		);
+		const parsed = parseOcrScriptOutput(output);
+		if (!parsed?.ok) {
+			return { file, text: "", fingerprint: empty, error: `Windows OCR 失败：${parsed?.error ?? "没有返回结果"}` };
+		}
+		const text = (parsed.text ?? "").slice(0, 120_000);
+		const fingerprint = parseVerificationFingerprint(text);
+		if (parsed.truncated && fingerprint.invoiceNumbers.length + fingerprint.trainNumbers.length + fingerprint.amounts.length === 0) {
+			return { file, text, fingerprint, error: `PDF 超过 ${OCR_MAX_PAGES} 页，前 ${OCR_MAX_PAGES} 页未识别到配对标识` };
+		}
+		return { file, text, fingerprint };
+	} catch (error) {
+		const output = parseOcrScriptOutput(String((error as { stdout?: string | Buffer }).stdout ?? ""));
+		const reason = output?.error ?? (error instanceof Error ? error.message : String(error));
+		return { file, text: "", fingerprint: empty, error: `Windows OCR 失败：${reason.slice(0, 300)}` };
+	}
+}
+
+/** Kept for read-only diagnostics and older callers. */
+export function ocrTravelPdf(file: string): TravelOcrDocument {
+	return ocrTravelDocument(file);
+}
+
+/**
+ * Deterministic attachment precheck for high-level workflows such as travel_fill_draft.
+ * Call once with all travel attachments and stop before browser mutation unless the
+ * railway pairing (and, for multi-day travel, lodging resolution) is ready.
+ */
+export function readAndPairRailwayAttachments(
+	paths: string[],
+	workspaceRoot: string,
+	options: { ocrTravelDocument?: (file: string, timeoutMs: number) => TravelOcrDocument } = {},
+): InvoiceAttachmentResult {
+	if (!Array.isArray(paths) || paths.length === 0) throw new Error("请至少提供一个差旅附件");
+	if (paths.length > MAX_TRAVEL_INPUT_FILES) {
+		throw new Error(`差旅附件一次最多 ${MAX_TRAVEL_INPUT_FILES} 个，请移除无关文件后重试`);
+	}
+	let totalInputBytes = 0;
+	for (const requested of paths) {
+		const file = resolveAttachmentPath(requested, workspaceRoot);
+		if (!existsSync(file) || !statSync(file).isFile()) continue;
+		totalInputBytes += statSync(file).size;
+		if (totalInputBytes > MAX_TRAVEL_INPUT_BYTES) {
+			throw new Error(`差旅附件总量超过 ${MAX_TRAVEL_INPUT_BYTES / 1024 / 1024}MB 安全上限`);
+		}
+	}
+	const invoices: RailwayInvoice[] = [];
+	const ocrDocuments: TravelOcrDocument[] = [];
+	const extractionBudget: ExtractionBudget = { entries: 0, bytes: 0 };
+	const ocrStartedAt = Date.now();
+	let ocrCount = 0;
+	const readOcrDocument = (file: string): TravelOcrDocument => {
+		ocrCount += 1;
+		if (ocrCount > MAX_OCR_DOCUMENTS) {
+			return {
+				file,
+				text: "",
+				fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+				error: `需要 OCR 的 PDF/图片超过 ${MAX_OCR_DOCUMENTS} 个安全上限`,
+			};
+		}
+		const remainingMs = MAX_OCR_WALL_MS - (Date.now() - ocrStartedAt);
+		if (remainingMs < 1_000) {
+			return {
+				file,
+				text: "",
+				fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+				error: `本批 OCR 已超过 ${Math.round(MAX_OCR_WALL_MS / 1000)} 秒总时限`,
+			};
+		}
+		return (options.ocrTravelDocument ?? ocrTravelDocument)(file, remainingMs);
+	};
+	for (const requested of paths) {
+		const file = resolveAttachmentPath(requested, workspaceRoot);
+		if (!existsSync(file) || !statSync(file).isFile()) {
+			invoices.push({ source: requested, uploadFile: file, error: "文件不存在" });
+			continue;
+		}
+		if (/\.pdf$/i.test(file)) {
+			try {
+				const pdfInvoices = readRailwayPdf(requested, workspaceRoot);
+				if (pdfInvoices) invoices.push(...pdfInvoices);
+				else ocrDocuments.push(readOcrDocument(file));
+			} catch (error) {
+				invoices.push({
+					source: requested,
+					uploadFile: file,
+					error: `PDF 票据解析失败：${error instanceof Error ? error.message : String(error)}`,
+				});
+			}
+			continue;
+		}
+		if (/\.(?:png|jpe?g)$/i.test(file)) {
+			ocrDocuments.push(readOcrDocument(file));
+			continue;
+		}
+		const archive = readRailwayInvoices(requested, workspaceRoot, extractionBudget, readOcrDocument);
+		invoices.push(...archive.invoices);
+		ocrDocuments.push(...archive.ocrDocuments);
+	}
+
+	const seenInvoices = new Set<string>();
+	for (const invoice of invoices) {
+		if (invoice.error || !invoice.invoiceNumber) continue;
+		if (seenInvoices.has(invoice.invoiceNumber)) invoice.error = `检测到重复票据：${invoice.invoiceNumber}`;
+		else seenInvoices.add(invoice.invoiceNumber);
+	}
+	const validInvoiceIndexes = invoices
+		.map((invoice, index) => ({ invoice, index }))
+		.filter(({ invoice }) => !invoice.error)
+		.map(({ index }) => index);
+	let lodging = resolveLodgingInvoiceCandidate(ocrDocuments);
+	if (lodging.status === "ready" && lodging.invoice) {
+		const sourceInvoice = lodging.invoice;
+		let activeFile = sourceInvoice.uploadFile;
+		try {
+			const durableFiles = new Set<string>();
+			const persistUnique = (file: string, identity: string): string => {
+				activeFile = file;
+				const durable = durableAttachment(workspaceRoot, file, identity);
+				const durableIdentity = resolve(durable).toLocaleLowerCase("en-US");
+				if (durableFiles.has(durableIdentity)) {
+					throw new Error("住宿主发票与查验附件或多个查验附件内容相同，不能重复绑定");
+				}
+				durableFiles.add(durableIdentity);
+				return durable;
+			};
+			const uploadFile = persistUnique(sourceInvoice.uploadFile, sourceInvoice.invoiceNumber);
+			const verificationFiles = sourceInvoice.verificationFiles.map((file, index) =>
+				persistUnique(file, `${sourceInvoice.invoiceNumber}-verification-${index + 1}`),
+			);
+			const durableInvoice = { ...sourceInvoice, uploadFile, verificationFiles };
+			lodging = { ...lodging, invoice: durableInvoice, candidates: [durableInvoice] };
+		} catch (error) {
+			lodging = {
+				...lodging,
+				status: "missing",
+				invoice: undefined,
+				issues: [
+					...lodging.issues,
+					{
+						file: activeFile,
+						kind: "missing",
+						reason: error instanceof Error ? error.message : String(error),
+						invoiceNumbers: [sourceInvoice.invoiceNumber],
+						amounts: [sourceInvoice.amount],
+					},
+				],
+			};
+		}
+	}
+	const lodgingFiles = new Set(lodging.classifiedFiles);
+	const verificationCandidates: VerificationCandidate[] = ocrDocuments
+		.filter((document) => !lodgingFiles.has(document.file))
+		.map(({ file, fingerprint, error }) => ({ file, fingerprint, error }));
+	const pairing = matchVerificationFiles(
+		validInvoiceIndexes.map((index) => invoices[index]),
+		verificationCandidates,
+	);
+	const claimedDurableVerificationFiles = new Map<string, string>();
+	for (const [validIndex, files] of pairing.verificationFilesByInvoice.entries()) {
+		const invoice = invoices[validInvoiceIndexes[validIndex]];
+		const durableFiles: string[] = [];
+		for (const file of files) {
+			try {
+				const durable = durableAttachment(workspaceRoot, file, basename(file));
+				const durableIdentity = resolve(durable).toLocaleLowerCase("en-US");
+				const previous = claimedDurableVerificationFiles.get(durableIdentity);
+				if (previous) {
+					pairing.unmatched.push({
+						file,
+						reason: `查验附件内容与 ${basename(previous)} 重复，不能重复或跨行绑定`,
+						fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+					});
+					continue;
+				}
+				claimedDurableVerificationFiles.set(durableIdentity, file);
+				durableFiles.push(durable);
+			} catch (error) {
+				pairing.unmatched.push({
+					file,
+					reason: `查验附件持久化失败：${error instanceof Error ? error.message : String(error)}`,
+					fingerprint: { invoiceNumbers: [], trainNumbers: [], amounts: [] },
+				});
+			}
+		}
+		invoice.verificationFiles = durableFiles;
+		invoice.verificationStatus = durableFiles.length > 0 ? "ready" : "missing";
+	}
+	const missing = validInvoiceIndexes
+		.map((invoiceIndex) => ({ invoiceIndex, invoice: invoices[invoiceIndex] }))
+		.filter(({ invoice }) => !invoice.verificationFiles?.length)
+		.map(({ invoiceIndex, invoice }) => {
+			return { invoiceIndex, invoiceNumber: invoice.invoiceNumber, source: invoice.source };
+		});
+	const ambiguous = pairing.ambiguous.map((item) => ({
+		...item,
+		candidateInvoiceIndexes: item.candidateInvoiceIndexes.map((validIndex) => validInvoiceIndexes[validIndex]),
+		candidateInvoiceNumbers: item.candidateInvoiceIndexes.map(
+			(validIndex) => invoices[validInvoiceIndexes[validIndex]].invoiceNumber ?? "未识别发票号",
+		),
+	}));
+	return {
+		invoices,
+		pairingStatus:
+			ambiguous.length > 0 || pairing.unmatched.length > 0
+				? "ambiguous"
+				: validInvoiceIndexes.length === 0 || missing.length > 0
+					? "missing"
+					: "ready",
+		lodging,
+		ocrDocuments,
+		missing,
+		ambiguous,
+		unmatched: pairing.unmatched.map(({ file, reason }) => ({ file, reason })),
+	};
 }
 
 interface TripLeg {
@@ -415,6 +1091,7 @@ const EXPECTED_PASSENGER = "苏爱健";
 function reimbursementGuideText(): string {
 	return [
 		"差旅费用报销单填报规则（易快报/合思）：",
+		"0. 票据预检：把全部电子客票 PDF/OFD/ZIP、查验 PDF 与多日行程的住宿发票 PDF 一次传给 travel_read_invoices；铁路须 pairingStatus=ready，多日住宿还须 lodging.status=ready，missing/ambiguous 必须一次性补齐且绝不猜测。",
 		"1. 关联申请：必须从已有出差申请中选择（点击 data-testid=field-expenseLink-select，在弹窗中按标题搜索后勾选并确认）。",
 		"2. 所属公司、提交人、报销日期（默认当天）、申请人部门、费用所属部门通常已自动带出；只需核对，一般不改动。",
 		"3. 报销说明：写关联出差申请的事由（如“常州业务拓展”），字段 data-testid=field-text-u_事由。",
@@ -578,9 +1255,458 @@ function buildDetailPlan(params: PlanParams, workspaceRoot: string): { rows: Det
 	return { rows, notes };
 }
 
+export interface FillTravelDraftParams {
+	url?: string;
+	paths?: string[];
+	applicationHint?: string;
+}
+
+export interface FillTravelDraftDependencies {
+	readAttachments?: (paths: string[], cwd: string) => InvoiceAttachmentResult;
+	createDriver?: (options: TravelDraftBrowserDriverOptions) => TravelDraftBrowserDriver;
+}
+
+const TRAVEL_SAVE_INTENT_VERSION = 1;
+
+function travelSaveIntentPath(cwd: string, plan: TravelDraftPlan): string {
+	return join(cwd, ".pi", "travel-expense", `save-intent-${travelDraftSaveIdentity(plan)}.json`);
+}
+
+function travelSaveIntentExists(cwd: string, plan: TravelDraftPlan): boolean {
+	try {
+		lstatSync(travelSaveIntentPath(cwd, plan));
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+function persistTravelSaveIntent(cwd: string, plan: TravelDraftPlan): void {
+	const identity = travelDraftSaveIdentity(plan);
+	const directory = join(cwd, ".pi", "travel-expense");
+	const target = join(directory, `save-intent-${identity}.json`);
+	mkdirSync(directory, { recursive: true });
+	let descriptor: number;
+	try {
+		descriptor = openSync(target, "wx", 0o600);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+		throw error;
+	}
+	try {
+		writeFileSync(
+			descriptor,
+			`${JSON.stringify({ version: TRAVEL_SAVE_INTENT_VERSION, saveIdentity: identity, state: "save_requested" })}\n`,
+			"utf8",
+		);
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+interface CompleteRailwayInvoice extends RailwayInvoice {
+	trainNumber: string;
+	fromStation: string;
+	toStation: string;
+	fromCity: string;
+	toCity: string;
+	date: string;
+	seatClass: string;
+	amount: number;
+	passenger: string;
+	invoiceNumber: string;
+	uploadFile: string;
+	verificationFiles: string[];
+}
+
+function workflowIssue(code: string, field: string, message: string): TravelDraftIssue {
+	return { code, field, message };
+}
+
+function completeRailwayInvoiceIssues(result: InvoiceAttachmentResult): {
+	ready: CompleteRailwayInvoice[];
+	missing: TravelDraftIssue[];
+	ambiguous: TravelDraftIssue[];
+} {
+	const missing: TravelDraftIssue[] = [];
+	const ambiguous: TravelDraftIssue[] = [];
+	const ready: CompleteRailwayInvoice[] = [];
+	if (result.invoices.length === 0) {
+		missing.push(workflowIssue("missing_railway_ticket", "paths", "没有解析出铁路电子客票"));
+	}
+	for (const [index, invoice] of result.invoices.entries()) {
+		if (invoice.error) {
+			ambiguous.push(workflowIssue("invalid_railway_ticket", `invoices[${index}]`, invoice.error));
+			continue;
+		}
+		const required = [
+			["trainNumber", invoice.trainNumber, "车次"],
+			["fromStation", invoice.fromStation, "原始出发站"],
+			["toStation", invoice.toStation, "原始到达站"],
+			["fromCity", invoice.fromCity, "出发城市"],
+			["toCity", invoice.toCity, "到达城市"],
+			["date", invoice.date, "乘车日期"],
+			["seatClass", invoice.seatClass, "席别"],
+			["passenger", invoice.passenger, "乘车人"],
+			["invoiceNumber", invoice.invoiceNumber, "发票号码"],
+			["uploadFile", invoice.uploadFile, "电子客票附件"],
+		] as const;
+		for (const [field, value, label] of required) {
+			if (typeof value !== "string" || !value.trim()) {
+				missing.push(workflowIssue("missing_ticket_field", `invoices[${index}].${field}`, `第 ${index + 1} 张票缺少${label}`));
+			}
+		}
+		if (!Number.isFinite(invoice.amount) || (invoice.amount ?? 0) <= 0) {
+			missing.push(workflowIssue("missing_ticket_amount", `invoices[${index}].amount`, `第 ${index + 1} 张票缺少有效票价`));
+		}
+		if (!invoice.verificationFiles?.length) {
+			missing.push(workflowIssue("missing_verification", `invoices[${index}].verificationFiles`, `第 ${index + 1} 张票缺少唯一匹配的查验附件`));
+		}
+		if (
+			required.every(([, value]) => typeof value === "string" && value.trim()) &&
+			Number.isFinite(invoice.amount) &&
+			(invoice.amount ?? 0) > 0 &&
+			Boolean(invoice.verificationFiles?.length)
+		) {
+			ready.push(invoice as CompleteRailwayInvoice);
+		}
+	}
+	for (const item of result.ambiguous) {
+		ambiguous.push(
+			workflowIssue(
+				"ambiguous_verification",
+				"paths",
+				`查验附件无法唯一匹配：同时匹配 ${item.candidateInvoiceNumbers.join("、")}`,
+			),
+		);
+	}
+	for (const item of result.missing) {
+		missing.push(
+			workflowIssue(
+				"missing_verification",
+				`invoices[${item.invoiceIndex}].verificationFiles`,
+				`发票 ${item.invoiceNumber ?? item.source} 缺少唯一匹配的查验附件`,
+			),
+		);
+	}
+	for (const item of result.unmatched) {
+		ambiguous.push(
+			workflowIssue(
+				"unmatched_attachment",
+				"paths",
+				`附件 ${basename(item.file)} 未能归属到任一车票或住宿发票：${item.reason}`,
+			),
+		);
+	}
+	if (result.pairingStatus !== "ready" && result.missing.length === 0 && result.ambiguous.length === 0) {
+		missing.push(workflowIssue("railway_pairing_not_ready", "paths", "铁路电子票与查验附件尚未全部唯一配对"));
+	}
+	return { ready, missing, ambiguous };
+}
+
+function certainPreDiscoveryLodgingIssues(lodging: LodgingInvoiceResolution): {
+	missing: TravelDraftIssue[];
+	ambiguous: TravelDraftIssue[];
+} {
+	const missing: TravelDraftIssue[] = [];
+	const ambiguous: TravelDraftIssue[] = [];
+	if (lodging.status !== "ambiguous" && !(lodging.status === "missing" && lodging.classifiedFiles.length > 0)) {
+		return { missing, ambiguous };
+	}
+	const target = lodging.status === "ambiguous" ? ambiguous : missing;
+	target.push(
+		workflowIssue(
+			lodging.status === "ambiguous" ? "ambiguous_lodging" : "unresolved_lodging_attachment",
+			"hotel",
+			lodging.status === "ambiguous"
+				? "住宿发票存在多个候选或字段冲突，需先核对附件"
+				: "已识别到住宿相关附件，但未能唯一确定住宿主发票，需先补齐或替换附件",
+		),
+	);
+	for (const item of lodging.issues) {
+		target.push(workflowIssue(`lodging_${item.kind}`, "hotel", item.reason));
+	}
+	return { missing, ambiguous };
+}
+
+function localIsoDate(now = new Date()): string {
+	const year = now.getFullYear();
+	const month = String(now.getMonth() + 1).padStart(2, "0");
+	const day = String(now.getDate()).padStart(2, "0");
+	return `${year}-${month}-${day}`;
+}
+
+function inclusiveDateCount(startDate: string, endDate: string): number {
+	return Math.floor((Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000) + 1;
+}
+
+function conciseIssues(missing: TravelDraftIssue[], ambiguous: TravelDraftIssue[], errors: string[] = []): string {
+	const messages = [...missing, ...ambiguous].map((item) => item.message);
+	for (const error of errors) if (error.trim()) messages.push(error.trim());
+	return [...new Set(messages)].map((message) => `- ${redactSensitiveText(message)}`).join("\n");
+}
+
+function stoppedWorkflowResult(
+	status: "needs_input" | "blocked" | "interrupted",
+	stage: string,
+	missing: TravelDraftIssue[],
+	ambiguous: TravelDraftIssue[],
+	errors: string[] = [],
+	draftSaveStateUncertain = false,
+	draftSaveRequested = false,
+): AgentToolResult<unknown> {
+	const label = status === "needs_input" ? "开始自动填报前还缺少以下信息" : status === "interrupted" ? "自动填报已中断" : "自动填报已安全停止";
+	const disposition = draftSaveStateUncertain ? "已进入保存阶段，草稿状态未确认，未提交" : "未保存、未提交";
+	return textResult(`${label}（${disposition}）：\n${conciseIssues(missing, ambiguous, errors) || "- 页面状态未通过确定性核验"}`, {
+		status,
+		stage,
+		draftSaved: false,
+		draftSaveStateUncertain,
+		draftSaveRequested,
+		missing,
+		ambiguous,
+		errors: errors.map(redactSensitiveText),
+	});
+}
+
+export async function fillTravelDraft(
+	params: FillTravelDraftParams,
+	cwd: string,
+	signal: AbortSignal | undefined,
+	onUpdate: ((result: AgentToolResult<unknown>) => void) | undefined,
+	dependencies: FillTravelDraftDependencies = {},
+): Promise<AgentToolResult<unknown>> {
+	const progress = (message: string, stage: string) =>
+		onUpdate?.(textResult(message, { status: "running", stage, draftSaved: false }));
+	if (signal?.aborted) return stoppedWorkflowResult("interrupted", "PRECHECK", [], [], ["用户已停止任务"]);
+	const url = typeof params.url === "string" ? params.url.trim() : "";
+	const paths = Array.isArray(params.paths) ? params.paths : [];
+	const missingInputs: TravelDraftIssue[] = [];
+	if (!url) missingInputs.push(workflowIssue("missing_url", "url", "缺少易快报差旅费用报销链接"));
+	if (paths.length === 0) {
+		missingInputs.push(workflowIssue("missing_attachments", "paths", "缺少本次行程的火车票和对应查验附件"));
+	}
+	if (missingInputs.length > 0) {
+		return stoppedWorkflowResult("needs_input", "PRECHECK", missingInputs, []);
+	}
+	progress("正在一次性核对全部车票、查验件和住宿附件…", "PRECHECK");
+	let attachments: InvoiceAttachmentResult;
+	try {
+		attachments = (dependencies.readAttachments ?? readAndPairRailwayAttachments)(paths, cwd);
+	} catch (error) {
+		return stoppedWorkflowResult("needs_input", "PRECHECK", [], [], [error instanceof Error ? error.message : String(error)]);
+	}
+	const invoiceCheck = completeRailwayInvoiceIssues(attachments);
+	if (invoiceCheck.missing.length > 0 || invoiceCheck.ambiguous.length > 0 || attachments.pairingStatus !== "ready") {
+		return stoppedWorkflowResult("needs_input", "PRECHECK", invoiceCheck.missing, invoiceCheck.ambiguous);
+	}
+	const lodgingPrecheck = certainPreDiscoveryLodgingIssues(attachments.lodging);
+	if (lodgingPrecheck.missing.length > 0 || lodgingPrecheck.ambiguous.length > 0) {
+		return stoppedWorkflowResult("needs_input", "PRECHECK", lodgingPrecheck.missing, lodgingPrecheck.ambiguous);
+	}
+	const tickets = [...invoiceCheck.ready].sort(
+		(left, right) =>
+			left.date.localeCompare(right.date, "en") ||
+			(left.departTime ?? "").localeCompare(right.departTime ?? "", "en") ||
+			left.invoiceNumber.localeCompare(right.invoiceNumber, "en"),
+	);
+	progress("票据已唯一配对，正在匹配已有出差申请…", "APPLICATION");
+	let driver: TravelDraftBrowserDriver;
+	let discovery;
+	try {
+		driver = (dependencies.createDriver ?? ((options) => new TravelDraftBrowserDriver(options)))({
+			cwd,
+			signal,
+			maxBrowserActions: 400,
+			onBrowserAction: ({ index, kind, operation }) => {
+				if (index === 1 || index % 10 === 0) progress(`页面操作 ${index}/400：${operation}（${kind}）`, "BROWSER");
+			},
+		});
+		discovery = await driver.discoverApplication({
+			url,
+			hint: params.applicationHint,
+			invoiceFacts: {
+				travelDates: [...new Set(tickets.map((ticket) => ticket.date))],
+				cities: [...new Set(tickets.flatMap((ticket) => [ticket.fromCity, ticket.toCity]))],
+			},
+		});
+	} catch (error) {
+		return stoppedWorkflowResult("blocked", "APPLICATION", [], [], [error instanceof Error ? error.message : String(error)]);
+	}
+	if (discovery.status !== "selected") {
+		return stoppedWorkflowResult("needs_input", "APPLICATION", discovery.missing, discovery.ambiguous);
+	}
+	const days = inclusiveDateCount(discovery.application.startDate, discovery.application.endDate);
+	const lodgingMissing: TravelDraftIssue[] = [];
+	const lodgingAmbiguous: TravelDraftIssue[] = [];
+	if (days > 1 && attachments.lodging.status !== "ready") {
+		const target = attachments.lodging.status === "ambiguous" ? lodgingAmbiguous : lodgingMissing;
+		target.push(
+			workflowIssue(
+				attachments.lodging.status === "ambiguous" ? "ambiguous_lodging" : "missing_lodging",
+				"hotel",
+				attachments.lodging.status === "ambiguous"
+					? "多日出差的住宿发票存在多个候选或字段冲突"
+					: "多日出差缺少可唯一识别的住宿发票 PDF",
+			),
+		);
+		for (const item of attachments.lodging.issues) {
+			target.push(workflowIssue(`lodging_${item.kind}`, "hotel", item.reason));
+		}
+	}
+	if (days === 1 && attachments.lodging.status === "ready") {
+		lodgingAmbiguous.push(
+			workflowIssue("unexpected_lodging", "hotel", "关联申请为当天往返，但附件中识别到住宿发票，请核对行程或移除住宿附件"),
+		);
+	}
+	if (lodgingMissing.length > 0 || lodgingAmbiguous.length > 0) {
+		return stoppedWorkflowResult("needs_input", "PRECHECK", lodgingMissing, lodgingAmbiguous);
+	}
+	const transport = tickets.map((ticket) => ({
+		fromCity: ticket.fromCity,
+		toCity: ticket.toCity,
+		fromStation: ticket.fromStation,
+		toStation: ticket.toStation,
+		trainNumber: ticket.trainNumber,
+		travelDate: ticket.date,
+		departTime: ticket.departTime,
+		seatClass: ticket.seatClass,
+		amount: ticket.amount,
+		passenger: ticket.passenger,
+		invoiceNumber: ticket.invoiceNumber,
+		uploadFile: ticket.uploadFile,
+		verificationFiles: [...ticket.verificationFiles],
+	}));
+	const lodging = attachments.lodging.invoice;
+	const plan: TravelDraftPlan = {
+		url,
+		reimbursementDate: localIsoDate(),
+		application: discovery.application,
+		transport,
+		hotel:
+			days > 1 && lodging
+				? {
+						checkinDate: discovery.application.startDate,
+						checkoutDate: discovery.application.endDate,
+						amount: lodging.amount,
+						invoiceNumber: lodging.invoiceNumber,
+						uploadFile: lodging.uploadFile,
+						verificationFiles: [...lodging.verificationFiles],
+					}
+				: undefined,
+	};
+	try {
+		if (travelSaveIntentExists(cwd, plan)) {
+			return stoppedWorkflowResult(
+				"blocked",
+				"CONFIRM",
+				[],
+				[],
+				["检测到同一行程已经发起过草稿保存；请在易快报中人工确认草稿状态，不会再次点击保存"],
+				true,
+				true,
+			);
+		}
+	} catch {
+		return stoppedWorkflowResult(
+			"blocked",
+			"CONFIRM",
+			[],
+			[],
+			["无法安全核对同一行程的保存意图记录；为防止重复保存已停止，请人工确认草稿状态"],
+			true,
+			true,
+		);
+	}
+	progress(`已锁定申请 ${discovery.application.id}，正在按固定流程填写并逐项回读…`, "HEADER");
+	let run: TravelDraftRunResult;
+	let saveIntentPersisted = false;
+	try {
+		run = await runTravelDraft(driver, plan, {
+			signal,
+			maxActions: 60,
+			maxStageRetries: 2,
+			maxNoProgress: 2,
+			onCheckpoint: (checkpoint) => {
+				if (checkpoint.saveRequested && !saveIntentPersisted) {
+					persistTravelSaveIntent(cwd, plan);
+					saveIntentPersisted = true;
+				}
+				progress(`自动填报进行中：${checkpoint.stage}（${checkpoint.actionsUsed}/60）`, checkpoint.stage);
+			},
+		});
+	} catch (error) {
+		return stoppedWorkflowResult("blocked", "PRECHECK", [], [], [error instanceof Error ? error.message : String(error)]);
+	}
+	if (run.status !== "done" || run.stage !== "DONE") {
+		const draftSaveRequested = run.checkpoint.saveRequested || run.observation?.draft?.saveRequested === true;
+		return stoppedWorkflowResult(
+			run.status === "done" ? "blocked" : run.status,
+			run.stage,
+			run.missing,
+			run.ambiguous,
+			run.errors,
+			draftSaveRequested || ["SAVE_DRAFT", "CONFIRM", "DONE"].includes(run.stage),
+			draftSaveRequested,
+		);
+	}
+	return textResult(
+		`草稿保存成功：已关联 ${discovery.application.title}（${discovery.application.id}），填写 ${tickets.length} 条火车/高铁、${days > 1 ? "1 条住宿、" : "无住宿、"}1 条其他省份补助，系统核验合计 ¥${run.expectedTotal.toFixed(2)}。未提交送审。`,
+		{
+			status: "done",
+			stage: "DONE",
+			draftSaved: true,
+			submitted: false,
+			actionsUsed: run.actionsUsed,
+			expectedTotal: run.expectedTotal,
+			application: discovery.application,
+			transportCount: tickets.length,
+			attachmentAssignments: tickets.map((ticket) => ({
+				invoiceNumber: ticket.invoiceNumber,
+				trainNumber: ticket.trainNumber,
+				ticket: basename(ticket.uploadFile),
+				verification: ticket.verificationFiles.map((file) => basename(file)),
+			})),
+			hotelCount: days > 1 ? 1 : 0,
+			allowanceDays: days,
+			allowanceAmount: days * 180,
+		},
+	);
+}
+
 export default function definePack(ctx: PackContext) {
 	const workspaceRoot = () => ctx.getWorkspaceRoot();
 	const tools: ToolDefinition[] = [
+		{
+			name: "travel_fill_draft",
+			label: "自动填写差旅报销草稿",
+			description:
+				"一次调用完成易快报差旅草稿：先解析并唯一配对全部附件，再从已有出差申请中唯一匹配，按固定状态机填写表头、逐程火车/高铁、住宿（仅多日）和 180 元/天补助，逐项回读后只存草稿。缺项一次性返回；绝不提交、删除单据或猜测页面。普通流程只用本工具，不再自行调用 browser_*、shell、OCR 或旧的分步差旅工具。",
+			promptSnippet: "使用单个确定性工具一次完成易快报差旅报销草稿，只保存草稿，绝不提交",
+			promptGuidelines: [
+				"收到报销链接和附件后只调用一次 travel_fill_draft；不要先调用 browser_*、travel_read_invoices、travel_plan_details、shell 或 OCR。",
+				"如果工具返回 needs_input，把 missing/ambiguous 合并成一条消息向用户索要；不要绕过检查或猜测。",
+				"只有 details.status=done、stage=DONE、draftSaved=true 才能告诉用户草稿保存成功；其他状态都明确说明未保存、未提交。",
+			],
+			parameters: Type.Object({
+				url: Type.Optional(
+					Type.String({ minLength: 1, description: "用户提供的易快报差旅费用报销链接；安全凭据引用必须原样传入" }),
+				),
+				paths: Type.Optional(
+					Type.Array(Type.String({ minLength: 1 }), {
+						maxItems: MAX_TRAVEL_INPUT_FILES,
+						description: "本次行程全部附件路径：每程铁路电子票及对应查验 PDF/PNG/JPG；多日再含住宿发票 PDF",
+					}),
+				),
+				applicationHint: Type.Optional(Type.String({ description: "可选的已有出差申请标题、城市或申请编号线索，如 常州" })),
+			}),
+			execute: async (_id, rawParams, signal, onUpdate) => {
+				const params = rawParams as FillTravelDraftParams;
+				return fillTravelDraft(params, workspaceRoot(), signal, onUpdate);
+			},
+		},
 		{
 			name: "travel_reimbursement_guide",
 			label: "差旅报销规则速查",
@@ -590,25 +1716,20 @@ export default function definePack(ctx: PackContext) {
 		},
 		{
 			name: "travel_read_invoices",
-			label: "解析铁路电子客票",
+			label: "解析差旅票据",
 			description:
-				"解析铁路电子客票发票（.ofd 文件或包含 ofd/pdf 的 .zip 压缩包），提取车次、起止站、日期时间、席别、票价、乘车人、发票号，并给出建议上传的发票文件。用户发来票据附件后先用本工具解析，不要手工解压。",
+				"一次解析差旅票据：支持直接传铁路电子客票 PDF、OFD、含 OFD/PDF 的 ZIP、扫描版查验 PDF 和住宿发票 PDF。提取铁路字段并保守配对查验附件；住宿票据仅在 OCR 明确含住宿类目且发票号、价税合计各自唯一时返回候选。绝不按文件名、顺序或单独金额猜测。用户发来全部附件后集中调用一次，不要手工解压或 OCR。",
 			parameters: Type.Object({
 				paths: Type.Array(Type.String(), {
 					minItems: 1,
-					description: "票据文件路径（工作区相对或绝对路径），支持 .ofd / .zip",
+					maxItems: MAX_TRAVEL_INPUT_FILES,
+					description: "本次行程的全部票据路径（工作区相对或绝对路径），支持 .pdf / .ofd / .zip",
 				}),
 			}),
 			execute: async (_id, rawParams) => {
 				const params = rawParams as { paths: string[] };
-				const invoices = params.paths.flatMap((path) => readRailwayInvoices(path, workspaceRoot()));
-				const seenInvoices = new Set<string>();
-				for (const invoice of invoices) {
-					if (invoice.error || !invoice.invoiceNumber) continue;
-					if (seenInvoices.has(invoice.invoiceNumber)) invoice.error = `检测到重复票据：${invoice.invoiceNumber}`;
-					else seenInvoices.add(invoice.invoiceNumber);
-				}
-				const lines = invoices.map((invoice) => {
+				const result = readAndPairRailwayAttachments(params.paths, workspaceRoot());
+				const lines = result.invoices.map((invoice) => {
 					if (invoice.error) return `✗ ${invoice.source}：${invoice.error}`;
 					return [
 						`✓ ${invoice.invoiceNumber ?? "（发票号未识别）"}：`,
@@ -616,9 +1737,44 @@ export default function definePack(ctx: PackContext) {
 						`  计划城市：${invoice.fromCity ?? "未识别"} → ${invoice.toCity ?? "未识别"}（原始站名保留如上）`,
 						`  ${invoice.date} ${invoice.seatClass} ¥${invoice.amount} 乘车人：${invoice.passenger ?? "未识别"}`,
 						`  开票日期 ${invoice.issueDate ?? "未识别"}；上传附件用：${invoice.uploadFile}`,
+						invoice.verificationFiles?.length
+							? `  查验附件（已唯一配对）：${invoice.verificationFiles.join("、")}`
+							: "  查验附件：MISSING（尚未唯一配对）",
 					].join("\n");
 				});
-				return textResult(lines.join("\n\n"), { invoices });
+				const summary = [`附件配对状态：${result.pairingStatus.toUpperCase()}`];
+				if (result.invoices.every((invoice) => invoice.error)) {
+					summary.push("MISSING：没有解析出可用的铁路电子客票 PDF/OFD。");
+				}
+				for (const item of result.missing) {
+					summary.push(`MISSING：发票 ${item.invoiceNumber ?? item.source} 缺少能唯一匹配的查验 PDF。`);
+				}
+				for (const item of result.ambiguous) {
+					summary.push(
+						`AMBIGUOUS：查验 PDF ${item.file} 同时匹配 ${item.candidateInvoiceNumbers.join("、")}（依据 ${item.signals.join("+")}），已停止自动配对。`,
+					);
+				}
+				for (const item of result.unmatched) summary.push(`UNMATCHED：查验 PDF ${item.file}：${item.reason}。`);
+				if (result.lodging.status === "ready" && result.lodging.invoice) {
+					summary.push(
+						`LODGING READY：住宿发票 ${result.lodging.invoice.invoiceNumber}，价税合计 ¥${result.lodging.invoice.amount}；上传附件用：${result.lodging.invoice.uploadFile}；查验附件可为空数组。`,
+					);
+				} else if (result.lodging.status === "ambiguous") {
+					summary.push("LODGING AMBIGUOUS：识别到多份住宿候选或住宿票据字段冲突；多日行程必须一次性核对，不能猜测。");
+				} else {
+					summary.push("LODGING MISSING：未唯一识别住宿发票；当天往返可忽略，多日行程必须补齐。");
+				}
+				if (result.pairingStatus !== "ready") {
+					summary.push("请一次补齐或替换上面列出的附件后重新调用；不要猜测，也不要开始填写费用明细。");
+				}
+				const details = {
+					...result,
+					ocrDocuments: result.ocrDocuments.map(({ text, ...document }) => ({
+						...document,
+						textLength: text.length,
+					})),
+				};
+				return textResult([...lines, "", ...summary].join("\n\n"), details);
 			},
 		},
 		{

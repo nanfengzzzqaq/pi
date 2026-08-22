@@ -31,6 +31,7 @@ foreach ($Dir in @("src", "web", "packs", "skills")) {
     Copy-Item (Join-Path $ConsoleDir $Dir) $Target -Recurse
     Write-Host "已拷贝 $Dir/"
 }
+$Verifier = Join-Path $ElectronDir "scripts\verify-local-agent.js"
 
 # 2.5 预置 OfficeCLI（必要工具）：优先开发数据目录，其次当前用户已安装副本。
 # 只复制到安装包自身，不修改系统 PATH；客户端首启再复制到 %APPDATA% 的外置数据目录。
@@ -149,13 +150,21 @@ try {
         & npm.cmd install --no-audit --no-fund
         if ($LASTEXITCODE -ne 0) { throw "npm install 失败" }
 
+		& node --test (Join-Path $ElectronDir "scripts\verify-local-agent.node-test.js")
+		if ($LASTEXITCODE -ne 0) { throw "安装包关键资源校验器自测失败" }
+
+        # 校验脚本依赖 Electron 暂存目录安装的 @electron/asar；必须在 npm install 后运行，
+        # 否则干净 CI 会在真正开始校验前因模块缺失退出。
+        node $Verifier --source-console $ConsoleDir --staged-electron $ElectronDir
+        if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的控制台关键资源与源码不一致" }
+        Write-Host "已校验 Electron 暂存目录中的控制台关键资源"
+
         & npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage
         if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
     } finally {
         Pop-Location
     }
 
-    $Verifier = Join-Path $ElectronDir "scripts\verify-local-agent.js"
     $LocalAgentDist = Join-Path $CodingAgentDir "dist"
     $InstalledAgentDist = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent\dist"
     node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
@@ -177,6 +186,16 @@ try {
     node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
     if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
     Write-Host "已校验 app.asar 中的本地 coding-agent"
+
+	node $Verifier --source-electron $ElectronDir --asar $PackagedAsar
+	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的可信浏览器控制器与暂存源码不一致" }
+	Write-Host "已校验 app.asar 中的可信浏览器控制器"
+
+    $PackagedUnpackedApp = Join-Path $ElectronDir "dist\win-unpacked\resources\app.asar.unpacked"
+    if (-not (Test-Path -LiteralPath $PackagedUnpackedApp)) { throw "未找到解包资源 $PackagedUnpackedApp" }
+    node $Verifier --source-console $ConsoleDir --unpacked-app $PackagedUnpackedApp
+    if ($LASTEXITCODE -ne 0) { throw "安装包中的控制台关键资源与源码不一致" }
+    Write-Host "已校验安装包中的控制台关键资源"
 } finally {
 	if (Test-Path -LiteralPath $LocalAgentPackageDir) {
 		Remove-Item -LiteralPath $LocalAgentPackageDir -Recurse -Force

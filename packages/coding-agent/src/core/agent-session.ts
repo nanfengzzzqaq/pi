@@ -19,6 +19,7 @@ import type {
 	Agent,
 	AgentEvent,
 	AgentMessage,
+	AgentPromptOptions,
 	AgentState,
 	AgentTool,
 	PrepareNextTurnContext,
@@ -249,6 +250,10 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+	/** Force the first provider request for this prompt to use a tool; subsequent tool-result turns return to auto. */
+	toolChoice?: AgentPromptOptions["toolChoice"];
+	/** Optional per-prompt selection after a successful or failed tool result. */
+	toolChoiceAfterToolResult?: AgentPromptOptions["toolChoiceAfterToolResult"];
 }
 
 /** Result from cycleModel() */
@@ -335,6 +340,9 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryPromptToolChoice: AgentPromptOptions["toolChoice"];
+	private _activeToolResultChoicePolicy: AgentPromptOptions["toolChoiceAfterToolResult"];
+	private _toolChoiceTurnHadError = false;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -615,6 +623,25 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			const assistant = event.message as AssistantMessage;
+			const hasToolCall = assistant.content.some((content) => content.type === "toolCall");
+			if (hasToolCall) {
+				this._toolChoiceTurnHadError = false;
+			} else if (
+				assistant.stopReason !== "error" &&
+				assistant.stopReason !== "aborted" &&
+				assistant.stopReason !== "length"
+			) {
+				this._retryPromptToolChoice = undefined;
+			}
+		} else if (event.type === "tool_execution_end" && this._activeToolResultChoicePolicy) {
+			this._toolChoiceTurnHadError ||= event.isError;
+			this._retryPromptToolChoice = this._toolChoiceTurnHadError
+				? this._activeToolResultChoicePolicy.error
+				: this._activeToolResultChoicePolicy.success;
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1067,14 +1094,30 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentPrompt(
+		messages: AgentMessage | AgentMessage[],
+		promptOptions: AgentPromptOptions = {},
+	): Promise<void> {
 		this._isAgentRunActive = true;
+		this._retryPromptToolChoice = promptOptions.toolChoice;
+		this._activeToolResultChoicePolicy = promptOptions.toolChoiceAfterToolResult;
+		this._toolChoiceTurnHadError = false;
 		try {
-			await this.agent.prompt(messages);
+			await this.agent.prompt(messages, promptOptions);
 			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+				const continuationOptions =
+					this._retryPromptToolChoice === undefined
+						? undefined
+						: {
+								toolChoice: this._retryPromptToolChoice,
+								toolChoiceAfterToolResult: this._activeToolResultChoicePolicy,
+							};
+				await this.agent.continue(continuationOptions);
 			}
 		} finally {
+			this._retryPromptToolChoice = undefined;
+			this._activeToolResultChoicePolicy = undefined;
+			this._toolChoiceTurnHadError = false;
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			await this._emitAgentSettled();
@@ -1172,6 +1215,9 @@ export class AgentSession {
 
 			// If streaming, queue via steer() or followUp() based on option
 			if (this.isStreaming) {
+				if (options?.toolChoice !== undefined || options?.toolChoiceAfterToolResult !== undefined) {
+					throw new Error("A prompt with toolChoice cannot be queued while the agent is already streaming.");
+				}
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1276,7 +1322,10 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		await this._runAgentPrompt(messages, {
+			toolChoice: options?.toolChoice,
+			toolChoiceAfterToolResult: options?.toolChoiceAfterToolResult,
+		});
 	}
 
 	/**
