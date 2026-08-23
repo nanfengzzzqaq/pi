@@ -8,8 +8,11 @@ import {
 	CONSOLE_CRITICAL_FILES,
 	ELECTRON_ASAR_CRITICAL_FILES,
 	LOCAL_AGENT_CRITICAL_FILES,
+	LOCAL_AI_CRITICAL_FILES,
 	verifyInstalledAgent,
+	verifyInstalledAi,
 	verifyPackagedAgent,
+	verifyPackagedAi,
 	verifyPackagedConsole,
 	verifyPackagedElectron,
 	verifyStagedConsole,
@@ -61,6 +64,57 @@ function createConsoleFixture() {
 	return { sourceConsole, stagedElectron, unpackedApp };
 }
 
+function createAiFixture({ nestedRegistryCopy = false } = {}) {
+	const directory = mkdtempSync(join(tmpdir(), "pi-local-ai-verification-"));
+	temporaryDirectories.push(directory);
+	const sourceAiDist = join(directory, "source-ai-dist");
+	const appDirectory = join(directory, "app");
+	const installedAgentRoot = join(appDirectory, "node_modules", "@earendil-works", "pi-coding-agent");
+	const nestedAiRoot = join(installedAgentRoot, "node_modules", "@earendil-works", "pi-ai");
+	const installedAiRoot = nestedRegistryCopy
+		? join(appDirectory, "node_modules", "@earendil-works", "pi-ai")
+		: nestedAiRoot;
+	const installedAiDist = join(installedAiRoot, "dist");
+	for (const relativePath of LOCAL_AI_CRITICAL_FILES) {
+		const content =
+			relativePath === "providers/data/deepseek.json"
+				? JSON.stringify({
+						"openai-completions": {
+							"deepseek-v4-flash": {
+								compat: {
+									supportsToolChoiceWithThinking: false,
+									requiresReasoningContentOnAssistantMessages: true,
+									requiresAssistantContentOnToolCalls: true,
+									thinkingFormat: "deepseek",
+								},
+							},
+							"deepseek-v4-flash-vision-exp": { input: ["text", "image"] },
+						},
+					})
+				: `local-ai:${relativePath}`;
+		for (const root of [sourceAiDist, installedAiDist]) {
+			const target = join(root, relativePath);
+			mkdirSync(dirname(target), { recursive: true });
+			writeFileSync(target, content);
+		}
+	}
+	mkdirSync(installedAgentRoot, { recursive: true });
+	writeFileSync(join(installedAgentRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent" }));
+	writeFileSync(
+		join(installedAiRoot, "package.json"),
+		JSON.stringify({ name: "@earendil-works/pi-ai", main: "./dist/index.js" }),
+	);
+	if (nestedRegistryCopy) {
+		mkdirSync(join(nestedAiRoot, "dist"), { recursive: true });
+		writeFileSync(
+			join(nestedAiRoot, "package.json"),
+			JSON.stringify({ name: "@earendil-works/pi-ai", main: "./dist/index.js" }),
+		);
+		writeFileSync(join(nestedAiRoot, "dist", "index.js"), "registry ai");
+	}
+	return { directory, sourceAiDist, appDirectory, installedAgentRoot, installedAiDist };
+}
+
 function addElectronFixture(directory, appDirectory) {
 	const sourceElectron = join(directory, "source-electron");
 	for (const relativePath of ELECTRON_ASAR_CRITICAL_FILES) {
@@ -96,6 +150,44 @@ test("rejects a registry or stale agent file with a different hash", () => {
 	assert.throws(
 		() => verifyInstalledAgent(fixture.sourceDist, fixture.installedDist),
 		/本地 coding-agent 校验失败/u,
+	);
+});
+
+test("accepts the same local pi-ai and proves coding-agent resolves that exact copy", async () => {
+	const fixture = createAiFixture();
+	assert.equal(
+		verifyInstalledAi(fixture.sourceAiDist, fixture.installedAiDist, fixture.installedAgentRoot).length,
+		LOCAL_AI_CRITICAL_FILES.length,
+	);
+
+	const archivePath = join(fixture.directory, "ai-app.asar");
+	await asar.createPackage(fixture.appDirectory, archivePath);
+	assert.equal(verifyPackagedAi(fixture.sourceAiDist, archivePath).length, LOCAL_AI_CRITICAL_FILES.length);
+});
+
+test("rejects a root pi-ai copy when coding-agent still resolves a nested registry copy", () => {
+	const fixture = createAiFixture({ nestedRegistryCopy: true });
+	assert.throws(
+		() => verifyInstalledAi(fixture.sourceAiDist, fixture.installedAiDist, fixture.installedAgentRoot),
+		/仍会解析到 registry 或嵌套的 pi-ai/u,
+	);
+});
+
+test("rejects stale DeepSeek model data in the installed pi-ai", () => {
+	const fixture = createAiFixture();
+	writeFileSync(join(fixture.installedAiDist, "providers/data/deepseek.json"), "registry model data");
+	assert.throws(
+		() => verifyInstalledAi(fixture.sourceAiDist, fixture.installedAiDist, fixture.installedAgentRoot),
+		/本地 pi-ai 校验失败/u,
+	);
+});
+
+test("rejects a local pi-ai build without the required DeepSeek compatibility catalog", () => {
+	const fixture = createAiFixture();
+	writeFileSync(join(fixture.sourceAiDist, "providers/data/deepseek.json"), JSON.stringify({}));
+	assert.throws(
+		() => verifyInstalledAi(fixture.sourceAiDist, fixture.installedAiDist, fixture.installedAgentRoot),
+		/DeepSeek V4 工具调用兼容字段或视觉模型数据/u,
 	);
 });
 

@@ -17,6 +17,7 @@ $ElectronDir = Join-Path $PSScriptRoot "electron"
 $ConsoleDir = Split-Path $PSScriptRoot -Parent
 $RepositoryRoot = (Resolve-Path (Join-Path $ConsoleDir "..\..")).Path
 $CodingAgentDir = Join-Path $RepositoryRoot "packages\coding-agent"
+$AiDir = Join-Path $RepositoryRoot "packages\ai"
 
 Write-Host "== Pi 控制台 Electron 版构建 =="
 
@@ -123,23 +124,34 @@ foreach ($Tool in $SearchTools) {
     Write-Host "已预置文件搜索工具：$($Tool.Name) $($Tool.Version)"
 }
 
-# 3. 先编译当前仓库，再将本地 coding-agent 压包安装进 Electron 暂存目录。
-# package.json 仍保留 registry 版本用于依赖解析；最终实际装入安装包的 agent 必须来自本仓库。
-$LocalAgentPackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-console-local-agent-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $LocalAgentPackageDir -Force | Out-Null
+# 3. 先编译当前仓库，再将本地 pi-ai 与 coding-agent 压包安装进 Electron 暂存目录。
+# package.json 仍保留 registry 版本用于基础依赖解析；最终实际装入安装包的 AI 与 agent 都必须来自本仓库。
+$LocalPackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-console-local-packages-" + [guid]::NewGuid().ToString("N"))
+$LocalAiPackageDir = Join-Path $LocalPackageDir "pi-ai"
+$LocalAgentPackageDir = Join-Path $LocalPackageDir "coding-agent"
+New-Item -ItemType Directory -Path $LocalAiPackageDir, $LocalAgentPackageDir -Force | Out-Null
 try {
     Push-Location $RepositoryRoot
     try {
         & npm.cmd run build:offline
         if ($LASTEXITCODE -ne 0) { throw "本地仓库编译失败" }
 
-        & npm.cmd pack --workspace=@earendil-works/pi-coding-agent --pack-destination $LocalAgentPackageDir
-        if ($LASTEXITCODE -ne 0) { throw "本地 coding-agent 打包失败" }
+		& npm.cmd pack --workspace=@earendil-works/pi-ai --pack-destination $LocalAiPackageDir
+		if ($LASTEXITCODE -ne 0) { throw "本地 pi-ai 打包失败" }
+
+		& npm.cmd pack --workspace=@earendil-works/pi-coding-agent --pack-destination $LocalAgentPackageDir
+		if ($LASTEXITCODE -ne 0) { throw "本地 coding-agent 打包失败" }
     } finally {
         Pop-Location
     }
 
-    $LocalAgentPackages = @(Get-ChildItem -LiteralPath $LocalAgentPackageDir -Filter "*.tgz" -File)
+	$LocalAiPackages = @(Get-ChildItem -LiteralPath $LocalAiPackageDir -Filter "*.tgz" -File)
+	if ($LocalAiPackages.Count -ne 1) {
+		throw "本地 pi-ai 压包数量异常：$($LocalAiPackages.Count)"
+	}
+	$LocalAiPackage = $LocalAiPackages[0].FullName
+
+	$LocalAgentPackages = @(Get-ChildItem -LiteralPath $LocalAgentPackageDir -Filter "*.tgz" -File)
     if ($LocalAgentPackages.Count -ne 1) {
         throw "本地 coding-agent 压包数量异常：$($LocalAgentPackages.Count)"
     }
@@ -159,15 +171,25 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的控制台关键资源与源码不一致" }
         Write-Host "已校验 Electron 暂存目录中的控制台关键资源"
 
-        & npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage
-        if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
-    } finally {
-        Pop-Location
-    }
+		& npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage
+		if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
 
-    $LocalAgentDist = Join-Path $CodingAgentDir "dist"
-    $InstalledAgentDist = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent\dist"
-    node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
+		$InstalledAgentRoot = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent"
+		& npm.cmd install --prefix $InstalledAgentRoot --no-audit --no-fund --no-save --package-lock=false --force $LocalAiPackage
+		if ($LASTEXITCODE -ne 0) { throw "将本地 pi-ai 安装到 coding-agent 实际依赖目录失败" }
+	} finally {
+		Pop-Location
+	}
+
+	$LocalAgentDist = Join-Path $CodingAgentDir "dist"
+	$LocalAiDist = Join-Path $AiDir "dist"
+	$InstalledAgentDist = Join-Path $InstalledAgentRoot "dist"
+	$InstalledAiDist = Join-Path $InstalledAgentRoot "node_modules\@earendil-works\pi-ai\dist"
+	node $Verifier --source-ai-dist $LocalAiDist --installed-ai-dist $InstalledAiDist --installed-agent-root $InstalledAgentRoot
+	if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 pi-ai 不是本地构建或 coding-agent 仍解析到 registry 副本" }
+	Write-Host "已校验 Electron 暂存目录中的本地 pi-ai 与实际解析路径"
+
+	node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
     if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 coding-agent 与本地构建不一致" }
     Write-Host "已校验 Electron 暂存目录中的本地 coding-agent"
 
@@ -183,9 +205,13 @@ try {
 
     $PackagedAsar = Join-Path $ElectronDir "dist\win-unpacked\resources\app.asar"
     if (-not (Test-Path -LiteralPath $PackagedAsar)) { throw "未找到打包结果 $PackagedAsar" }
-    node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
-    if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
-    Write-Host "已校验 app.asar 中的本地 coding-agent"
+	node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
+	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
+	Write-Host "已校验 app.asar 中的本地 coding-agent"
+
+	node $Verifier --source-ai-dist $LocalAiDist --asar $PackagedAsar
+	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 pi-ai 与本地构建不一致或仍包含嵌套 registry 副本" }
+	Write-Host "已校验 app.asar 中的本地 pi-ai 与 DeepSeek 模型数据"
 
 	node $Verifier --source-electron $ElectronDir --asar $PackagedAsar
 	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的可信浏览器控制器与暂存源码不一致" }
@@ -197,8 +223,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "安装包中的控制台关键资源与源码不一致" }
     Write-Host "已校验安装包中的控制台关键资源"
 } finally {
-	if (Test-Path -LiteralPath $LocalAgentPackageDir) {
-		Remove-Item -LiteralPath $LocalAgentPackageDir -Recurse -Force
+	if (Test-Path -LiteralPath $LocalPackageDir) {
+		Remove-Item -LiteralPath $LocalPackageDir -Recurse -Force
 	}
 }
 
