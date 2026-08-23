@@ -159,11 +159,17 @@ interface OpenAICompatCacheControl {
 
 type ResolvedOpenAICompletionsCompat = Omit<
 	Required<OpenAICompletionsCompat>,
-	"cacheControlFormat" | "deferredToolsMode" | "supportsThinkingTokenBudget"
+	| "cacheControlFormat"
+	| "deferredToolsMode"
+	| "requiresAssistantContentOnToolCalls"
+	| "supportsThinkingTokenBudget"
+	| "supportsToolChoiceWithThinking"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
+	requiresAssistantContentOnToolCalls?: OpenAICompletionsCompat["requiresAssistantContentOnToolCalls"];
 	supportsThinkingTokenBudget?: OpenAICompletionsCompat["supportsThinkingTokenBudget"];
+	supportsToolChoiceWithThinking?: OpenAICompletionsCompat["supportsToolChoiceWithThinking"];
 };
 
 type ResolvedChatTemplateKwargValue = string | number | boolean | null;
@@ -695,6 +701,19 @@ function buildParams(
 		compat.supportsOpenAIGrammarTools,
 	),
 ) {
+	// Some OpenAI-compatible reasoning APIs reject every explicit tool_choice
+	// while thinking is enabled. Silently dropping "required" or "none" breaks
+	// the caller's control-flow contract: a required tool may never run, or a
+	// completed tool may be called again. For non-auto choices, preserve the
+	// explicit routing policy and turn thinking off for this provider request.
+	if (
+		options?.toolChoice !== undefined &&
+		options.toolChoice !== "auto" &&
+		options.reasoningEffort !== undefined &&
+		compat.supportsToolChoiceWithThinking === false
+	) {
+		options = { ...options, reasoningEffort: undefined };
+	}
 	const messages = convertMessages(model, context, compat, { grammarToolInputProperties });
 	const cacheControl = getCompatCacheControl(compat, cacheRetention);
 
@@ -747,7 +766,7 @@ function buildParams(
 		applyAnthropicCacheControl(messages, params.tools, cacheControl);
 	}
 
-	if (options?.toolChoice) {
+	if (options?.toolChoice && (compat.supportsToolChoiceWithThinking !== false || !options.reasoningEffort)) {
 		params.tool_choice = options.toolChoice;
 	}
 
@@ -1191,6 +1210,9 @@ export function convertMessages(
 
 			const toolCalls = msg.content.filter(isToolCallBlock);
 			if (toolCalls.length > 0) {
+				if (compat.requiresAssistantContentOnToolCalls && assistantMsg.content == null) {
+					assistantMsg.content = "";
+				}
 				assistantMsg.tool_calls = toolCalls.map((tc): ChatCompletionMessageToolCall => {
 					const customInputProperty = options?.grammarToolInputProperties?.get(tc.name);
 					if (customInputProperty !== undefined) {
@@ -1507,6 +1529,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		supportsDeveloperRole: isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter),
 		supportsReasoningEffort:
 			!isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAntLing,
+		supportsToolChoiceWithThinking: !isDeepSeek,
 		supportsUsageInStreaming: true,
 		supportsFinishReason: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
@@ -1514,6 +1537,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		requiresAssistantAfterToolResult: false,
 		requiresThinkingAsText: false,
 		requiresReasoningContentOnAssistantMessages: isDeepSeek,
+		requiresAssistantContentOnToolCalls: isDeepSeek,
 		thinkingFormat: isDeepSeek
 			? "deepseek"
 			: isZai
@@ -1559,6 +1583,8 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		supportsStore: model.compat.supportsStore ?? detected.supportsStore,
 		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? detected.supportsDeveloperRole,
 		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? detected.supportsReasoningEffort,
+		supportsToolChoiceWithThinking:
+			model.compat.supportsToolChoiceWithThinking ?? detected.supportsToolChoiceWithThinking,
 		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? detected.supportsUsageInStreaming,
 		supportsFinishReason: model.compat.supportsFinishReason ?? detected.supportsFinishReason,
 		maxTokensField: model.compat.maxTokensField ?? detected.maxTokensField,
@@ -1569,6 +1595,8 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		requiresReasoningContentOnAssistantMessages:
 			model.compat.requiresReasoningContentOnAssistantMessages ??
 			detected.requiresReasoningContentOnAssistantMessages,
+		requiresAssistantContentOnToolCalls:
+			model.compat.requiresAssistantContentOnToolCalls ?? detected.requiresAssistantContentOnToolCalls,
 		thinkingFormat: model.compat.thinkingFormat ?? detected.thinkingFormat,
 		openRouterRouting: model.compat.openRouterRouting ?? {},
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,

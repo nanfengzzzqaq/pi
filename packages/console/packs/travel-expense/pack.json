@@ -2,7 +2,7 @@
 	"name": "travel-expense",
 	"displayName": "差旅报销",
 	"description": "在客户端内置浏览器中自动填报易快报（合思）差旅费用报销单：关联出差申请、按规则填写字段与费用明细、上传票据附件，最后保存草稿",
-	"version": "1.3.0",
+	"version": "1.4.0",
 	"activation": {
 		"extensions": [".zip", ".ofd", ".pdf", ".png", ".jpg", ".jpeg"],
 		"keywords": [

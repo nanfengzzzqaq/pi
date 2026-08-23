@@ -1,8 +1,17 @@
 import { basename } from "node:path";
 import {
+	EKUAIBAO_TRUSTED_CONTRACT_VERSION,
 	getAgentBrowserRuntime,
 	redactSensitiveText,
 	resolveSensitiveBrowserUrl,
+	type EkuaibaoTrustedFailureCode,
+	type EkuaibaoTrustedCommand,
+	type EkuaibaoTrustedControl,
+	type EkuaibaoTrustedField,
+	type EkuaibaoTrustedOptionKind,
+	type EkuaibaoTrustedPageState,
+	type EkuaibaoTrustedScope,
+	type EkuaibaoTrustedUploadSlot,
 	type AgentBrowserRuntime,
 	type AgentBrowserTarget,
 } from "../../src/agent-browser-runtime.ts";
@@ -23,6 +32,7 @@ import {
 	type TravelDraftObservation,
 	type TravelDraftPlan,
 	type TravelDraftPrecheckResult,
+	type TravelDraftConfirmationOptions,
 	type TravelDraftTransportExpected,
 	type TravelExpenseNature,
 	TravelDraftInterruptedError,
@@ -103,7 +113,14 @@ export interface TravelDraftBrowserDriverOptions {
 	onBrowserAction?: (event: TravelDraftBrowserActionEvent) => void | Promise<void>;
 }
 
-export type TravelDraftBrowserActionKind = "navigate" | "snapshot" | "click" | "hover" | "type" | "upload";
+export type TravelDraftBrowserActionKind =
+	| "navigate"
+	| "snapshot"
+	| "trusted"
+	| "click"
+	| "hover"
+	| "type"
+	| "upload";
 
 export interface TravelDraftBrowserActionEvent {
 	index: number;
@@ -549,6 +566,7 @@ function linkedApplicationCandidate(
 
 interface VerifiedApplicationFacts {
 	application: TravelDraftApplication;
+	source: "candidate" | "details";
 }
 
 interface ParsedApplicationFacts {
@@ -572,24 +590,76 @@ function normalizedFactCity(value: string): string {
 	return normalizeText(leaf).replace(/(?:市|地区|自治州)$/, "");
 }
 
-function parseLinkedApplicationFacts(snapshot: string, candidate: TravelApplicationCandidate): ParsedApplicationFacts {
+interface ParsedApplicationSourceFacts {
+	reason?: string;
+	expenseNature?: TravelExpenseNature;
+	source?: VerifiedApplicationFacts["source"];
+	missing: TravelDraftIssue[];
+	ambiguous: TravelDraftIssue[];
+}
+
+function reasonFromApplicationTitle(title: string): string | undefined {
+	const match = /^出差申请\s*[：:]\s*(.+)$/.exec(title.trim());
+	return match?.[1]?.trim() || undefined;
+}
+
+function parseApplicationSourceFacts(
+	snapshot: string,
+	candidate: TravelApplicationCandidate,
+	source: VerifiedApplicationFacts["source"],
+): ParsedApplicationSourceFacts {
+	const missing: TravelDraftIssue[] = [];
+	const ambiguous: TravelDraftIssue[] = [];
+	if (!snapshot.includes(candidate.id) || !snapshot.includes(candidate.title)) {
+		missing.push(issue("application_source_unverified", "application", "申请来源范围未同时显示申请编号和标题"));
+	}
+	const elements = parseSnapshotElements(snapshot);
+	const explicitReasons = ["申请事由", "出差事由", "事由"]
+		.flatMap((label) => semanticFieldValues(elements, label))
+		.map((value) => value.trim())
+		.filter(Boolean);
+	for (const match of snapshot.matchAll(
+		/(?:申请事由|出差事由|(?<!报销)事由)\s*[：:=]\s*(.+?)(?=\s+费用性质\s*[：:=]|[|；;\n)）]|$)/g,
+	)) {
+		if (match[1]?.trim()) explicitReasons.push(match[1].trim());
+	}
+	const reasons = [...new Map(explicitReasons.map((value) => [normalizeText(value), value])).values()];
+	const titleReason = reasonFromApplicationTitle(candidate.title);
+	if (reasons.length === 0 && titleReason) reasons.push(titleReason);
+	const expenseNatures = [
+		...new Set([
+			...semanticFieldValues(elements, "费用性质"),
+			...(snapshot.match(/费用性质\s*[：:=]\s*(部门费用|项目费用)/g) ?? []).map(
+				(value) => /部门费用/.test(value) ? "部门费用" : "项目费用",
+			),
+		].filter((value): value is TravelExpenseNature => value === "部门费用" || value === "项目费用")),
+	];
+	if (reasons.length === 0) missing.push(issue("application_fact_missing", "reason", "申请详情缺少唯一申请事由"));
+	else if (reasons.length > 1) ambiguous.push(issue("application_fact_ambiguous", "reason", "申请详情出现冲突的申请事由"));
+	if (expenseNatures.length === 0) {
+		missing.push(issue("application_fact_missing", "expenseNature", "申请详情缺少唯一费用性质"));
+	} else if (expenseNatures.length > 1) {
+		ambiguous.push(issue("application_fact_ambiguous", "expenseNature", "申请详情出现冲突的费用性质"));
+	}
+	return {
+		reason: reasons.length === 1 ? reasons[0] : undefined,
+		expenseNature: expenseNatures.length === 1 ? expenseNatures[0] : undefined,
+		source: missing.length === 0 && ambiguous.length === 0 ? source : undefined,
+		missing,
+		ambiguous,
+	};
+}
+
+function parseLinkedApplicationFacts(
+	snapshot: string,
+	candidate: TravelApplicationCandidate,
+	sourceFacts: ParsedApplicationSourceFacts,
+): ParsedApplicationFacts {
 	const missing: TravelDraftIssue[] = [];
 	const ambiguous: TravelDraftIssue[] = [];
 	const elements = parseSnapshotElements(snapshot);
-	const reasons = [
-		...new Map(
-			elements
-				.filter((element) => testId(element) === TEST_IDS.description && !isEmptyText(element.text))
-				.map((element) => [normalizeText(element.text), element.text]),
-		).values(),
-	];
-	const expenseNatures = [
-		...new Map(
-			semanticFieldValues(elements, "费用性质")
-				.filter((value): value is TravelExpenseNature => value === "部门费用" || value === "项目费用")
-				.map((value) => [value, value]),
-		).values(),
-	];
+	missing.push(...sourceFacts.missing);
+	ambiguous.push(...sourceFacts.ambiguous);
 	const linkedDates = elements.filter(
 		(element) => fieldLabel(element) === "申请单中的差旅起止日期" && element.descriptor.split("/").includes("disabled"),
 	);
@@ -604,8 +674,6 @@ function parseLinkedApplicationFacts(snapshot: string, candidate: TravelApplicat
 	const startDates = dateValues("开始日期");
 	const endDates = dateValues("结束日期");
 	for (const [field, label, values] of [
-		["reason", "关联确认后自动带出的报销说明", reasons],
-		["expenseNature", "关联确认后自动带出的费用性质", expenseNatures],
 		["startDate", "申请单中的差旅开始日期", startDates],
 		["endDate", "申请单中的差旅结束日期", endDates],
 	] as Array<[string, string, string[]]>) {
@@ -621,11 +689,12 @@ function parseLinkedApplicationFacts(snapshot: string, candidate: TravelApplicat
 			application: {
 				id: candidate.id,
 				title: candidate.title,
-				reason: reasons[0],
+				reason: sourceFacts.reason!,
 				startDate: startDates[0],
 				endDate: endDates[0],
-				expenseNature: expenseNatures[0],
+				expenseNature: sourceFacts.expenseNature!,
 			},
+			source: sourceFacts.source!,
 		},
 		missing,
 		ambiguous,
@@ -662,20 +731,12 @@ function linkedApplicationIssues(
 	const invoiceCities = [...new Set(invoiceFacts.cities.map(normalizedFactCity).filter(Boolean))];
 	const station = normalizedFactCity("南京");
 	const destinations = invoiceCities.filter((city) => city !== station);
-	if (!invoiceCities.includes(station) || destinations.length !== 1) {
+	if (!invoiceCities.includes(station) || destinations.length === 0) {
 		issues.push(
 			issue(
 				"application_city_conflict",
 				"application",
-				"票据城市必须形成以南京为驻地、唯一外地城市为目的地的双向集合",
-			),
-		);
-	} else if (!containsNormalized(application.title, destinations[0])) {
-		issues.push(
-			issue(
-				"application_city_conflict",
-				"application",
-				`票据目的地“${destinations[0]}”未在关联申请标题“${application.title}”中出现`,
+				"票据城市必须包含驻地南京和至少一个外地目的地",
 			),
 		);
 	}
@@ -694,6 +755,23 @@ function detailScope(row: TravelDraftTransportExpected | TravelDraftHotelExpecte
 
 function detailDrawerScope(feeType: string, ...fieldLabels: string[]): string[] {
 	return ["添加明细", feeType, ...fieldLabels];
+}
+
+function trustedDetailKind(feeType: string): "transport" | "hotel" | "allowance" {
+	if (feeType === FEE_TYPES.transport) return "transport";
+	if (feeType === FEE_TYPES.hotel) return "hotel";
+	if (feeType === FEE_TYPES.allowance) return "allowance";
+	throw new Error(`未知差旅费用类型：${feeType}`);
+}
+
+function trustedDetailEvidence(
+	row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+): string[] {
+	if (row.kind === "transport") {
+		return [row.startDate, row.endDate, row.fromCity, row.toCity, row.seatClass, row.amount.toFixed(2)];
+	}
+	if (row.kind === "hotel") return [row.checkinDate, row.checkoutDate, row.amount.toFixed(2), row.paymentRecipient];
+	return [row.startDate, row.endDate, row.allowanceType, row.amount.toFixed(2), row.paymentRecipient];
 }
 
 function detailCoreEvidence(
@@ -721,9 +799,28 @@ function detailCoreEvidence(
 type DetailRecipientLabel = "费用报销人" | "支付信息";
 
 function paymentAccountEvidence(value: string): boolean {
+	const normalized = normalizeText(value);
+	if (!normalized.includes(normalizeText(TRAVEL_DRAFT_CURRENT_USER))) return false;
+	if (paymentAccountExplicitlyNonPersonal(value)) return false;
+	if (normalized.includes(normalizeText(`${TRAVEL_DRAFT_CURRENT_USER}个人账户`))) return true;
+	const hasBankAccountDescriptor = /(?:银行|银行卡|卡号|账号|账户尾号|尾号)/.test(value);
+	const hasAccountIdentifier = /(?:\d{4,}|[*＊•·]{2,})/.test(value);
+	return hasBankAccountDescriptor && hasAccountIdentifier;
+}
+
+function paymentAccountExplicitlyNonPersonal(value: string): boolean {
+	return /(?:公司账户|企业账户|对公)/.test(normalizeText(value));
+}
+
+function paymentNameOnlyEvidence(value: string): boolean {
+	return !paymentAccountExplicitlyNonPersonal(value) && normalizeText(value) === normalizeText(TRAVEL_DRAFT_CURRENT_USER);
+}
+
+function paymentPickerScopeEvidence(snapshot: string): boolean {
 	return (
-		containsNormalized(value, TRAVEL_DRAFT_CURRENT_USER) &&
-		(containsNormalized(value, "个人账户") || /银行|尾号|[*＊•·]{2,}|\d{4,}/.test(value))
+		!paymentAccountExplicitlyNonPersonal(snapshot) &&
+		containsNormalized(snapshot, TRAVEL_DRAFT_CURRENT_USER) &&
+		containsNormalized(snapshot, "个人账户")
 	);
 }
 
@@ -757,10 +854,14 @@ function recipientFieldValues(snapshot: string, label: DetailRecipientLabel): st
 	return [...new Map(values.map((value) => [normalizeText(value), value])).values()];
 }
 
-function drawerRecipientEvidence(snapshot: string, label: DetailRecipientLabel): boolean {
+function drawerRecipientEvidence(snapshot: string, label: DetailRecipientLabel, allowVerifiedNameOnly = false): boolean {
 	const values = recipientFieldValues(snapshot, label);
 	if (values.length !== 1 || !containsNormalized(values[0], TRAVEL_DRAFT_CURRENT_USER)) return false;
-	return label !== "支付信息" || paymentAccountEvidence(values[0]);
+	return (
+		label !== "支付信息" ||
+		paymentAccountEvidence(values[0]) ||
+		(allowVerifiedNameOnly && paymentNameOnlyEvidence(values[0]))
+	);
 }
 
 function foldedExpenseReporterEvidence(snapshot: string): boolean {
@@ -773,12 +874,21 @@ function foldedExpenseReporterEvidence(snapshot: string): boolean {
 function foldedPaymentEvidence(
 	snapshot: string,
 	row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+	allowVerifiedNameOnly = false,
 ): boolean {
-	const account = `${TRAVEL_DRAFT_CURRENT_USER}（个人账户）`;
 	const expectedCents = Math.round(row.amount * 100);
 	const hasAccount = snapshot
 		.split(/\r?\n/)
-		.some((line) => containsNormalized(line, account));
+		.map((line) => line.trim())
+		.some(
+			(line) =>
+				paymentAccountEvidence(line) ||
+				(allowVerifiedNameOnly &&
+					(paymentNameOnlyEvidence(line) ||
+						new RegExp(`(?:^|\\s)(?:支付信息|收款人)[：:]?\\s*${TRAVEL_DRAFT_CURRENT_USER}(?=\\s|$)`).test(
+							line,
+						))),
+		);
 	const hasPaymentContext = /(?:支付信息|收款人|已有发票|支付计划|支付方式|全额支付)/.test(snapshot);
 	return hasAccount && hasPaymentContext && moneyTokenCents(snapshot).includes(expectedCents);
 }
@@ -786,9 +896,10 @@ function foldedPaymentEvidence(
 function foldedDetailEvidence(
 	snapshot: string,
 	row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+	allowVerifiedNameOnly = false,
 ): boolean {
 	if (foldedDetailCandidates(snapshot, row).length === 0) return false;
-	if (!foldedPaymentEvidence(snapshot, row)) return false;
+	if (!foldedPaymentEvidence(snapshot, row, allowVerifiedNameOnly)) return false;
 	if (row.kind === "allowance") return snapshot.includes(String(row.days));
 	if (!hasBoundInvoiceCount(snapshot)) return false;
 	return true;
@@ -816,10 +927,11 @@ function drawerDetailEvidence(
 	attachmentSnapshot: string | undefined,
 	row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
 	invoiceBindingVerified: boolean,
+	paymentNameOnlyVerified: boolean,
 ): boolean {
 	if (!detailCoreEvidence(formSnapshot, row)) return false;
 	if (!drawerRecipientEvidence(reporterSnapshot, "费用报销人")) return false;
-	if (!drawerRecipientEvidence(paymentSnapshot, "支付信息")) return false;
+	if (!drawerRecipientEvidence(paymentSnapshot, "支付信息", paymentNameOnlyVerified)) return false;
 	if (!drawerAmountEvidence(formSnapshot, row.amount)) return false;
 	if (row.kind === "allowance") return formSnapshot.includes(String(row.days));
 	if (
@@ -860,6 +972,14 @@ function detailFeeType(row: TravelDraftTransportExpected | TravelDraftHotelExpec
 	if (row.kind === "transport") return FEE_TYPES.transport;
 	if (row.kind === "hotel") return FEE_TYPES.hotel;
 	return FEE_TYPES.allowance;
+}
+
+type PaymentVerificationDomain = "main" | `detail:${string}`;
+
+function detailPaymentDomain(
+	row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+): PaymentVerificationDomain {
+	return `detail:${row.key}`;
 }
 
 function parseDetailCount(snapshot: string): number | undefined {
@@ -907,12 +1027,17 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	private readonly verifiedDetails = new Map<string, TravelDraftDetailObservation>();
 	private readonly verifiedInvoiceBindings = new Set<string>();
 	private readonly verifiedDepartments = new Set<"申请人部门" | "费用所属部门">();
+	private readonly verifiedPaymentDomains = new Set<PaymentVerificationDomain>();
 	private verificationValid = false;
 	private saveAttempted = false;
 	private saveRequested = false;
 	private saveConfirmation: string | undefined;
 	private saveVerifiedObservation: TravelDraftObservation | undefined;
 	private detailCountBeforeOpen: number | undefined;
+	private lastTrustedState: EkuaibaoTrustedPageState | undefined;
+	private lastVerifiedTrustedDigest: string | undefined;
+	private lastDocumentToken: string | undefined;
+	private lastDocumentUrl: string | undefined;
 
 	constructor(options: TravelDraftBrowserDriverOptions = {}) {
 		this.browser = options.runtime ?? getAgentBrowserRuntime();
@@ -970,6 +1095,8 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		this.saveConfirmation = undefined;
 		this.saveVerifiedObservation = undefined;
 		this.verificationValid = false;
+		this.lastVerifiedTrustedDigest = undefined;
+		this.lastTrustedState = undefined;
 	}
 
 	private draftSaveObservation(): TravelDraftObservation {
@@ -1000,6 +1127,11 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			);
 		}
 		this.invalidateDraftSaveEvidence();
+		// These capabilities are document-local. Never carry a collapsed payment
+		// display proof into another form, even when business row keys happen to match.
+		this.verifiedPaymentDomains.clear();
+		this.lastDocumentToken = undefined;
+		this.lastDocumentUrl = undefined;
 		await this.beforeBrowserAction("navigate", "打开差旅报销页面");
 		try {
 			await this.browser.navigate(resolved);
@@ -1011,6 +1143,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async snapshot(scopeTexts?: string[]): Promise<string> {
+		this.observeDocumentUrl();
 		await this.beforeBrowserAction("snapshot", "读取页面快照");
 		const output = await this.browser.snapshot({
 			maxChars: this.snapshotMaxChars,
@@ -1019,6 +1152,181 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		});
 		this.throwIfAborted("读取页面快照");
 		return output;
+	}
+
+	private observeDocumentUrl(): void {
+		const url = this.browser.state().url;
+		if (!url) return;
+		if (this.lastDocumentUrl && this.lastDocumentUrl !== url) this.verifiedPaymentDomains.clear();
+		this.lastDocumentUrl = url;
+	}
+
+	private observeTrustedDocumentToken(pageToken: string): void {
+		if (this.lastDocumentToken && this.lastDocumentToken !== pageToken) {
+			this.verifiedPaymentDomains.clear();
+		}
+		this.lastDocumentToken = pageToken;
+	}
+
+	private trustedBlockerCode(code: EkuaibaoTrustedFailureCode): TravelDraftBrowserBlockerCode {
+		if (code === "missing_anchor") return "missing_anchor";
+		if (code === "ambiguous_anchor") return "ambiguous_anchor";
+		if (code === "unsafe_target") return "unsafe_target";
+		if (code === "wrong_page" || code === "stale_page") return "unsafe_page_state";
+		return "unverified_state";
+	}
+
+	private async inspectTrusted(operation: string): Promise<EkuaibaoTrustedPageState | undefined> {
+		if (!this.browser.runEkuaibaoTrustedCommand) return undefined;
+		this.observeDocumentUrl();
+		await this.beforeBrowserAction("trusted", operation);
+		const result = await this.browser.runEkuaibaoTrustedCommand({
+			op: "inspect",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+		});
+		if (!result.ok) {
+			this.blocker(this.trustedBlockerCode(result.code), operation, result.message, [result.code]);
+		}
+		this.observeTrustedDocumentToken(result.state.pageToken);
+		if (this.lastVerifiedTrustedDigest && result.state.digest !== this.lastVerifiedTrustedDigest) {
+			this.verificationValid = false;
+		}
+		this.lastTrustedState = result.state;
+		return result.state;
+	}
+
+	private async runTrustedMutation(
+		operation: string,
+		command: Exclude<EkuaibaoTrustedCommand, { op: "inspect" }>,
+	): Promise<EkuaibaoTrustedPageState> {
+		const run = this.browser.runEkuaibaoTrustedCommand?.bind(this.browser);
+		if (!run) this.blocker("unverified_state", operation, "当前客户端没有可信合思命令运行时");
+		this.invalidateDraftSaveEvidence();
+		await this.beforeBrowserAction("trusted", operation);
+		const result = await run(command);
+		if (!result.ok) {
+			this.blocker(this.trustedBlockerCode(result.code), operation, result.message, [result.code]);
+		}
+		this.observeTrustedDocumentToken(result.state.pageToken);
+		this.lastTrustedState = result.state;
+		return result.state;
+	}
+
+	private trustedOverlayForScope(scope: EkuaibaoTrustedScope): EkuaibaoTrustedPageState["overlay"] {
+		if (scope.kind === "main") return "none";
+		if (scope.kind === "application-dialog") return "application-dialog";
+		if (scope.kind === "application-details") return "application-details";
+		if (scope.kind === "detail-picker") return "detail-picker";
+		if (scope.kind === "detail-drawer") return "detail-drawer";
+		if (scope.kind === "invoice-menu") return "invoice-menu";
+		if (scope.kind === "invoice-dialog") return "invoice-dialog";
+		return "invoice-results";
+	}
+
+	private async trustedBaseline(operation: string, scope: EkuaibaoTrustedScope): Promise<EkuaibaoTrustedPageState> {
+		const state = await this.inspectTrusted(operation);
+		const expectedOverlay = this.trustedOverlayForScope(scope);
+		if (!state || state.overlay !== expectedOverlay) {
+			this.blocker(
+				"unverified_state",
+				operation,
+				`可信命令要求 ${scope.kind}，当前结构化页面层为 ${state?.overlay ?? "不可读"}`,
+			);
+		}
+		return state;
+	}
+
+	private async trustedClick(
+		operation: string,
+		control: EkuaibaoTrustedControl,
+		scope: EkuaibaoTrustedScope,
+		extra: { detailKind?: "transport" | "hotel" | "allowance"; evidence?: string[] } = {},
+	): Promise<EkuaibaoTrustedPageState> {
+		const baseline = await this.trustedBaseline(operation, scope);
+		return this.runTrustedMutation(operation, {
+			op: "click",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: baseline.pageToken,
+			expectedDigest: baseline.digest,
+			control,
+			scope,
+			...extra,
+		});
+	}
+
+	private async trustedType(
+		operation: string,
+		field: EkuaibaoTrustedField,
+		scope: EkuaibaoTrustedScope,
+		value: string,
+		commit = true,
+	): Promise<EkuaibaoTrustedPageState> {
+		const baseline = await this.trustedBaseline(operation, scope);
+		return this.runTrustedMutation(operation, {
+			op: "type",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: baseline.pageToken,
+			expectedDigest: baseline.digest,
+			field,
+			scope,
+			value,
+			commit,
+		});
+	}
+
+	private async trustedHover(
+		operation: string,
+		scope: Extract<EkuaibaoTrustedScope, { kind: "detail-drawer" }>,
+	): Promise<EkuaibaoTrustedPageState> {
+		const baseline = await this.trustedBaseline(operation, scope);
+		return this.runTrustedMutation(operation, {
+			op: "hover",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: baseline.pageToken,
+			expectedDigest: baseline.digest,
+			control: "show-invoice-menu",
+			scope,
+		});
+	}
+
+	private async trustedSelect(
+		operation: string,
+		optionKind: EkuaibaoTrustedOptionKind,
+		scope: EkuaibaoTrustedScope,
+		value: string,
+		evidence: string[] = [],
+	): Promise<EkuaibaoTrustedPageState> {
+		const baseline = await this.trustedBaseline(operation, scope);
+		return this.runTrustedMutation(operation, {
+			op: "select-exact",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: baseline.pageToken,
+			expectedDigest: baseline.digest,
+			optionKind,
+			scope,
+			value,
+			evidence,
+		});
+	}
+
+	private async trustedUpload(
+		operation: string,
+		slot: EkuaibaoTrustedUploadSlot,
+		scope: Extract<EkuaibaoTrustedScope, { kind: "invoice-dialog" | "detail-drawer" }>,
+		paths: string[],
+	): Promise<EkuaibaoTrustedPageState> {
+		const baseline = await this.trustedBaseline(operation, scope);
+		const files = readAgentBrowserUploadFiles(this.cwd, paths);
+		this.throwIfAborted(operation);
+		return this.runTrustedMutation(operation, {
+			op: "upload",
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: baseline.pageToken,
+			expectedDigest: baseline.digest,
+			slot,
+			scope,
+			files,
+		});
 	}
 
 	private requireUnique(
@@ -1040,6 +1348,128 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		return matches[0];
 	}
 
+	private sourceFactsFromVerified(candidate: TravelApplicationCandidate): ParsedApplicationSourceFacts | undefined {
+		const verified = this.verifiedApplicationFacts;
+		if (!verified || verified.application.id !== candidate.id || verified.application.title !== candidate.title) {
+			return undefined;
+		}
+		return {
+			reason: verified.application.reason,
+			expenseNature: verified.application.expenseNature,
+			source: verified.source,
+			missing: [],
+			ambiguous: [],
+		};
+	}
+
+	private async inspectApplicationSourceFacts(
+		candidate: TravelApplicationCandidate,
+		candidateSnapshot: string,
+	): Promise<ParsedApplicationSourceFacts> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const operation = "核对关联申请详情";
+			let state = await this.inspectTrusted(operation);
+			if (!state || state.overlay !== "application-dialog") {
+				this.blocker("unverified_state", operation, "可信页面当前不在唯一关联申请弹窗中");
+			}
+			state = await this.runTrustedMutation(operation, {
+				op: "select-exact",
+				contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+				pageToken: state.pageToken,
+				expectedDigest: state.digest,
+				optionKind: "application",
+				scope: { kind: "application-dialog" },
+				value: candidate.id,
+				evidence: [candidate.title],
+			});
+			if (state.overlay !== "application-dialog") {
+				this.blocker("unverified_state", operation, "选择候选后关联申请弹窗状态发生意外变化");
+			}
+			state = await this.runTrustedMutation(operation, {
+				op: "click",
+				contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+				pageToken: state.pageToken,
+				expectedDigest: state.digest,
+				control: "open-application-details",
+				scope: { kind: "application-dialog" },
+			});
+			if (state.overlay !== "application-details") {
+				this.blocker("unverified_state", operation, "可信详情打开命令未进入唯一申请详情层");
+			}
+			const source = state.applicationSource;
+			const validationErrors: string[] = [];
+			const sourceId = typeof source?.id === "string" ? source.id.trim() : "";
+			const sourceTitle = typeof source?.title === "string" ? source.title.trim() : "";
+			const sourceReason = typeof source?.reason === "string" ? source.reason.trim() : "";
+			const sourceNature =
+				source?.expenseNature === "部门费用" || source?.expenseNature === "项目费用"
+					? source.expenseNature
+					: undefined;
+			if (!sourceId) validationErrors.push("详情缺少申请编号");
+			else if (sourceId.toUpperCase() !== candidate.id.trim().toUpperCase()) {
+				validationErrors.push(`详情申请编号 ${sourceId} 与候选 ${candidate.id} 不一致`);
+			}
+			if (!sourceTitle) validationErrors.push("详情缺少申请标题");
+			else if (normalizeText(sourceTitle) !== normalizeText(candidate.title)) {
+				validationErrors.push(`详情申请标题 ${sourceTitle} 与候选 ${candidate.title} 不一致`);
+			}
+			if (!sourceReason) validationErrors.push("详情缺少显式申请事由");
+			if (!sourceNature) validationErrors.push("详情费用性质不在部门费用/项目费用白名单内");
+			state = await this.runTrustedMutation("关闭关联申请详情", {
+				op: "click",
+				contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+				pageToken: state.pageToken,
+				expectedDigest: state.digest,
+				control: "close-application-details",
+				scope: { kind: "application-details" },
+			});
+			if (state.overlay !== "application-dialog") {
+				this.blocker("unverified_state", "关闭关联申请详情", "关闭详情后未返回唯一关联申请弹窗");
+			}
+			if (validationErrors.length > 0 || !sourceReason || !sourceNature) {
+				this.blocker("unsafe_page_state", operation, "申请详情事实与当前唯一候选不一致", validationErrors);
+			}
+			return {
+				reason: sourceReason,
+				expenseNature: sourceNature,
+				source: "details",
+				missing: [],
+				ambiguous: [],
+			};
+		}
+		const cached = this.sourceFactsFromVerified(candidate);
+		if (cached) return cached;
+		const inline = parseApplicationSourceFacts(candidate.evidence, candidate, "candidate");
+		if (inline.missing.length === 0 && inline.ambiguous.length === 0) return inline;
+		const details = parseSnapshotElements(candidateSnapshot).filter(
+			(element) =>
+				/^(?:查看)?详情$/.test(normalizeText(element.text)) &&
+				["button", "a", "div", "span"].includes(element.descriptor.split("/")[0]),
+		);
+		if (details.length !== 1) return inline;
+		await this.click("核对关联申请详情", {
+			ref: details[0].ref,
+			scopeTexts: [candidate.id, candidate.title],
+		});
+		await this.pause();
+		const detailSnapshot = await this.snapshot([candidate.id, candidate.title, "费用性质"]);
+		const parsed = parseApplicationSourceFacts(detailSnapshot, candidate, "details");
+		const close = this.requireUnique(
+			detailSnapshot,
+			(element) =>
+				element.descriptor.startsWith("button") &&
+				(["关闭", "取消"].includes(normalizeText(element.text)) || /OutlinedTipsClose/.test(element.text)),
+			"核对关联申请详情",
+			"申请详情必须有唯一关闭按钮",
+		);
+		await this.click("关闭关联申请详情", {
+			ref: close.ref,
+			scopeTexts: [candidate.id, candidate.title, "费用性质"],
+		});
+		await this.pause();
+		return parsed;
+	}
+
 	private safeTarget(operation: string, target: AgentBrowserTarget): void {
 		const encoded = JSON.stringify(target);
 		if (DANGEROUS_TARGET.test(encoded)) {
@@ -1048,6 +1478,9 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async click(operation: string, target: AgentBrowserTarget): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			this.blocker("unsafe_target", operation, "新客户端禁止合思写操作回退到 generic click/ref/selector");
+		}
 		this.safeTarget(operation, target);
 		if (target.selector !== `[data-testid="${TEST_IDS.saveDraft}"]`) this.invalidateDraftSaveEvidence();
 		await this.beforeBrowserAction("click", operation);
@@ -1056,7 +1489,11 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async hover(operation: string, target: AgentBrowserTarget): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			this.blocker("unsafe_target", operation, "新客户端禁止合思写操作回退到 generic hover/ref");
+		}
 		this.safeTarget(operation, target);
+		this.invalidateDraftSaveEvidence();
 		await this.beforeBrowserAction("hover", operation);
 		await this.browser.hover(target);
 		this.throwIfAborted(operation);
@@ -1069,6 +1506,9 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		pressEnter = false,
 		commit = true,
 	): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			this.blocker("unsafe_target", operation, "新客户端禁止合思写操作回退到 generic type/ref");
+		}
 		this.safeTarget(operation, target);
 		this.invalidateDraftSaveEvidence();
 		await this.beforeBrowserAction("type", operation);
@@ -1077,6 +1517,9 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async upload(operation: string, paths: string[], target: AgentBrowserTarget): Promise<string> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			this.blocker("unsafe_target", operation, "新客户端禁止合思附件回退到 generic upload/ref");
+		}
 		this.safeTarget(operation, target);
 		this.invalidateDraftSaveEvidence();
 		if (!isAllowedEkuaibaoUrl(this.browser.state().url)) {
@@ -1160,6 +1603,56 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		optionPredicate: (element: SnapshotElement) => boolean,
 		scopeTexts: string[],
 	): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const fieldMap: Partial<Record<string, EkuaibaoTrustedField>> = {
+				费用性质: "expense-nature",
+				申请人部门: "applicant-department",
+				费用所属部门: "expense-department",
+				出发城市: "departure-city",
+				到达城市: "arrival-city",
+				乘坐火车席别: "seat-class",
+				补助类型: "allowance-type",
+			};
+			const optionMap: Partial<Record<string, EkuaibaoTrustedOptionKind>> = {
+				费用性质: "expense-nature",
+				申请人部门: "department",
+				费用所属部门: "department",
+				出发城市: "city",
+				到达城市: "city",
+				乘坐火车席别: "seat-class",
+				补助类型: "allowance-type",
+			};
+			const field = fieldMap[fieldLabelText];
+			const optionKind = optionMap[fieldLabelText];
+			if (!field || !optionKind) this.blocker("unverified_state", operation, `字段 ${fieldLabelText} 没有可信选择契约`);
+			const feeType = Object.values(FEE_TYPES).find((item) => scopeTexts.includes(item));
+			const scope: EkuaibaoTrustedScope = feeType
+				? { kind: "detail-drawer", detailKind: trustedDetailKind(feeType) }
+				: { kind: "main" };
+			await this.trustedType(operation, field, scope, query, false);
+			await this.pause();
+			const value = optionKind === "department" ? TRAVEL_DRAFT_DEPARTMENT : query;
+			const selected = await this.trustedSelect(
+				operation,
+				optionKind,
+				scope,
+				value,
+				optionKind === "department" ? [departmentLeaf()] : [],
+			);
+			const selectedField = selected.fields[field];
+			if (!selectedField?.present || selectedField.ambiguous || !selectedField.value) {
+				this.blocker("unverified_state", operation, `可信选择后未结构化回读唯一 ${fieldLabelText}`);
+			}
+			const verified =
+				optionKind === "department"
+					? departmentPathMatches(selectedField.value) || departmentLeafMatches(selectedField.value)
+					: optionKind === "city"
+						? cityLevelPathMatches(selectedField.value, query)
+						: containsNormalized(selectedField.value, query);
+			if (!verified) this.blocker("unverified_state", operation, `可信选择后 ${fieldLabelText} 回读值不匹配 ${query}`);
+			await this.pause();
+			return;
+		}
 		const before = await this.snapshot(scopeTexts);
 		const input = this.field(before, fieldLabelText, operation, { editable: true, allowUnlabeled: true });
 		await this.type(operation, { ref: input.ref, scopeTexts }, query, false, false);
@@ -1195,14 +1688,77 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		}
 	}
 
-	private async ensureRecipient(label: "支付信息" | "费用报销人", scopeTexts: string[]): Promise<void> {
+	private paymentValueEvidence(value: string, domain: PaymentVerificationDomain): boolean {
+		if (paymentAccountEvidence(value)) return true;
+		return this.verifiedPaymentDomains.has(domain) && paymentNameOnlyEvidence(value);
+	}
+
+	private async ensureRecipient(
+		label: "支付信息" | "费用报销人",
+		scopeTexts: string[],
+		paymentDomain?: PaymentVerificationDomain,
+	): Promise<void> {
+		if (label === "支付信息" && !paymentDomain) {
+			this.blocker("unverified_state", `填写${label}`, "支付信息缺少主表或唯一业务明细凭证域");
+		}
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const feeType = Object.values(FEE_TYPES).find((item) => scopeTexts.includes(item));
+			const scope: EkuaibaoTrustedScope = feeType
+				? { kind: "detail-drawer", detailKind: trustedDetailKind(feeType) }
+				: { kind: "main" };
+			const field: EkuaibaoTrustedField =
+				label === "费用报销人" ? "expense-reporter" : scope.kind === "main" ? "main-payment-recipient" : "payment-recipient";
+			const current = await this.trustedBaseline(`填写${label}`, scope);
+			const currentField = current.fields[field];
+			if (currentField?.present && !currentField.ambiguous && currentField.value?.includes(TRAVEL_DRAFT_CURRENT_USER)) {
+				if (
+					label === "费用报销人" ||
+					(paymentDomain && this.paymentValueEvidence(currentField.value, paymentDomain))
+				) {
+					return;
+				}
+			}
+			if (!currentField?.present || currentField.ambiguous) {
+				this.blocker("unverified_state", `填写${label}`, `可信页面没有唯一 ${label} 字段`);
+			}
+			const control: EkuaibaoTrustedControl =
+				label === "费用报销人"
+					? "open-expense-reporter"
+					: scope.kind === "main"
+						? "open-main-payment-recipient"
+						: "open-payment-recipient";
+			await this.trustedClick(`填写${label}`, control, scope);
+			await this.pause();
+			const selected = await this.trustedSelect(
+				`填写${label}`,
+				label === "费用报销人" ? "expense-reporter" : "payment-recipient",
+				scope,
+				TRAVEL_DRAFT_CURRENT_USER,
+				label === "支付信息" ? [label, "个人账户"] : [label],
+			);
+			await this.pause();
+			const verified = selected.fields[field];
+			const selectedPaymentVerified =
+				label !== "支付信息" ||
+				Boolean(
+					verified?.value &&
+					(paymentAccountEvidence(verified.value) || paymentNameOnlyEvidence(verified.value)),
+				);
+			if (!verified?.present || verified.ambiguous || !verified.value?.includes(TRAVEL_DRAFT_CURRENT_USER) || !selectedPaymentVerified) {
+				this.blocker("unverified_state", `填写${label}`, `可信选择后未结构化回读唯一 ${label}`);
+			}
+			if (label === "支付信息" && paymentDomain) this.verifiedPaymentDomains.add(paymentDomain);
+			return;
+		}
 		const current = await this.snapshot(scopeTexts);
 		const currentElements = parseSnapshotElements(current);
 		const values = currentElements.filter((element) => {
 			if (fieldLabel(element) !== label || isEmptyText(element.text)) return false;
 			return !["label", "span", "svg", "img"].includes(element.descriptor.split("/")[0]);
 		});
-		if (drawerRecipientEvidence(current, label)) return;
+		if (drawerRecipientEvidence(current, label, Boolean(paymentDomain && this.verifiedPaymentDomains.has(paymentDomain)))) {
+			return;
+		}
 		if (values.length !== 1) {
 			this.blocker(
 				values.length === 0 ? "missing_anchor" : "ambiguous_anchor",
@@ -1214,11 +1770,15 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		await this.click(`填写${label}`, { ref: values[0].ref, scopeTexts });
 		await this.pause();
 		const picker = await this.snapshot([TRAVEL_DRAFT_CURRENT_USER]);
+		const pickerProvesPersonalAccount = label === "支付信息" && paymentPickerScopeEvidence(picker);
 		const choice = this.requireUnique(
 			picker,
 			(element) =>
 				element.text.includes(TRAVEL_DRAFT_CURRENT_USER) &&
-				(label === "支付信息" ? paymentAccountEvidence(element.text) : !isEmptyText(element.text)) &&
+				(label === "支付信息"
+					? paymentAccountEvidence(element.text) ||
+						(paymentNameOnlyEvidence(element.text) && pickerProvesPersonalAccount)
+					: !isEmptyText(element.text)) &&
 				fieldLabel(element) !== "提交人" &&
 				fieldLabel(element) !== "是否为多收款人" &&
 				(element.descriptor.split("/").includes("option") || testId(element) === "entity-profile"),
@@ -1228,7 +1788,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		await this.click(`填写${label}`, { ref: choice.ref, scopeTexts: [TRAVEL_DRAFT_CURRENT_USER] });
 		await this.pause();
 		const selected = await this.snapshot(scopeTexts);
-		if (!drawerRecipientEvidence(selected, label)) {
+		if (!drawerRecipientEvidence(selected, label, label === "支付信息")) {
 			this.blocker(
 				"unverified_state",
 				`填写${label}`,
@@ -1238,9 +1798,39 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				recipientFieldValues(selected, label),
 			);
 		}
+		if (label === "支付信息" && paymentDomain) this.verifiedPaymentDomains.add(paymentDomain);
 	}
 
 	private async ensureStation(): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const scope = { kind: "main" } as const;
+			const current = await this.trustedBaseline("填写驻地", scope);
+			const field = current.fields.station;
+			if (
+				field?.present &&
+				!field.ambiguous &&
+				field.value &&
+				containsNormalized(field.value, "江苏省") &&
+				cityLevelPathMatches(field.value, "南京")
+			) {
+				return;
+			}
+			if (!field?.present || field.ambiguous) this.blocker("unverified_state", "填写驻地", "可信页面没有唯一驻地字段");
+			await this.trustedType("填写驻地", "station", scope, "江苏省南京", false);
+			await this.pause();
+			const selected = await this.trustedSelect(
+				"填写驻地",
+				"station",
+				scope,
+				"中国 / 江苏省 / 南京",
+				["城市", "南京"],
+			);
+			const value = selected.fields.station?.value;
+			if (!value || !containsNormalized(value, "江苏省") || !cityLevelPathMatches(value, "南京")) {
+				this.blocker("unverified_state", "填写驻地", "可信选择后未结构化回读江苏省南京城市级驻地");
+			}
+			return;
+		}
 		const current = await this.snapshot(["驻地"]);
 		if (
 			scopedFieldValues(parseSnapshotElements(current), "驻地").some(
@@ -1267,12 +1857,57 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async ensureDimension(label: "费用性质" | "申请人部门" | "费用所属部门", value: string): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const field: EkuaibaoTrustedField =
+				label === "费用性质"
+					? "expense-nature"
+					: label === "申请人部门"
+						? "applicant-department"
+						: "expense-department";
+			const scope = { kind: "main" } as const;
+			const current = await this.trustedBaseline(`核对${label}`, scope);
+			const state = current.fields[field];
+			if (!state?.present || state.ambiguous) this.blocker("unverified_state", `核对${label}`, `可信页面没有唯一 ${label} 字段`);
+			const currentValue = state.value?.trim() ?? "";
+			if (label === "费用性质" && normalizeText(currentValue) === normalizeText(value)) return;
+			if (label !== "费用性质") {
+				if (departmentPathMatches(currentValue) || (departmentLeafMatches(currentValue) && this.verifiedDepartments.has(label))) {
+					this.verifiedDepartments.add(label);
+					return;
+				}
+				if (currentValue) {
+					this.blocker("unsafe_page_state", `核对${label}`, `当前 ${label} 未证明属于完整组织路径 ${TRAVEL_DRAFT_DEPARTMENT}`, [
+						currentValue,
+					]);
+				}
+			}
+			await this.selectExactOption(
+				`填写${label}`,
+				label,
+				label === "费用性质" ? value : departmentLeaf(),
+				() => false,
+				[label],
+			);
+			const selected = await this.trustedBaseline(`回读${label}`, scope);
+			const selectedValue = selected.fields[field]?.value ?? "";
+			if (
+				(label === "费用性质" && normalizeText(selectedValue) !== normalizeText(value)) ||
+				(label !== "费用性质" && !departmentPathMatches(selectedValue) && !departmentLeafMatches(selectedValue))
+			) {
+				this.blocker("unverified_state", `填写${label}`, `可信选择后未结构化回读 ${label}`);
+			}
+			if (label !== "费用性质") this.verifiedDepartments.add(label);
+			return;
+		}
 		const current = await this.snapshot([label]);
 		const currentValues = scopedFieldValues(parseSnapshotElements(current), label);
 		if (label !== "费用性质") {
-			if (currentValues.length === 1 && (departmentPathMatches(currentValues[0]) || departmentLeafMatches(currentValues[0]))) {
-				this.verifiedDepartments.add(label);
-				return;
+			if (currentValues.length === 1) {
+				if (departmentPathMatches(currentValues[0])) {
+					this.verifiedDepartments.add(label);
+					return;
+				}
+				if (departmentLeafMatches(currentValues[0]) && this.verifiedDepartments.has(label)) return;
 			}
 			if (currentValues.length > 0) {
 				this.blocker(
@@ -1313,6 +1948,22 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async ensureTextField(label: string, testIdValue: string, value: string): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			if (label !== "报销说明" || testIdValue !== TEST_IDS.description) {
+				this.blocker("unverified_state", `填写${label}`, "该文本字段没有可信写入契约");
+			}
+			const scope = { kind: "main" } as const;
+			const current = await this.trustedBaseline(`填写${label}`, scope);
+			const field = current.fields.description;
+			if (!field?.present || field.ambiguous) this.blocker("unverified_state", `填写${label}`, "可信页面没有唯一报销说明字段");
+			if (field.value === value) return;
+			const updated = await this.trustedType(`填写${label}`, "description", scope, value, true);
+			if (updated.fields.description?.value !== value) {
+				this.blocker("unverified_state", `填写${label}`, "可信输入后未结构化回读完整报销说明");
+			}
+			await this.pause();
+			return;
+		}
 		const snapshot = await this.snapshot([label]);
 		const field = this.field(snapshot, label, `填写${label}`, { testId: testIdValue, editable: true });
 		if (field.text === value) return;
@@ -1321,6 +1972,24 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async ensureDate(label: string, placeholderValue: "开始日期" | "结束日期", value: string, scope: string[]) {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const feeType = Object.values(FEE_TYPES).find((item) => scope.includes(item));
+			if (!feeType) this.blocker("unverified_state", `填写${label}${placeholderValue}`, "明细日期缺少可信费用类型范围");
+			const trustedScope = { kind: "detail-drawer", detailKind: trustedDetailKind(feeType) } as const;
+			const field: EkuaibaoTrustedField = placeholderValue === "开始日期" ? "detail-start-date" : "detail-end-date";
+			const current = await this.trustedBaseline(`填写${label}${placeholderValue}`, trustedScope);
+			const currentField = current.fields[field];
+			if (!currentField?.present || currentField.ambiguous) {
+				this.blocker("unverified_state", `填写${label}${placeholderValue}`, "可信页面没有唯一明细日期字段");
+			}
+			if (currentField.value === value) return;
+			const updated = await this.trustedType(`填写${label}${placeholderValue}`, field, trustedScope, value, true);
+			if (updated.fields[field]?.value !== value) {
+				this.blocker("unverified_state", `填写${label}${placeholderValue}`, "可信输入后未结构化回读明细日期");
+			}
+			await this.pause();
+			return;
+		}
 		const snapshot = await this.snapshot(scope);
 		const field = this.field(snapshot, label, `填写${label}${placeholderValue}`, {
 			placeholder: placeholderValue,
@@ -1332,6 +2001,39 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 	}
 
 	private async openDetail(feeType: string): Promise<void> {
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const mainScope = { kind: "main" } as const;
+			const main = await this.trustedBaseline("添加费用明细", mainScope);
+			const currentCount = main.detailCount;
+			if (currentCount === undefined) {
+				this.blocker("unverified_state", "添加费用明细", "可信主表未结构化返回唯一费用明细数");
+			}
+			if (currentCount !== this.verifiedDetails.size) {
+				this.blocker(
+					"existing_row_unverifiable",
+					"添加费用明细",
+					`主表已有 ${currentCount} 条费用明细，但本轮只完整复核了 ${this.verifiedDetails.size} 条`,
+				);
+			}
+			this.detailCountBeforeOpen = currentCount;
+			const picker = await this.trustedClick("添加费用明细", "add-detail", mainScope);
+			if (picker.overlay !== "detail-picker") {
+				this.blocker("unverified_state", "添加费用明细", "可信添加按钮未进入费用类型选择层");
+			}
+			const pickerScope = { kind: "detail-picker" } as const;
+			await this.trustedType("选择费用类型", "fee-type-search", pickerScope, feeType, false);
+			await this.pause();
+			const selected = await this.trustedSelect("选择费用类型", "fee-type", pickerScope, feeType);
+			if (selected.overlay !== "detail-drawer") {
+				this.blocker("unverified_state", "选择费用类型", `可信选择后未进入 ${feeType} 明细抽屉`);
+			}
+			const save = selected.controls["save-detail"];
+			if (!save?.present || save.ambiguous || save.disabled) {
+				this.blocker("unverified_state", "选择费用类型", "明细抽屉没有唯一可用的可信保存控件");
+			}
+			await this.pause();
+			return;
+		}
 		const main = await this.snapshot();
 		const currentCount = parseDetailCount(main);
 		if (currentCount === undefined) {
@@ -1403,6 +2105,9 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 
 	private async bindInvoice(row: TravelDraftTransportExpected | TravelDraftHotelExpected, feeType: string): Promise<void> {
 		const invoiceScope = detailDrawerScope(feeType, "上传发票");
+		// The caller's row type is the stronger proof here: allowance rows can never enter
+		// the invoice overlays, whose trusted contract deliberately admits only these two kinds.
+		const trustedScope = { kind: "detail-drawer", detailKind: row.kind } as const;
 		const form = await this.snapshot(invoiceScope);
 		if (hasBoundInvoiceCount(form)) {
 			const existingInvoice = await this.snapshot([...invoiceScope, "已有发票"]);
@@ -1424,11 +2129,25 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"绑定发票",
 			"当前明细的“添加发票”按钮必须唯一",
 		);
-		await this.hover("绑定发票", { ref: addInvoice.ref, scopeTexts: invoiceScope });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const menuState = await this.trustedHover("绑定发票", trustedScope);
+			if (menuState.overlay !== "invoice-menu") this.blocker("unverified_state", "绑定发票", "可信悬浮未打开智能识票菜单");
+		} else {
+			await this.hover("绑定发票", { ref: addInvoice.ref, scopeTexts: invoiceScope });
+		}
 		await this.pause();
 		const menu = await this.snapshot(["智能识票"]);
 		const smart = this.requireUnique(menu, (element) => element.text === "智能识票", "绑定发票", "悬浮菜单必须唯一出现“智能识票”");
-		await this.click("绑定发票", { ref: smart.ref, scopeTexts: ["智能识票"] });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const dialogState = await this.trustedClick(
+				"绑定发票",
+				"open-smart-invoice",
+				{ kind: "invoice-menu", detailKind: trustedScope.detailKind },
+			);
+			if (dialogState.overlay !== "invoice-dialog") this.blocker("unverified_state", "绑定发票", "可信命令未进入智能识票上传层");
+		} else {
+			await this.click("绑定发票", { ref: smart.ref, scopeTexts: ["智能识票"] });
+		}
 		await this.pause();
 		const uploadDialog = await this.snapshot(["智能识票", "上传文件"]);
 		const fileInput = this.requireUnique(
@@ -1437,10 +2156,19 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"智能识票上传",
 			"智能识票对话框必须暴露唯一 file ref；有多个时绝不按 occurrence 猜测",
 		);
-		await this.upload("智能识票上传", [row.uploadFile], {
-			ref: fileInput.ref,
-			scopeTexts: ["智能识票", "上传文件"],
-		});
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedUpload(
+				"智能识票上传",
+				"smart-invoice",
+				{ kind: "invoice-dialog", detailKind: trustedScope.detailKind },
+				[row.uploadFile],
+			);
+		} else {
+			await this.upload("智能识票上传", [row.uploadFile], {
+				ref: fileInput.ref,
+				scopeTexts: ["智能识票", "上传文件"],
+			});
+		}
 		await this.pause();
 		const uploaded = await this.snapshot(["智能识票", "上传文件"]);
 		if (!hasFileEvidence(uploaded, row.uploadFile)) {
@@ -1452,7 +2180,15 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"智能识票上传",
 			"上传对话框必须有唯一可用的“确定”按钮",
 		);
-		await this.click("智能识票上传", { ref: confirm.ref, scopeTexts: ["智能识票", "上传文件"] });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedClick(
+				"智能识票上传",
+				"confirm-invoice-upload",
+				{ kind: "invoice-dialog", detailKind: trustedScope.detailKind },
+			);
+		} else {
+			await this.click("智能识票上传", { ref: confirm.ref, scopeTexts: ["智能识票", "上传文件"] });
+		}
 		const recognitionScope = ["通过智能识票识别出", "与该消费绑定"];
 		const recognized = await this.waitForInvoiceRecognition();
 		const checkboxCandidates = parseSnapshotElements(recognized).filter(
@@ -1478,7 +2214,26 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				checkboxCandidates.map((element) => element.raw),
 			);
 		}
-		await this.click("选择识别发票", { ref: checkboxCandidates[0].ref, scopeTexts: recognitionScope });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const evidence =
+				row.kind === "transport"
+					? [
+							row.travelDate,
+							row.fromStation ?? row.fromCity,
+							row.toStation ?? row.toCity,
+							...(row.trainNumber ? [row.trainNumber] : []),
+						]
+					: ["住宿"];
+			await this.trustedSelect(
+				"选择识别发票",
+				"recognized-invoice",
+				{ kind: "invoice-results", detailKind: trustedScope.detailKind },
+				row.amount.toFixed(2),
+				evidence,
+			);
+		} else {
+			await this.click("选择识别发票", { ref: checkboxCandidates[0].ref, scopeTexts: recognitionScope });
+		}
 		await this.pause();
 		const selected = await this.snapshot(recognitionScope);
 		const selectedCheckboxes = parseSnapshotElements(selected).filter(
@@ -1501,7 +2256,16 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"绑定发票",
 			"勾选唯一发票后“与该消费绑定”必须唯一且可用",
 		);
-		await this.click("绑定发票", { ref: bind.ref, scopeTexts: recognitionScope });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const reboundState = await this.trustedClick(
+				"绑定发票",
+				"bind-recognized-invoice",
+				{ kind: "invoice-results", detailKind: trustedScope.detailKind },
+			);
+			if (reboundState.overlay !== "detail-drawer") this.blocker("unverified_state", "绑定发票", "可信绑定后未返回当前明细抽屉");
+		} else {
+			await this.click("绑定发票", { ref: bind.ref, scopeTexts: recognitionScope });
+		}
 		await this.pause(Math.max(this.waitMilliseconds, 800));
 		const rebound = await this.snapshot([...invoiceScope, "已有发票"]);
 		if (!boundInvoiceSummaryEvidence(rebound, row)) {
@@ -1524,7 +2288,18 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"上传明细附件",
 			"当前明细的普通附件区域必须暴露唯一 file ref；绝不回退到顶部附件或其他明细",
 		);
-		const output = await this.upload("上传明细附件", paths, { ref: fileInput.ref, scopeTexts: scope });
+		let output: string;
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedUpload(
+				"上传明细附件",
+				"detail-attachments",
+				{ kind: "detail-drawer", detailKind: row.kind },
+				paths,
+			);
+			output = paths.map((path) => basename(path)).join("、");
+		} else {
+			output = await this.upload("上传明细附件", paths, { ref: fileInput.ref, scopeTexts: scope });
+		}
 		if (!paths.every((path) => output.includes(basename(path)))) {
 			this.blocker("unverified_state", "上传明细附件", "浏览器没有确认保留全部定向附件", [output]);
 		}
@@ -1540,7 +2315,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
 		operation: string,
 	): SnapshotElement {
-		if (!foldedDetailEvidence(snapshot, row)) {
+		if (!foldedDetailEvidence(snapshot, row, this.verifiedPaymentDomains.has(detailPaymentDomain(row)))) {
 			this.blocker(
 				"unverified_state",
 				operation,
@@ -1585,6 +2360,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				attachmentSnapshot,
 				row,
 				row.kind === "allowance" || this.verifiedInvoiceBindings.has(verifiedInvoiceBindingKey(row)),
+				this.verifiedPaymentDomains.has(detailPaymentDomain(row)),
 			)
 		) {
 			this.blocker(
@@ -1600,7 +2376,17 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		foldedSnapshot: string,
 	): Promise<void> {
 		const candidate = this.uniqueFoldedDetail(foldedSnapshot, row, "恢复已有费用明细");
-		await this.click("恢复已有费用明细", { ref: candidate.ref, scopeTexts: detailScope(row) });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const opened = await this.trustedClick("恢复已有费用明细", "open-detail", { kind: "main" }, {
+				detailKind: row.kind,
+				evidence: trustedDetailEvidence(row),
+			});
+			if (opened.overlay !== "detail-drawer") {
+				this.blocker("unverified_state", "恢复已有费用明细", "可信费用行命令未打开唯一明细抽屉");
+			}
+		} else {
+			await this.click("恢复已有费用明细", { ref: candidate.ref, scopeTexts: detailScope(row) });
+		}
 		await this.pause();
 		await this.verifyOpenDetail(row, "复核已有费用明细");
 		const feeType = detailFeeType(row);
@@ -1620,7 +2406,16 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				closeCandidates.map((element) => element.raw),
 			);
 		}
-		await this.click("关闭已复核明细", { ref: closeCandidates[0].ref, scopeTexts: detailDrawerScope(feeType) });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const closed = await this.trustedClick(
+				"关闭已复核明细",
+				"close-detail",
+				{ kind: "detail-drawer", detailKind: trustedDetailKind(feeType) },
+			);
+			if (closed.overlay !== "none") this.blocker("unverified_state", "关闭已复核明细", "可信关闭后未返回主表");
+		} else {
+			await this.click("关闭已复核明细", { ref: closeCandidates[0].ref, scopeTexts: detailDrawerScope(feeType) });
+		}
 		await this.pause();
 		const restored = await this.snapshot(detailScope(row));
 		this.uniqueFoldedDetail(restored, row, "确认已复核明细关闭");
@@ -1632,13 +2427,23 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		if (this.detailCountBeforeOpen === undefined) {
 			this.blocker("unverified_state", "保存费用明细", "新增前无法读取费用明细数，不能证明未重复新增");
 		}
-		await this.click("保存费用明细", {
-			selector: `[data-testid="${TEST_IDS.saveDetail}"]`,
-			scopeTexts: ["添加明细"],
-		});
+		let trustedSaved: EkuaibaoTrustedPageState | undefined;
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			trustedSaved = await this.trustedClick(
+				"保存费用明细",
+				"save-detail",
+				{ kind: "detail-drawer", detailKind: row.kind },
+			);
+			if (trustedSaved.overlay !== "none") this.blocker("unverified_state", "保存费用明细", "可信保存后未返回主表");
+		} else {
+			await this.click("保存费用明细", {
+				selector: `[data-testid="${TEST_IDS.saveDetail}"]`,
+				scopeTexts: ["添加明细"],
+			});
+		}
 		await this.pause(Math.max(this.waitMilliseconds, 800));
 		const main = await this.snapshot();
-		const actualCount = parseDetailCount(main);
+		const actualCount = trustedSaved?.detailCount ?? parseDetailCount(main);
 		if (actualCount !== this.detailCountBeforeOpen + 1) {
 			this.blocker(
 				"unverified_state",
@@ -1654,7 +2459,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 
 	private async existingDetail(row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected) {
 		const snapshot = await this.snapshot(detailScope(row));
-		if (foldedDetailEvidence(snapshot, row)) {
+		if (foldedDetailEvidence(snapshot, row, this.verifiedPaymentDomains.has(detailPaymentDomain(row)))) {
 			this.uniqueFoldedDetail(snapshot, row, "检查已有费用明细");
 			if (!this.verifiedDetails.has(row.key)) await this.reverifyFoldedDetail(row, snapshot);
 			return true;
@@ -1671,7 +2476,10 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		return false;
 	}
 
-	private mainHeader(snapshot: string, expected: TravelDraftExpected): TravelDraftObservation["header"] {
+	private mainHeader(
+		snapshot: string,
+		expected: TravelDraftExpected,
+	): NonNullable<TravelDraftObservation["header"]> {
 		const elements = parseSnapshotElements(snapshot);
 		const fieldValue = (label: string) => adjacentFieldValue(elements, label);
 		const explanation = elements.find((element) => testId(element) === TEST_IDS.description)?.text;
@@ -1680,16 +2488,12 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		const company = companyValues.length === 1 ? companyValues[0] : undefined;
 		const applicantDepartment = fieldValue("申请人部门");
 		const expenseDepartment = fieldValue("费用所属部门");
-		if (
-			applicantDepartment &&
-			(departmentPathMatches(applicantDepartment) || departmentLeafMatches(applicantDepartment))
-		) {
+		// A collapsed leaf is usable only after this driver instance selected the
+		// unique full path itself. It must never mint that proof during recovery.
+		if (applicantDepartment && departmentPathMatches(applicantDepartment)) {
 			this.verifiedDepartments.add("申请人部门");
 		}
-		if (
-			expenseDepartment &&
-			(departmentPathMatches(expenseDepartment) || departmentLeafMatches(expenseDepartment))
-		) {
+		if (expenseDepartment && departmentPathMatches(expenseDepartment)) {
 			this.verifiedDepartments.add("费用所属部门");
 		}
 		const payment = fieldValue("支付信息");
@@ -1708,16 +2512,120 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				fieldValue("报销日期") === expected.header.reimbursementDate ? expected.header.reimbursementDate : undefined,
 			expenseNature: fieldValue("费用性质") as TravelExpenseNature | undefined,
 			applicantDepartment:
-				applicantDepartment && this.verifiedDepartments.has("申请人部门")
+				applicantDepartment &&
+				(departmentPathMatches(applicantDepartment) ||
+					(departmentLeafMatches(applicantDepartment) && this.verifiedDepartments.has("申请人部门")))
 					? TRAVEL_DRAFT_DEPARTMENT
 					: undefined,
 			expenseDepartment:
-				expenseDepartment && this.verifiedDepartments.has("费用所属部门")
+				expenseDepartment &&
+				(departmentPathMatches(expenseDepartment) ||
+					(departmentLeafMatches(expenseDepartment) && this.verifiedDepartments.has("费用所属部门")))
 					? TRAVEL_DRAFT_DEPARTMENT
 					: undefined,
-			paymentRecipient: payment?.includes(TRAVEL_DRAFT_CURRENT_USER) ? TRAVEL_DRAFT_CURRENT_USER : undefined,
+			paymentRecipient: payment && this.paymentValueEvidence(payment, "main") ? TRAVEL_DRAFT_CURRENT_USER : undefined,
 			multipleRecipients: multipleRecipientCheckbox ? explicitChecked(multipleRecipientCheckbox) : undefined,
 		};
+	}
+
+	private trustedMainHeader(
+		state: EkuaibaoTrustedPageState,
+		expected: TravelDraftExpected,
+	): NonNullable<TravelDraftObservation["header"]> {
+		const value = (key: keyof EkuaibaoTrustedPageState["fields"]): string | undefined => {
+			const field = state.fields[key];
+			return field?.present && !field.ambiguous ? field.value : undefined;
+		};
+		const applicantDepartment = value("applicant-department");
+		const expenseDepartment = value("expense-department");
+		const company = value("company");
+		const station = value("station");
+		const payment = value("main-payment-recipient");
+		const verifiedDepartment = (
+			label: "申请人部门" | "费用所属部门",
+			department: string | undefined,
+		): string | undefined => {
+			if (!department) return undefined;
+			if (departmentPathMatches(department)) {
+				this.verifiedDepartments.add(label);
+				return TRAVEL_DRAFT_DEPARTMENT;
+			}
+			return departmentLeafMatches(department) && this.verifiedDepartments.has(label)
+				? TRAVEL_DRAFT_DEPARTMENT
+				: undefined;
+		};
+		return {
+			explanation: value("description") === expected.header.explanation ? expected.header.explanation : undefined,
+			submitter: value("submitter") === TRAVEL_DRAFT_CURRENT_USER ? TRAVEL_DRAFT_CURRENT_USER : undefined,
+			station:
+				station && containsNormalized(station, "江苏省") && cityLevelPathMatches(station, "南京")
+					? TRAVEL_DRAFT_STATION
+					: undefined,
+			company:
+				company && normalizeText(company) === normalizeText(TRAVEL_DRAFT_COMPANY)
+					? TRAVEL_DRAFT_COMPANY
+					: undefined,
+			reimbursementDate:
+				value("reimbursement-date") === expected.header.reimbursementDate
+					? expected.header.reimbursementDate
+					: undefined,
+			expenseNature: value("expense-nature") as TravelExpenseNature | undefined,
+			applicantDepartment: verifiedDepartment("申请人部门", applicantDepartment),
+			expenseDepartment: verifiedDepartment("费用所属部门", expenseDepartment),
+			paymentRecipient: payment && this.paymentValueEvidence(payment, "main") ? TRAVEL_DRAFT_CURRENT_USER : undefined,
+			multipleRecipients:
+				state.multipleRecipients.present && state.multipleRecipients.source !== "ambiguous"
+					? state.multipleRecipients.checked
+					: undefined,
+		};
+	}
+
+	private completeTrustedHeader(
+		header: TravelDraftObservation["header"],
+		expected: TravelDraftExpected,
+	): boolean {
+		return Boolean(
+			header &&
+				header.explanation === expected.header.explanation &&
+				header.submitter === expected.header.submitter &&
+				header.station === expected.header.station &&
+				header.company === expected.header.company &&
+				header.reimbursementDate === expected.header.reimbursementDate &&
+				header.expenseNature === expected.header.expenseNature &&
+				header.applicantDepartment === expected.header.applicantDepartment &&
+				header.expenseDepartment === expected.header.expenseDepartment &&
+				header.paymentRecipient === expected.header.paymentRecipient &&
+				header.multipleRecipients === false,
+		);
+	}
+
+	private trustedApplicationObservation(
+		state: EkuaibaoTrustedPageState,
+		expected: TravelDraftExpected,
+	): TravelDraftObservation["application"] {
+		const linked = state.linkedApplication;
+		if (!linked || !this.verifiedApplicationFacts) return undefined;
+		if (!sameApplication(this.verifiedApplicationFacts.application, expected.application)) return undefined;
+		if (linked.id !== expected.application.id || !linked.title || !containsNormalized(linked.title, expected.application.title)) {
+			return undefined;
+		}
+		if (linked.startDate && linked.startDate !== expected.application.startDate) return undefined;
+		if (linked.endDate && linked.endDate !== expected.application.endDate) return undefined;
+		return structuredClone(expected.application);
+	}
+
+	private trustedFoldedSnapshot(
+		state: EkuaibaoTrustedPageState,
+		row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+	): string | undefined {
+		const kind = row.kind;
+		const matches = state.foldedDetails
+			.filter((detail) => detail.feeType === kind)
+			.map((detail, index) => `[e${index + 1}] div ${detail.summary}`)
+			.filter((snapshot) =>
+				foldedDetailEvidence(snapshot, row, this.verifiedPaymentDomains.has(detailPaymentDomain(row))),
+			);
+		return matches.length === 1 ? matches[0] : undefined;
 	}
 
 	private applicationObservation(snapshot: string, expected: TravelDraftExpected): TravelDraftObservation["application"] {
@@ -1755,14 +2663,44 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		this.expected = expected;
 		const state = this.browser.state();
 		if (!state.open) return { page: "closed", details: [] };
-		const main = await this.snapshot();
-		if (!main.includes("差旅费用报销单") || !main.includes(`testid=${TEST_IDS.saveDraft}`)) {
-			return { page: state.loading ? "loading" : "closed", details: [] };
+		const trusted = await this.inspectTrusted("读取合思差旅页面契约");
+		let main: string | undefined;
+		const readMain = async (): Promise<string> => {
+			main ??= await this.snapshot();
+			return main;
+		};
+		if (!trusted) {
+			const legacyMain = await readMain();
+			if (!legacyMain.includes("差旅费用报销单") || !legacyMain.includes(`testid=${TEST_IDS.saveDraft}`)) {
+				return { page: state.loading ? "loading" : "closed", details: [] };
+			}
+		}
+
+		let application = trusted ? this.trustedApplicationObservation(trusted, expected) : undefined;
+		let header = trusted ? this.trustedMainHeader(trusted, expected) : undefined;
+		if (!application || !this.completeTrustedHeader(header, expected)) {
+			const legacyMain = await readMain();
+			application ??= this.applicationObservation(legacyMain, expected);
+			if (!this.completeTrustedHeader(header, expected)) {
+				header = this.mainHeader(legacyMain, expected);
+				if (trusted?.multipleRecipients.present && trusted.multipleRecipients.source !== "ambiguous") {
+					header.multipleRecipients = trusted.multipleRecipients.checked;
+				}
+				const trustedPayment = trusted?.fields["main-payment-recipient"];
+				if (
+					trustedPayment?.present &&
+					!trustedPayment.ambiguous &&
+					this.paymentValueEvidence(trustedPayment.value ?? "", "main")
+				) {
+					header.paymentRecipient = TRAVEL_DRAFT_CURRENT_USER;
+				}
+			}
 		}
 		const details: TravelDraftDetailObservation[] = [];
 		for (const row of [...expected.transport, ...(expected.hotel ? [expected.hotel] : []), expected.allowance]) {
-			const scoped = await this.snapshot(detailScope(row));
-			if (foldedDetailEvidence(scoped, row)) {
+			let scoped = trusted ? this.trustedFoldedSnapshot(trusted, row) : undefined;
+			if (!scoped || !this.verifiedDetails.has(row.key)) scoped = await this.snapshot(detailScope(row));
+			if (foldedDetailEvidence(scoped, row, this.verifiedPaymentDomains.has(detailPaymentDomain(row)))) {
 				this.uniqueFoldedDetail(scoped, row, "观察费用明细");
 				if (!this.verifiedDetails.has(row.key)) await this.reverifyFoldedDetail(row, scoped);
 				const detail = expectedDetail(row);
@@ -1771,14 +2709,27 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				this.verifiedDetails.delete(row.key);
 			}
 		}
-		const confirmation = this.saveRequested ? explicitConfirmation(main) ?? this.saveConfirmation : undefined;
+		let confirmation = this.saveRequested && trusted?.draftConfirmationVisible ? "保存成功" : undefined;
+		if (this.saveRequested && !confirmation) {
+			confirmation = explicitConfirmation(await readMain()) ?? this.saveConfirmation;
+		}
+		let detailCount = trusted?.detailCount;
+		if (detailCount === undefined) detailCount = parseDetailCount(await readMain());
+		let calculatedTotal = trusted?.calculatedTotal ? Number(trusted.calculatedTotal) : undefined;
+		if (!Number.isFinite(calculatedTotal)) calculatedTotal = parseExpectedTotal(await readMain(), expected.totalAmount);
+		if (
+			calculatedTotal !== undefined &&
+			Math.round(calculatedTotal * 100) !== Math.round(expected.totalAmount * 100)
+		) {
+			calculatedTotal = undefined;
+		}
 		return {
 			page: "form",
-			application: this.applicationObservation(main, expected),
-			header: this.mainHeader(main, expected),
+			application,
+			header,
 			details,
-			detailCount: parseDetailCount(main),
-			calculatedTotal: parseExpectedTotal(main, expected.totalAmount),
+			detailCount,
+			calculatedTotal,
 			verification: this.verificationValid ? { valid: true, errors: [] } : undefined,
 			draft: {
 				saveRequested: this.saveRequested,
@@ -1808,7 +2759,10 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			travelDates: expected.transport.map((row) => row.travelDate),
 			cities: expected.transport.flatMap((row) => [row.fromCity, row.toCity]),
 		};
-		const alreadyLinked = parseLinkedApplicationFacts(current, expectedCandidate);
+		const verifiedSource = this.sourceFactsFromVerified(expectedCandidate);
+		const alreadyLinked = verifiedSource
+			? parseLinkedApplicationFacts(current, expectedCandidate, verifiedSource)
+			: { missing: [], ambiguous: [] };
 		if (
 			alreadyLinked.facts &&
 			alreadyLinked.missing.length === 0 &&
@@ -1819,10 +2773,15 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			this.verifiedApplicationFacts = alreadyLinked.facts;
 			return this.observe(expected);
 		}
-		await this.click("选择关联申请", {
-			selector: `[data-testid="${TEST_IDS.application}"]`,
-			scopeTexts: ["关联申请"],
-		});
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const opened = await this.trustedClick("选择关联申请", "open-application", { kind: "main" });
+			if (opened.overlay !== "application-dialog") this.blocker("unverified_state", "选择关联申请", "可信命令未打开关联申请弹窗");
+		} else {
+			await this.click("选择关联申请", {
+				selector: `[data-testid="${TEST_IDS.application}"]`,
+				scopeTexts: ["关联申请"],
+			});
+		}
 		await this.pause();
 		const dialog = await this.snapshot(["搜索标题和单号"]);
 		const search = this.requireUnique(
@@ -1831,7 +2790,11 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"选择关联申请",
 			"关联申请弹窗必须有唯一搜索框",
 		);
-		await this.type("选择关联申请", { ref: search.ref, scopeTexts: ["搜索标题和单号"] }, application.id, false, false);
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedType("选择关联申请", "application-search", { kind: "application-dialog" }, application.id, false);
+		} else {
+			await this.type("选择关联申请", { ref: search.ref, scopeTexts: ["搜索标题和单号"] }, application.id, false, false);
+		}
 		await this.pause();
 		const results = await this.snapshot([application.id, application.title]);
 		const choices = applicationCandidates(results).filter(
@@ -1845,10 +2808,31 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 				choices.map((candidate) => candidate.evidence),
 			);
 		}
-		await this.click("选择关联申请", {
-			ref: choices[0].ref,
-			scopeTexts: [application.id, application.title],
-		});
+		const sourceFacts = await this.inspectApplicationSourceFacts(choices[0], results);
+		if (sourceFacts.missing.length > 0 || sourceFacts.ambiguous.length > 0) {
+			this.blocker(
+				"unverified_state",
+				"核对关联申请详情",
+				"无法从候选申请或其详情唯一核对申请事由和费用性质",
+				[...sourceFacts.missing, ...sourceFacts.ambiguous].map((item) => item.message),
+			);
+		}
+		let selectedChoice = choices[0];
+		if (sourceFacts.source === "details") {
+			const refreshed = applicationCandidates(await this.snapshot([application.id, application.title])).filter(
+				(candidate) => candidate.id === application.id && candidate.title === application.title,
+			);
+			if (refreshed.length !== 1) {
+				this.blocker("unverified_state", "选择关联申请", "关闭申请详情后无法重新定位唯一候选申请");
+			}
+			selectedChoice = refreshed[0];
+		}
+		if (!this.browser.runEkuaibaoTrustedCommand) {
+			await this.click("选择关联申请", {
+				ref: selectedChoice.ref,
+				scopeTexts: [application.id, application.title],
+			});
+		}
 		const confirmSnapshot = await this.snapshot([application.id, application.title, "确认"]);
 		const confirm = this.requireUnique(
 			confirmSnapshot,
@@ -1856,10 +2840,14 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"选择关联申请",
 			"关联申请弹窗必须有唯一确认按钮",
 		);
-		await this.click("选择关联申请", { ref: confirm.ref, scopeTexts: [application.id, application.title] });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedClick("选择关联申请", "confirm-application", { kind: "application-dialog" });
+		} else {
+			await this.click("选择关联申请", { ref: confirm.ref, scopeTexts: [application.id, application.title] });
+		}
 		await this.pause(Math.max(this.waitMilliseconds, 800));
 		const selected = await this.snapshot();
-		const parsedFacts = parseLinkedApplicationFacts(selected, choices[0]);
+		const parsedFacts = parseLinkedApplicationFacts(selected, selectedChoice, sourceFacts);
 		if (!parsedFacts.facts || parsedFacts.missing.length > 0 || parsedFacts.ambiguous.length > 0) {
 			this.blocker(
 				"unverified_state",
@@ -1885,11 +2873,34 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 
 	async ensureHeader(header: TravelDraftHeaderExpected): Promise<TravelDraftObservation> {
 		const expected = this.assertExpected();
+		const trusted = await this.inspectTrusted("读取表头可信状态");
 		const initial = await this.snapshot();
 		const initialHeader = this.mainHeader(initial, expected);
+		if (trusted?.multipleRecipients.present && trusted.multipleRecipients.source !== "ambiguous") {
+			initialHeader.multipleRecipients = trusted.multipleRecipients.checked;
+		}
+		const trustedPayment = trusted?.fields["main-payment-recipient"];
+		if (
+			trustedPayment?.present &&
+			!trustedPayment.ambiguous &&
+			this.paymentValueEvidence(trustedPayment.value ?? "", "main")
+		) {
+			initialHeader.paymentRecipient = TRAVEL_DRAFT_CURRENT_USER;
+		}
+		const trustedSubmitter = trusted?.fields.submitter;
+		if (trustedSubmitter?.present && !trustedSubmitter.ambiguous && trustedSubmitter.value) {
+			initialHeader.submitter = trustedSubmitter.value.includes(TRAVEL_DRAFT_CURRENT_USER)
+				? TRAVEL_DRAFT_CURRENT_USER
+				: trustedSubmitter.value;
+		}
 		if (!initialHeader) this.blocker("unverified_state", "填写表头", "无法读取表头状态");
 		const allCompanyElements = parseSnapshotElements(initial).filter((element) => fieldLabel(element) === "所属公司");
-		const companyValues = semanticFieldValues(parseSnapshotElements(initial), "所属公司");
+		const trustedCompany = trusted?.fields.company;
+		const companyValues = trusted
+			? trustedCompany?.present && !trustedCompany.ambiguous && trustedCompany.value
+				? [trustedCompany.value]
+				: []
+			: semanticFieldValues(parseSnapshotElements(initial), "所属公司");
 		if (companyValues.length !== 1) {
 			this.blocker(
 				"unverified_state",
@@ -1924,20 +2935,43 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		await this.ensureDimension("费用性质", header.expenseNature);
 		await this.ensureDimension("申请人部门", header.applicantDepartment);
 		await this.ensureDimension("费用所属部门", header.expenseDepartment);
-		const dateSnapshot = await this.snapshot(["报销日期"]);
-		const dateField = this.field(dateSnapshot, "报销日期", "填写报销日期", {
-			placeholder: "请选择日期",
-			editable: true,
-		});
-		if (dateField.text !== header.reimbursementDate) {
-			await this.type(
-				"填写报销日期",
-				{ ref: dateField.ref, scopeTexts: ["报销日期"] },
-				header.reimbursementDate,
-				false,
-				true,
-			);
-			await this.pause();
+		if (initialHeader.paymentRecipient !== header.paymentRecipient) {
+			await this.ensureRecipient("支付信息", ["支付信息"], "main");
+		}
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const currentDate = (await this.trustedBaseline("填写报销日期", { kind: "main" })).fields["reimbursement-date"];
+			if (!currentDate?.present || currentDate.ambiguous) {
+				this.blocker("unverified_state", "填写报销日期", "可信页面没有唯一报销日期字段");
+			}
+			if (currentDate.value !== header.reimbursementDate) {
+				const updated = await this.trustedType(
+					"填写报销日期",
+					"reimbursement-date",
+					{ kind: "main" },
+					header.reimbursementDate,
+					true,
+				);
+				if (updated.fields["reimbursement-date"]?.value !== header.reimbursementDate) {
+					this.blocker("unverified_state", "填写报销日期", "可信输入后未结构化回读报销日期");
+				}
+				await this.pause();
+			}
+		} else {
+			const dateSnapshot = await this.snapshot(["报销日期"]);
+			const dateField = this.field(dateSnapshot, "报销日期", "填写报销日期", {
+				placeholder: "请选择日期",
+				editable: true,
+			});
+			if (dateField.text !== header.reimbursementDate) {
+				await this.type(
+					"填写报销日期",
+					{ ref: dateField.ref, scopeTexts: ["报销日期"] },
+					header.reimbursementDate,
+					false,
+					true,
+				);
+				await this.pause();
+			}
 		}
 		const verified = await this.observe(expected);
 		if (verified.header?.multipleRecipients === true) {
@@ -1967,17 +3001,30 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			detailDrawerScope(FEE_TYPES.transport, "乘坐火车席别"),
 		);
 		const amountScope = detailDrawerScope(FEE_TYPES.transport, "报销费用金额");
-		const amountSnapshot = await this.snapshot(amountScope);
-		const amount = this.field(amountSnapshot, "报销费用金额", "填写报销费用金额", {
-			placeholder: "请输入报销费用金额",
-			editable: true,
-		});
-		if (!amountSignals(row.amount).includes(amount.text)) {
-			await this.type("填写报销费用金额", { ref: amount.ref, scopeTexts: amountScope }, String(row.amount));
-			await this.pause();
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const trustedScope = { kind: "detail-drawer", detailKind: "transport" } as const;
+			const current = (await this.trustedBaseline("填写报销费用金额", trustedScope)).fields["reimbursement-amount"];
+			if (!current?.present || current.ambiguous) this.blocker("unverified_state", "填写报销费用金额", "可信页面没有唯一报销金额字段");
+			if (!current.value || !amountSignals(row.amount).includes(current.value)) {
+				const updated = await this.trustedType("填写报销费用金额", "reimbursement-amount", trustedScope, String(row.amount));
+				if (!amountSignals(row.amount).includes(updated.fields["reimbursement-amount"]?.value ?? "")) {
+					this.blocker("unverified_state", "填写报销费用金额", "可信输入后未结构化回读报销金额");
+				}
+				await this.pause();
+			}
+		} else {
+			const amountSnapshot = await this.snapshot(amountScope);
+			const amount = this.field(amountSnapshot, "报销费用金额", "填写报销费用金额", {
+				placeholder: "请输入报销费用金额",
+				editable: true,
+			});
+			if (!amountSignals(row.amount).includes(amount.text)) {
+				await this.type("填写报销费用金额", { ref: amount.ref, scopeTexts: amountScope }, String(row.amount));
+				await this.pause();
+			}
 		}
 		await this.ensureRecipient("费用报销人", detailDrawerScope(FEE_TYPES.transport, "费用报销人"));
-		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.transport, "支付信息"));
+		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.transport, "支付信息"), detailPaymentDomain(row));
 		await this.uploadDetailAttachments(row, FEE_TYPES.transport);
 		await this.saveDetail(row);
 		return this.observe(expected);
@@ -1992,17 +3039,30 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		await this.ensureDate("差旅起止日期", "开始日期", row.checkinDate, scope);
 		await this.ensureDate("差旅起止日期", "结束日期", row.checkoutDate, scope);
 		const amountScope = detailDrawerScope(FEE_TYPES.hotel, "报销费用金额");
-		const amountSnapshot = await this.snapshot(amountScope);
-		const amount = this.field(amountSnapshot, "报销费用金额", "填写住宿报销金额", {
-			placeholder: "请输入报销费用金额",
-			editable: true,
-		});
-		if (!amountSignals(row.amount).includes(amount.text)) {
-			await this.type("填写住宿报销金额", { ref: amount.ref, scopeTexts: amountScope }, String(row.amount));
-			await this.pause();
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const trustedScope = { kind: "detail-drawer", detailKind: "hotel" } as const;
+			const current = (await this.trustedBaseline("填写住宿报销金额", trustedScope)).fields["reimbursement-amount"];
+			if (!current?.present || current.ambiguous) this.blocker("unverified_state", "填写住宿报销金额", "可信页面没有唯一住宿金额字段");
+			if (!current.value || !amountSignals(row.amount).includes(current.value)) {
+				const updated = await this.trustedType("填写住宿报销金额", "reimbursement-amount", trustedScope, String(row.amount));
+				if (!amountSignals(row.amount).includes(updated.fields["reimbursement-amount"]?.value ?? "")) {
+					this.blocker("unverified_state", "填写住宿报销金额", "可信输入后未结构化回读住宿金额");
+				}
+				await this.pause();
+			}
+		} else {
+			const amountSnapshot = await this.snapshot(amountScope);
+			const amount = this.field(amountSnapshot, "报销费用金额", "填写住宿报销金额", {
+				placeholder: "请输入报销费用金额",
+				editable: true,
+			});
+			if (!amountSignals(row.amount).includes(amount.text)) {
+				await this.type("填写住宿报销金额", { ref: amount.ref, scopeTexts: amountScope }, String(row.amount));
+				await this.pause();
+			}
 		}
 		await this.ensureRecipient("费用报销人", detailDrawerScope(FEE_TYPES.hotel, "费用报销人"));
-		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.hotel, "支付信息"));
+		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.hotel, "支付信息"), detailPaymentDomain(row));
 		await this.uploadDetailAttachments(row, FEE_TYPES.hotel);
 		await this.saveDetail(row);
 		return this.observe(expected);
@@ -2026,7 +3086,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			detailDrawerScope(FEE_TYPES.allowance, "补助类型"),
 		);
 		await this.ensureRecipient("费用报销人", detailDrawerScope(FEE_TYPES.allowance, "费用报销人"));
-		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.allowance, "支付信息"));
+		await this.ensureRecipient("支付信息", detailDrawerScope(FEE_TYPES.allowance, "支付信息"), detailPaymentDomain(row));
 		const calculation = await this.snapshot(detailDrawerScope(FEE_TYPES.allowance, row.allowanceType));
 		if (!amountSignals(row.amount).some((signal) => calculation.includes(signal))) {
 			this.blocker(
@@ -2047,10 +3107,9 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		// accepting hidden-field evidence cached by an earlier save/recovery pass.
 		this.verifiedDetails.clear();
 		const observation = await this.observe(expected);
-		const main = await this.snapshot();
 		const errors: string[] = [];
 		const expectedCount = expected.transport.length + (expected.hotel ? 1 : 0) + 1;
-		const actualCount = parseDetailCount(main);
+		const actualCount = observation.detailCount;
 		if (actualCount !== expectedCount) errors.push(`费用明细应为 ${expectedCount} 条，页面为 ${actualCount ?? "无法读取"} 条`);
 		if (observation.details.length !== expectedCount) errors.push("有明细的金额、收款人、发票或附件未通过逐行核验");
 		if (observation.calculatedTotal !== expected.totalAmount) {
@@ -2058,30 +3117,89 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		}
 		if (!observation.application) errors.push("关联申请编号/标题/日期/费用性质未完整核验");
 		const header = observation.header;
+		const detailPaymentsVerified =
+			observation.details.length === expectedCount &&
+			observation.details.every((row) => row.paymentRecipient === expected.header.paymentRecipient);
+		const headerPaymentVerified =
+			header?.paymentRecipient === expected.header.paymentRecipient ||
+			(header?.paymentRecipient === undefined && header?.multipleRecipients === false && detailPaymentsVerified);
 		if (
 			!header ||
 			header.explanation !== expected.header.explanation ||
 			header.submitter !== expected.header.submitter ||
 			header.station !== expected.header.station ||
 			header.company !== expected.header.company ||
-			header.expenseNature !== expected.header.expenseNature ||
-			header.applicantDepartment !== expected.header.applicantDepartment ||
-			header.expenseDepartment !== expected.header.expenseDepartment ||
-			header.multipleRecipients !== false
+				header.expenseNature !== expected.header.expenseNature ||
+				header.applicantDepartment !== expected.header.applicantDepartment ||
+				header.expenseDepartment !== expected.header.expenseDepartment ||
+				!headerPaymentVerified ||
+				header.multipleRecipients !== false
 		) {
 			errors.push("表头固定字段或多收款人状态未完整核验");
 		}
 		this.verificationValid = errors.length === 0;
+		this.lastVerifiedTrustedDigest = this.verificationValid ? this.lastTrustedState?.digest : undefined;
 		return { ...observation, detailCount: actualCount, verification: { valid: errors.length === 0, errors } };
 	}
 
-	async saveDraft(expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+	async saveDraft(
+		expected: TravelDraftExpected,
+		onDispatch?: () => void | Promise<void>,
+	): Promise<TravelDraftObservation> {
 		this.expected = expected;
 		if (this.saveAttempted) {
 			this.blocker("unverified_state", "保存差旅草稿", "本轮已发起过草稿保存；保存状态未确认时绝不再次点击");
 		}
 		this.saveConfirmation = undefined;
 		this.saveVerifiedObservation = undefined;
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			let baseline = await this.inspectTrusted("核对草稿保存基线");
+			if (!baseline) this.blocker("unverified_state", "保存差旅草稿", "可信合思页面契约不可用");
+			for (let attempt = 0; baseline.draftConfirmationVisible && attempt < 3; attempt += 1) {
+				await this.pause(Math.max(this.waitMilliseconds, 500));
+				baseline = (await this.inspectTrusted("等待旧保存提示消失")) ?? baseline;
+			}
+			if (baseline.draftConfirmationVisible) {
+				this.blocker(
+					"unverified_state",
+					"保存差旅草稿",
+					"点击主草稿按钮前仍存在旧“保存成功”提示，无法证明后续提示属于主草稿保存",
+				);
+			}
+			if (!this.verificationValid || this.lastVerifiedTrustedDigest !== baseline.digest) {
+				this.blocker(
+					"unverified_state",
+					"保存差旅草稿",
+					"保存前可信 DOM 摘要已变化，必须重新逐项核验后再进入保存边界",
+					baseline.validationErrors,
+				);
+			}
+			const verified = await this.observe(expected);
+			if (verified.verification?.valid !== true || this.lastTrustedState?.digest !== baseline.digest) {
+				this.blocker(
+					"unverified_state",
+					"保存差旅草稿",
+					"保存前结构化回读与刚完成的逐行核验不一致；不会点击草稿按钮",
+				);
+			}
+			this.saveVerifiedObservation = structuredClone(verified);
+			await onDispatch?.();
+			this.saveAttempted = true;
+			this.saveRequested = true;
+			await this.beforeBrowserAction("trusted", "保存差旅草稿");
+			const result = await this.browser.runEkuaibaoTrustedCommand({
+				op: "save-draft",
+				contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+				pageToken: baseline.pageToken,
+				expectedDigest: baseline.digest,
+			});
+			if (!result.ok) {
+				this.blocker(this.trustedBlockerCode(result.code), "保存差旅草稿", result.message, [result.code]);
+			}
+			this.lastTrustedState = result.state;
+			this.saveConfirmation = result.state.draftConfirmationVisible ? "保存成功" : undefined;
+			return this.draftSaveObservation();
+		}
 		let baseline = await this.snapshot();
 		for (let attempt = 0; explicitConfirmation(baseline) && attempt < 3; attempt += 1) {
 			await this.pause(Math.max(this.waitMilliseconds, 500));
@@ -2107,6 +3225,7 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		// This flag is intentionally irreversible for the lifetime of this driver.
 		// It is set before dispatch so an abort or runtime exception after the DOM
 		// receives the click can never lead to a second save attempt.
+		await onDispatch?.();
 		this.saveAttempted = true;
 		this.saveRequested = true;
 		await this.click("保存差旅草稿", {
@@ -2119,7 +3238,47 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		return this.draftSaveObservation();
 	}
 
-	async confirmDraftSaved(): Promise<TravelDraftObservation> {
+	async confirmDraftSaved(options: TravelDraftConfirmationOptions = {}): Promise<TravelDraftObservation> {
+		if (options.readOnlyRecovery) {
+			let confirmation: string | undefined;
+			if (this.browser.runEkuaibaoTrustedCommand) {
+				for (let attempt = 0; attempt < 3 && !confirmation; attempt += 1) {
+					const state = await this.inspectTrusted("只读恢复草稿保存结果");
+					confirmation = state?.overlay === "none" && state.draftConfirmationVisible ? "保存成功" : undefined;
+					if (!confirmation && attempt < 2) await this.pause(Math.max(this.waitMilliseconds, 500));
+				}
+			} else {
+				const immediate = await this.snapshot();
+				if (!immediate.includes("差旅费用报销单") || !immediate.includes(`testid=${TEST_IDS.saveDraft}`)) {
+					this.blocker(
+						"unsafe_page_state",
+						"只读恢复草稿保存结果",
+						"当前页面不是可唯一识别的差旅费用报销主表；状态仍为 unknown，绝不补点或重试保存",
+					);
+				}
+				confirmation = explicitConfirmation(immediate);
+				if (!confirmation) {
+					try {
+						const waited = await this.waitFor(5_000, "保存成功");
+						confirmation = explicitConfirmation(waited);
+					} catch (error) {
+						if (error instanceof TravelDraftInterruptedError) throw error;
+					}
+				}
+			}
+			if (!confirmation) {
+				this.blocker(
+					"unverified_state",
+					"只读恢复草稿保存结果",
+					"持久化记录只证明保存可能已派发，页面未显示明确保存成功证据；状态仍为 unknown，绝不补点或重试保存",
+				);
+			}
+			return {
+				page: "form",
+				details: [],
+				draft: { saveRequested: true, saved: true, confirmationText: confirmation },
+			};
+		}
 		this.assertExpected();
 		if (!this.saveAttempted || !this.saveRequested) {
 			this.blocker("unverified_state", "确认草稿保存", "本轮没有不可逆的草稿保存请求凭证；不会补点保存按钮");
@@ -2190,26 +3349,15 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 		await this.waitFor(10_000, "差旅费用报销单");
 		const unlinkedBaseline = await this.snapshot();
 		const existing = linkedApplicationCandidate(unlinkedBaseline, parsedHint.id, effectiveTitleHint);
-		if (existing) {
-			const parsedExisting = parseLinkedApplicationFacts(unlinkedBaseline, existing);
-			missing.push(...parsedExisting.missing);
-			ambiguous.push(...parsedExisting.ambiguous);
-			if (parsedExisting.facts) ambiguous.push(...linkedApplicationIssues(parsedExisting.facts.application, input.invoiceFacts));
-			if (!parsedExisting.facts || missing.length > 0 || ambiguous.length > 0) {
-				return { status: "needs_input", missing, ambiguous, candidates: [existing] };
-			}
-			this.verifiedApplicationFacts = parsedExisting.facts;
-			return {
-				status: "selected",
-				application: parsedExisting.facts.application,
-				candidates: [existing],
-				observation: { page: "form", application: parsedExisting.facts.application, details: [] },
-			};
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			const opened = await this.trustedClick("发现关联申请", "open-application", { kind: "main" });
+			if (opened.overlay !== "application-dialog") this.blocker("unverified_state", "发现关联申请", "可信命令未打开关联申请弹窗");
+		} else {
+			await this.click("发现关联申请", {
+				selector: `[data-testid="${TEST_IDS.application}"]`,
+				scopeTexts: ["关联申请"],
+			});
 		}
-		await this.click("发现关联申请", {
-			selector: `[data-testid="${TEST_IDS.application}"]`,
-			scopeTexts: ["关联申请"],
-		});
 		await this.pause();
 		const dialog = await this.snapshot(["搜索标题和单号"]);
 		const search = this.requireUnique(
@@ -2218,17 +3366,20 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"发现关联申请",
 			"关联申请弹窗必须有唯一搜索框",
 		);
-		const query = parsedHint.id || effectiveTitleHint || destinationCities[0] || allCities[0] || "";
-		await this.type("发现关联申请", { ref: search.ref, scopeTexts: ["搜索标题和单号"] }, query, false, false);
+		const targetId = existing?.id ?? parsedHint.id;
+		const targetTitle = existing?.title ?? effectiveTitleHint;
+		const query = targetId || targetTitle || destinationCities[0] || allCities[0] || "";
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedType("发现关联申请", "application-search", { kind: "application-dialog" }, query, false);
+		} else {
+			await this.type("发现关联申请", { ref: search.ref, scopeTexts: ["搜索标题和单号"] }, query, false, false);
+		}
 		await this.pause();
 		const results = await this.snapshot(query ? [query] : ["搜索标题和单号"]);
 		const candidates = applicationCandidates(results);
 		const matches = candidates.filter((candidate) => {
-			if (parsedHint.id && candidate.id.toUpperCase() !== parsedHint.id) return false;
-			if (!parsedHint.id && effectiveTitleHint && !containsNormalized(candidate.title, effectiveTitleHint)) return false;
-			if (!parsedHint.id && !effectiveTitleHint && destinationCities.length > 0) {
-				return destinationCities.every((city) => containsNormalized(candidate.title, city));
-			}
+			if (targetId && candidate.id.toUpperCase() !== targetId.toUpperCase()) return false;
+			if (!targetId && targetTitle && !containsNormalized(candidate.title, targetTitle)) return false;
 			return true;
 		});
 		if (matches.length === 0) {
@@ -2252,11 +3403,31 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			return { status: "needs_input", missing, ambiguous, candidates: matches };
 		}
 
-		const selected = matches[0];
-		await this.click("发现关联申请", {
-			ref: selected.ref,
-			scopeTexts: [selected.id, selected.title],
-		});
+		let selected = matches[0];
+		const sourceFacts = await this.inspectApplicationSourceFacts(selected, results);
+		missing.push(...sourceFacts.missing);
+		ambiguous.push(...sourceFacts.ambiguous);
+		if (missing.length > 0 || ambiguous.length > 0) {
+			return { status: "needs_input", missing, ambiguous, candidates: [selected] };
+		}
+		if (sourceFacts.source === "details") {
+			const refreshed = applicationCandidates(await this.snapshot([selected.id, selected.title])).filter(
+				(candidate) => candidate.id === selected.id && candidate.title === selected.title,
+			);
+			if (refreshed.length !== 1) {
+				ambiguous.push(
+					issue("application_candidate_stale", "application", "关闭申请详情后无法重新定位唯一候选申请"),
+				);
+				return { status: "needs_input", missing, ambiguous, candidates: matches };
+			}
+			selected = refreshed[0];
+		}
+		if (!this.browser.runEkuaibaoTrustedCommand) {
+			await this.click("发现关联申请", {
+				ref: selected.ref,
+				scopeTexts: [selected.id, selected.title],
+			});
+		}
 		const confirmSnapshot = await this.snapshot([selected.id, selected.title, "确认"]);
 		const confirm = this.requireUnique(
 			confirmSnapshot,
@@ -2264,10 +3435,14 @@ export class TravelDraftBrowserDriver implements TravelDraftDriver {
 			"发现关联申请",
 			"关联申请弹窗必须有唯一确认按钮",
 		);
-		await this.click("发现关联申请", { ref: confirm.ref, scopeTexts: [selected.id, selected.title] });
+		if (this.browser.runEkuaibaoTrustedCommand) {
+			await this.trustedClick("发现关联申请", "confirm-application", { kind: "application-dialog" });
+		} else {
+			await this.click("发现关联申请", { ref: confirm.ref, scopeTexts: [selected.id, selected.title] });
+		}
 		await this.pause(Math.max(this.waitMilliseconds, 800));
 		const form = await this.snapshot();
-		const parsedFacts = parseLinkedApplicationFacts(form, selected);
+		const parsedFacts = parseLinkedApplicationFacts(form, selected, sourceFacts);
 		missing.push(...parsedFacts.missing);
 		ambiguous.push(...parsedFacts.ambiguous);
 		if (!parsedFacts.facts || missing.length > 0 || ambiguous.length > 0) {

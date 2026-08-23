@@ -153,10 +153,20 @@ class FakeTravelDraftDriver implements TravelDraftDriver {
 		});
 	}
 
-	async saveDraft(_expected: TravelDraftExpected): Promise<TravelDraftObservation> {
-		return this.complete("save_draft", () => {
+	async saveDraft(
+		_expected: TravelDraftExpected,
+		onDispatch?: () => void | Promise<void>,
+	): Promise<TravelDraftObservation> {
+		this.calls.push("save_draft");
+		await onDispatch?.();
+		if (!this.noProgress.has("save_draft")) {
 			this.state.draft = { saveRequested: true, saved: false };
-		});
+		}
+		if (this.interruptAfterMutation === "save_draft") {
+			this.interruptAfterMutation = undefined;
+			throw new TravelDraftInterruptedError("interrupt:save_draft");
+		}
+		return this.output();
 	}
 
 	async confirmDraftSaved(): Promise<TravelDraftObservation> {
@@ -170,7 +180,7 @@ describe("差旅草稿确定性状态机", () => {
 	it("跨重启保存身份仅由稳定业务事实构成，不受 URL、附件路径和行顺序影响", () => {
 		const first = changzhouPlan();
 		const second = structuredClone(first);
-		second.url = "https://app.ekuaibao.com/web/app.html?accessToken=must-not-enter-sentinel";
+		second.url = "https://app.ekuaibao.com/web/app.html?accessToken=test-recovery-token";
 		second.reimbursementDate = "2026-08-23";
 		second.application.title = "不同的自由文本标题";
 		second.application.reason = "不同的自由文本事由";
@@ -194,6 +204,7 @@ describe("差旅草稿确定性状态机", () => {
 
 		expect(output.status).toBe("done");
 		expect(output.stage).toBe("DONE");
+		expect(output.checkpoint).toMatchObject({ saveState: "confirmed", saveRequested: true });
 		expect(output.expectedTotal).toBe(327);
 		expect(driver.calls).toEqual([
 			"precheck",
@@ -398,8 +409,11 @@ describe("差旅草稿确定性状态机", () => {
 
 	it("草稿保存请求后页面完整性漂移立即阻断，绝不回退业务阶段或再次保存", async () => {
 		class DriftAfterSaveDriver extends FakeTravelDraftDriver {
-			override async saveDraft(expected: TravelDraftExpected): Promise<TravelDraftObservation> {
-				await super.saveDraft(expected);
+			override async saveDraft(
+				expected: TravelDraftExpected,
+				onDispatch?: () => void | Promise<void>,
+			): Promise<TravelDraftObservation> {
+				await super.saveDraft(expected, onDispatch);
 				this.state.details = [];
 				return cloneObservation(this.state);
 			}
@@ -431,8 +445,11 @@ describe("差旅草稿确定性状态机", () => {
 
 	it("草稿保存后异步多出一条明细时立即阻断，绝不继续修改或再次保存", async () => {
 		class ExtraDetailAfterSaveDriver extends FakeTravelDraftDriver {
-			override async saveDraft(expected: TravelDraftExpected): Promise<TravelDraftObservation> {
-				const observation = await super.saveDraft(expected);
+			override async saveDraft(
+				expected: TravelDraftExpected,
+				onDispatch?: () => void | Promise<void>,
+			): Promise<TravelDraftObservation> {
+				const observation = await super.saveDraft(expected, onDispatch);
 				return { ...observation, detailCount: observation.details.length + 1 };
 			}
 		}
@@ -447,18 +464,115 @@ describe("差旅草稿确定性状态机", () => {
 		expect(output.errors.join("\n")).toContain("保存请求后");
 	});
 
-	it("调用保存驱动前先持久化不可逆标记，保存后中断恢复也不重放保存", async () => {
+	it("保存前完整核验失败不会留下保存意图", async () => {
+		class VerifyFailureDriver extends FakeTravelDraftDriver {
+			override async verify(_expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+				this.calls.push("verify");
+				throw new Error("保存前完整核验失败");
+			}
+		}
+		const driver = new VerifyFailureDriver();
+		const persistedStates: Array<{ saveState?: string; saveRequested: boolean }> = [];
+
+		const output = await runTravelDraft(driver, changzhouPlan(), {
+			onCheckpoint: (checkpoint) => {
+				persistedStates.push({ saveState: checkpoint.saveState, saveRequested: checkpoint.saveRequested });
+			},
+		});
+
+		expect(output.status).toBe("blocked");
+		expect(output.stage).toBe("VERIFY");
+		expect(output.checkpoint).toMatchObject({ saveState: "none", saveRequested: false });
+		expect(driver.calls).not.toContain("save_draft");
+		expect(persistedStates.some((state) => state.saveRequested || state.saveState === "dispatched")).toBe(false);
+	});
+
+	it("保存驱动在点击前准备失败只保留可重试 prepared 状态", async () => {
+		class PrepareFailureDriver extends FakeTravelDraftDriver {
+			failBeforeDispatch = true;
+			dispatches = 0;
+
+			override async saveDraft(
+				expected: TravelDraftExpected,
+				onDispatch?: () => void | Promise<void>,
+			): Promise<TravelDraftObservation> {
+				if (this.failBeforeDispatch) {
+					this.calls.push("save_draft");
+					this.failBeforeDispatch = false;
+					throw new Error("旧提示清理或新鲜核验失败");
+				}
+				return super.saveDraft(expected, async () => {
+					await onDispatch?.();
+					this.dispatches += 1;
+				});
+			}
+		}
+		const driver = new PrepareFailureDriver();
+		const persistedStates: Array<{ saveState?: string; saveRequested: boolean }> = [];
+
+		const first = await runTravelDraft(driver, changzhouPlan(), {
+			onCheckpoint: (checkpoint) => {
+				persistedStates.push({ saveState: checkpoint.saveState, saveRequested: checkpoint.saveRequested });
+			},
+		});
+
+		expect(first.status).toBe("blocked");
+		expect(first.stage).toBe("SAVE_DRAFT");
+		expect(first.checkpoint).toMatchObject({ saveState: "prepared", saveRequested: false });
+		expect(driver.dispatches).toBe(0);
+		expect(persistedStates.some((state) => state.saveRequested || state.saveState === "dispatched")).toBe(false);
+
+		const resumed = await runTravelDraft(driver, changzhouPlan(), { checkpoint: first.checkpoint });
+
+		expect(resumed.status).toBe("done");
+		expect(resumed.checkpoint).toMatchObject({ saveState: "confirmed", saveRequested: true });
+		expect(driver.dispatches).toBe(1);
+		expect(driver.calls.filter((call) => call === "save_draft")).toHaveLength(2);
+	});
+
+	it("只有派发 hook 持久化后，中断恢复才禁止重放保存", async () => {
 		const driver = new FakeTravelDraftDriver();
 		driver.interruptAfterMutation = "save_draft";
+		const persistedStates: Array<{ saveState?: string; saveRequested: boolean }> = [];
 
-		const interrupted = await runTravelDraft(driver, changzhouPlan());
+		const interrupted = await runTravelDraft(driver, changzhouPlan(), {
+			onCheckpoint: (checkpoint) => {
+				persistedStates.push({ saveState: checkpoint.saveState, saveRequested: checkpoint.saveRequested });
+			},
+		});
 		expect(interrupted.status).toBe("interrupted");
 		expect(interrupted.stage).toBe("SAVE_DRAFT");
-		expect(interrupted.checkpoint.saveRequested).toBe(true);
+		expect(interrupted.checkpoint).toMatchObject({ saveState: "dispatched", saveRequested: true });
+		expect(persistedStates.some((state) => state.saveState === "prepared" && !state.saveRequested)).toBe(true);
+		expect(persistedStates.some((state) => state.saveState === "dispatched" && state.saveRequested)).toBe(true);
 		expect(driver.calls.filter((call) => call === "save_draft")).toHaveLength(1);
 
-		const resumed = await runTravelDraft(driver, changzhouPlan(), { checkpoint: interrupted.checkpoint });
+		const legacyCheckpoint = structuredClone(interrupted.checkpoint);
+		delete legacyCheckpoint.saveState;
+		const resumed = await runTravelDraft(driver, changzhouPlan(), { checkpoint: legacyCheckpoint });
 		expect(resumed.status).toBe("done");
+		expect(resumed.checkpoint).toMatchObject({ saveState: "confirmed", saveRequested: true });
+		expect(driver.calls.filter((call) => call === "save_draft")).toHaveLength(1);
+	});
+
+	it("保存驱动器重复消费派发许可时立即阻断且不会得到第二次许可", async () => {
+		class DoubleDispatchDriver extends FakeTravelDraftDriver {
+			override async saveDraft(
+				_expected: TravelDraftExpected,
+				onDispatch?: () => void | Promise<void>,
+			): Promise<TravelDraftObservation> {
+				this.calls.push("save_draft");
+				await onDispatch?.();
+				await onDispatch?.();
+				return cloneObservation(this.state);
+			}
+		}
+		const driver = new DoubleDispatchDriver();
+		const output = await runTravelDraft(driver, changzhouPlan());
+
+		expect(output.status).toBe("blocked");
+		expect(output.checkpoint).toMatchObject({ saveState: "dispatched", saveRequested: true });
+		expect(output.errors.join("\n")).toContain("只能消费一次");
 		expect(driver.calls.filter((call) => call === "save_draft")).toHaveLength(1);
 	});
 

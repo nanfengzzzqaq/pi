@@ -23,6 +23,7 @@ export const TRAVEL_DRAFT_STAGES = [
 export type TravelDraftStage = (typeof TRAVEL_DRAFT_STAGES)[number];
 export type TravelExpenseNature = "部门费用" | "项目费用";
 export type TravelDraftStatus = "done" | "needs_input" | "interrupted" | "blocked";
+export type TravelDraftSaveState = "none" | "prepared" | "dispatched" | "confirmed";
 
 export interface TravelDraftApplication {
 	id: string;
@@ -75,6 +76,7 @@ export interface TravelDraftHeaderExpected {
 	expenseNature: TravelExpenseNature;
 	applicantDepartment: typeof TRAVEL_DRAFT_DEPARTMENT;
 	expenseDepartment: typeof TRAVEL_DRAFT_DEPARTMENT;
+	paymentRecipient: typeof TRAVEL_DRAFT_CURRENT_USER;
 	multipleRecipients: false;
 }
 
@@ -182,6 +184,14 @@ export interface TravelDraftPrecheckResult {
 	ambiguous?: TravelDraftIssue[];
 }
 
+export interface TravelDraftConfirmationOptions {
+	/**
+	 * A durable checkpoint says the save command may already have been dispatched.
+	 * The driver may only read explicit success evidence; it must never click save.
+	 */
+	readOnlyRecovery?: boolean;
+}
+
 /**
  * Adapter boundary for the Electron browser. Every mutating method is an idempotent
  * "ensure" operation. Deliberately, there is no send-for-approval or bill-removal method.
@@ -196,8 +206,11 @@ export interface TravelDraftDriver {
 	ensureHotel(row: TravelDraftHotelExpected): Promise<TravelDraftObservation>;
 	ensureAllowance(row: TravelDraftAllowanceExpected): Promise<TravelDraftObservation>;
 	verify(expected: TravelDraftExpected): Promise<TravelDraftObservation>;
-	saveDraft(expected: TravelDraftExpected): Promise<TravelDraftObservation>;
-	confirmDraftSaved(): Promise<TravelDraftObservation>;
+	saveDraft(
+		expected: TravelDraftExpected,
+		onDispatch: () => void | Promise<void>,
+	): Promise<TravelDraftObservation>;
+	confirmDraftSaved(options?: TravelDraftConfirmationOptions): Promise<TravelDraftObservation>;
 }
 
 export interface TravelDraftCheckpoint {
@@ -208,6 +221,13 @@ export interface TravelDraftCheckpoint {
 	actionsUsed: number;
 	attempts: Record<string, number>;
 	noProgress: Record<string, number>;
+	/**
+	 * Durable save lifecycle. Optional so version-1 checkpoints written before
+	 * this field existed remain readable; legacy saveRequested=true maps to
+	 * "dispatched" and is never replayed.
+	 */
+	saveState?: TravelDraftSaveState;
+	/** Legacy compatibility mirror: true exactly after dispatch (or confirmation). */
 	saveRequested: boolean;
 	errors: string[];
 }
@@ -248,6 +268,7 @@ class TravelDraftBudgetError extends Error {
 }
 
 const EXPLICIT_DRAFT_CONFIRMATION = /(?:保存成功|草稿保存成功|已存为草稿|已保存为草稿)/;
+const TRAVEL_DRAFT_SAVE_STATES = new Set<TravelDraftSaveState>(["none", "prepared", "dispatched", "confirmed"]);
 
 function cloneCheckpoint(checkpoint: TravelDraftCheckpoint): TravelDraftCheckpoint {
 	return {
@@ -256,6 +277,21 @@ function cloneCheckpoint(checkpoint: TravelDraftCheckpoint): TravelDraftCheckpoi
 		noProgress: { ...checkpoint.noProgress },
 		errors: [...checkpoint.errors],
 	};
+}
+
+function normalizedCheckpointSaveState(checkpoint: TravelDraftCheckpoint): TravelDraftSaveState {
+	const candidate = checkpoint.saveState;
+	if (checkpoint.saveRequested) {
+		// saveRequested was the only durable save marker in older version-1
+		// checkpoints. It always means the click may already have been dispatched.
+		if (candidate === "confirmed") return "confirmed";
+		return "dispatched";
+	}
+	return candidate && TRAVEL_DRAFT_SAVE_STATES.has(candidate) ? candidate : "none";
+}
+
+function saveStateHasDispatched(state: TravelDraftSaveState): boolean {
+	return state === "dispatched" || state === "confirmed";
 }
 
 function cents(value: number | undefined): number {
@@ -308,7 +344,16 @@ export function travelDraftObservationFingerprint(observation: TravelDraftObserv
 }
 
 export function travelDraftPlanFingerprint(plan: TravelDraftPlan): string {
-	return createHash("sha256").update(stableJson(plan)).digest("hex");
+	const fingerprintInput = {
+		version: 2,
+		reimbursementDate: plan.reimbursementDate,
+		application: plan.application,
+		transport: plan.transport.map(({ uploadFile: _uploadFile, verificationFiles: _verificationFiles, ...row }) => row),
+		hotel: plan.hotel
+			? (({ uploadFile: _uploadFile, verificationFiles: _verificationFiles, ...hotel }) => hotel)(plan.hotel)
+			: undefined,
+	};
+	return createHash("sha256").update(stableJson(fingerprintInput)).digest("hex");
 }
 
 /**
@@ -393,6 +438,7 @@ export function buildTravelDraftExpected(plan: TravelDraftPlan): TravelDraftExpe
 			expenseNature: plan.application.expenseNature,
 			applicantDepartment: TRAVEL_DRAFT_DEPARTMENT,
 			expenseDepartment: TRAVEL_DRAFT_DEPARTMENT,
+			paymentRecipient: TRAVEL_DRAFT_CURRENT_USER,
 			multipleRecipients: false,
 		},
 		transport,
@@ -557,6 +603,7 @@ function applicationMatches(
 function headerMatches(
 	actual: TravelDraftHeaderObservation | undefined,
 	expected: TravelDraftHeaderExpected,
+	allowCollapsedPaymentSummary = false,
 ): boolean {
 	return Boolean(
 		actual &&
@@ -568,6 +615,8 @@ function headerMatches(
 			actual.expenseNature === expected.expenseNature &&
 			actual.applicantDepartment === expected.applicantDepartment &&
 			actual.expenseDepartment === expected.expenseDepartment &&
+			(actual.paymentRecipient === expected.paymentRecipient ||
+				(allowCollapsedPaymentSummary && actual.paymentRecipient === undefined)) &&
 			actual.multipleRecipients === false,
 	);
 }
@@ -643,7 +692,7 @@ function completeDraftMatches(observation: TravelDraftObservation, expected: Tra
 		observation.page === "form" &&
 		observation.detailCount === expectedDetailCount &&
 		applicationMatches(observation.application, expected.application) &&
-		headerMatches(observation.header, expected.header) &&
+		headerMatches(observation.header, expected.header, observation.details.length > 0) &&
 		expected.transport.every((row) => transportMatches(detailByKey(observation, row.key), row)) &&
 		(!expected.hotel || hotelMatches(detailByKey(observation, expected.hotel.key), expected.hotel)) &&
 		allowanceMatches(detailByKey(observation, expected.allowance.key), expected.allowance) &&
@@ -701,10 +750,19 @@ export async function runTravelDraft(
 				actionsUsed: 0,
 				attempts: {},
 				noProgress: {},
+				saveState: "none",
 				saveRequested: false,
 				errors: [],
 			};
 	let observation: TravelDraftObservation | undefined;
+	const setSaveState = (state: TravelDraftSaveState) => {
+		checkpoint.saveState = state;
+		checkpoint.saveRequested = saveStateHasDispatched(state);
+	};
+	const initialSaveState = normalizedCheckpointSaveState(checkpoint);
+	setSaveState(initialSaveState);
+	const readOnlyDispatchRecovery = options.checkpoint !== undefined && initialSaveState === "dispatched";
+	const saveHasDispatched = () => saveStateHasDispatched(checkpoint.saveState ?? "none");
 	const persist = async () => {
 		await options.onCheckpoint?.(cloneCheckpoint(checkpoint));
 	};
@@ -728,6 +786,12 @@ export async function runTravelDraft(
 	if (localIssues.missing.length > 0 || localIssues.ambiguous.length > 0) {
 		return result("needs_input", checkpoint, expected, observation, localIssues.missing, localIssues.ambiguous);
 	}
+	if (readOnlyDispatchRecovery && !["SAVE_DRAFT", "CONFIRM"].includes(checkpoint.stage)) {
+		checkpoint.errors.push(
+			`持久化派发恢复点异常停在 ${checkpoint.stage}；只允许只读确认，绝不回到核验或保存阶段`,
+		);
+		return result("blocked", checkpoint, expected, observation);
+	}
 
 	try {
 		if (checkpoint.stage === "PRECHECK") {
@@ -740,6 +804,15 @@ export async function runTravelDraft(
 			}
 			checkpoint.stage = "OPEN";
 			await persist();
+		} else if (readOnlyDispatchRecovery) {
+			// A dispatched checkpoint is an at-most-once barrier, not proof that the
+			// click reached the page. Do not reopen detail drawers or run verification;
+			// the only permitted browser operation is explicit, read-only confirmation.
+			observation = {
+				page: "loading",
+				details: [],
+				draft: { saveRequested: true, saved: false },
+			};
 		} else {
 			observation = await call(() => driver.observe(expected));
 		}
@@ -753,10 +826,26 @@ export async function runTravelDraft(
 
 	const firstMissingTransport = () =>
 		expected.transport.findIndex((row) => !transportMatches(detailByKey(observation!, row.key), row));
-	const draftSaveRequested = () => checkpoint.saveRequested || observation?.draft?.saveRequested === true;
+	const markSaveDispatched = async () => {
+		if (saveHasDispatched()) {
+			throw new Error("SAVE_DRAFT：同一个保存派发许可只能消费一次，已阻止驱动器重复发送");
+		}
+		if (checkpoint.saveState !== "prepared") {
+			throw new Error(`SAVE_DRAFT：保存派发边界要求 prepared 状态，当前为 ${checkpoint.saveState ?? "none"}`);
+		}
+		setSaveState("dispatched");
+		try {
+			// The driver awaits this hook immediately before issuing the irreversible
+			// browser click. If persistence fails, the hook rejects and no click is sent.
+			await persist();
+		} catch (error) {
+			setSaveState("prepared");
+			throw new Error(`SAVE_DRAFT：保存派发状态无法持久化，未点击草稿按钮：${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
 	const rewindForPrerequisites = async () => {
 		if (!observation) return;
-		if (draftSaveRequested()) return;
+		if (saveHasDispatched()) return;
 		let stage: TravelDraftStage | undefined;
 		let transportIndex = checkpoint.transportIndex;
 		if (checkpoint.stage !== "OPEN" && observation.page !== "form") stage = "OPEN";
@@ -767,7 +856,7 @@ export async function runTravelDraft(
 			stage = "APPLICATION";
 		} else if (
 			!["OPEN", "APPLICATION", "HEADER"].includes(checkpoint.stage) &&
-			!headerMatches(observation.header, expected.header)
+			!headerMatches(observation.header, expected.header, observation.details.length > 0)
 		) {
 			stage = "HEADER";
 		} else if (!["OPEN", "APPLICATION", "HEADER"].includes(checkpoint.stage)) {
@@ -786,6 +875,10 @@ export async function runTravelDraft(
 				!allowanceMatches(detailByKey(observation, expected.allowance.key), expected.allowance)
 			) {
 				stage = "ALLOWANCE";
+			} else if (checkpoint.stage === "SAVE_DRAFT" && observation.verification?.valid !== true) {
+				// A prepared checkpoint is reversible. After a restart/re-observation,
+				// repeat the fresh verification before allowing the dispatch hook.
+				stage = "VERIFY";
 			} else if (checkpoint.stage === "DONE" && observation.verification?.valid !== true) {
 				stage = "VERIFY";
 			} else if (checkpoint.stage === "DONE" && !explicitDraftSaved(observation)) {
@@ -800,15 +893,18 @@ export async function runTravelDraft(
 		if (stage && (stage !== checkpoint.stage || transportIndex !== checkpoint.transportIndex)) {
 			checkpoint.stage = stage;
 			checkpoint.transportIndex = transportIndex;
-			checkpoint.saveRequested = false;
+			setSaveState("none");
 			await persist();
 		}
 	};
 
 	while (true) {
 		if (options.signal?.aborted) return interruptResult();
-		if (draftSaveRequested()) {
-			if (!completeDraftMatches(observation!, expected) || observation?.verification?.valid !== true) {
+		if (saveHasDispatched()) {
+			if (
+				!readOnlyDispatchRecovery &&
+				(!completeDraftMatches(observation!, expected) || observation?.verification?.valid !== true)
+			) {
 				checkpoint.errors.push("草稿保存请求后页面完整性或保存前核验不再成立；为避免保存后重放修改已安全停止");
 				await persist();
 				return result("blocked", checkpoint, expected, observation);
@@ -818,7 +914,7 @@ export async function runTravelDraft(
 				await persist();
 				return result("blocked", checkpoint, expected, observation);
 			}
-			if (checkpoint.stage === "DONE" && !explicitDraftSaved(observation!)) {
+			if (!readOnlyDispatchRecovery && checkpoint.stage === "DONE" && !explicitDraftSaved(observation!)) {
 				checkpoint.errors.push("恢复点表明草稿保存已请求，但页面没有可归因的保存成功证据；不会再次点击保存");
 				await persist();
 				return result("blocked", checkpoint, expected, observation);
@@ -839,7 +935,11 @@ export async function runTravelDraft(
 				operation = () => driver.ensureApplication(expected.application);
 				break;
 			case "HEADER":
-				satisfied = headerMatches(observation?.header, expected.header);
+				satisfied = headerMatches(
+					observation?.header,
+					expected.header,
+					(observation?.details.length ?? 0) > 0,
+				);
 				operation = () => driver.ensureHeader(expected.header);
 				break;
 			case "TRANSPORT": {
@@ -873,12 +973,13 @@ export async function runTravelDraft(
 				operation = () => driver.verify(expected);
 				break;
 			case "SAVE_DRAFT":
-				satisfied = draftSaveRequested();
-				operation = () => driver.saveDraft(expected);
+				satisfied = saveHasDispatched();
+				operation = () => driver.saveDraft(expected, markSaveDispatched);
 				break;
 			case "CONFIRM":
-				satisfied = checkpoint.saveRequested && explicitDraftSaved(observation!);
-				operation = () => driver.confirmDraftSaved();
+				satisfied = saveHasDispatched() && explicitDraftSaved(observation!);
+				operation = () =>
+					driver.confirmDraftSaved(readOnlyDispatchRecovery ? { readOnlyRecovery: true } : undefined);
 				break;
 		}
 
@@ -903,13 +1004,14 @@ export async function runTravelDraft(
 					checkpoint.stage = "VERIFY";
 					break;
 				case "VERIFY":
+					setSaveState("prepared");
 					checkpoint.stage = "SAVE_DRAFT";
 					break;
 				case "SAVE_DRAFT":
-					checkpoint.saveRequested = true;
 					checkpoint.stage = "CONFIRM";
 					break;
 				case "CONFIRM":
+					setSaveState("confirmed");
 					checkpoint.stage = "DONE";
 					break;
 				default:
@@ -927,21 +1029,16 @@ export async function runTravelDraft(
 		}
 		checkpoint.attempts[attemptKey] = attempts + 1;
 		const before = travelDraftObservationFingerprint(observation!);
-		if (checkpoint.stage === "SAVE_DRAFT") {
-			// Persist an irreversible save-attempt sentinel before entering the driver.
-			// A DOM click may succeed even if the subsequent await aborts or throws.
-			checkpoint.saveRequested = true;
-			try {
-				await persist();
-			} catch {
-				checkpoint.errors.push("SAVE_DRAFT：保存意图无法持久化；为防止跨重启重复保存，未点击草稿按钮");
-				return result("blocked", checkpoint, expected, observation);
-			}
-		}
 		try {
 			observation = await call(operation!);
-			if (checkpoint.stage === "SAVE_DRAFT" && observation.draft?.saveRequested === true) {
-				checkpoint.saveRequested = true;
+			if (checkpoint.stage === "SAVE_DRAFT" && !saveHasDispatched()) {
+				// A driver that returns without consuming the durable permit violates the
+				// irreversible-action contract. It may nevertheless have clicked, so mark
+				// the state as dispatched and stop instead of ever retrying.
+				setSaveState("dispatched");
+				checkpoint.errors.push("SAVE_DRAFT：保存驱动器未消费持久化派发许可；保存状态未知，已禁止重试");
+				await persist();
+				return result("blocked", checkpoint, expected, observation);
 			}
 		} catch (error) {
 			if (isInterruption(error, options.signal)) {
@@ -952,9 +1049,17 @@ export async function runTravelDraft(
 			} else {
 				checkpoint.errors.push(`${attemptKey}：${error instanceof Error ? error.message : String(error)}`);
 			}
-			await persist();
-			// Driver exceptions mean a runtime contract or post-mutation verification failed.
-			// Replaying the same stage could duplicate rows, uploads, bindings, or drawers.
+			try {
+				await persist();
+			} catch (persistError) {
+				checkpoint.errors.push(
+					`恢复点持久化失败：${persistError instanceof Error ? persistError.message : String(persistError)}`,
+				);
+			}
+			// Before the dispatch hook, SAVE_DRAFT remains prepared and is safe to
+			// retry from a later invocation. After the hook it remains dispatched,
+			// so recovery can confirm but can never issue a second save click.
+			// Other driver exceptions remain fail-closed to avoid duplicate mutations.
 			return result("blocked", checkpoint, expected, observation);
 		}
 		const after = travelDraftObservationFingerprint(observation);

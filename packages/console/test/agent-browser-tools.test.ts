@@ -482,7 +482,11 @@ describe("客户端浏览器工具", () => {
 		expect(controller).toContain("const boundaryInputs = queryAll('input[type=file]', boundaryBases)");
 		expect(controller).toContain("指定目标最近边界内存在多个上传框，已拒绝猜测");
 		expect(controller).not.toContain("const nearby = [...container.querySelectorAll?.('input[type=file]') || []]");
-		expect(controller).toContain("const overlayWithInputs = overlays.find");
+		expect(controller).not.toContain("const overlayWithInputs = overlays.find");
+		expect(controller).toContain("已拒绝默认选择第一个");
+		expect(controller).toContain("同一最近边界内的唯一 file input");
+		expect(controller).toContain("data-pi-trusted-upload-token");
+		expect(controller).toContain("await revalidateTrustedUpload()");
 		expect(controller).toContain("const UPLOAD_ISOLATED_WORLD_ID = 1001");
 		expect(controller).toContain("executeJavaScriptInIsolatedWorld(");
 		expect(controller).toContain("startOrigin !== lockedOrigin");
