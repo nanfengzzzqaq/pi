@@ -124,6 +124,16 @@ foreach ($Tool in $SearchTools) {
     Write-Host "已预置文件搜索工具：$($Tool.Name) $($Tool.Version)"
 }
 
+function Assert-PathWithin([string]$Parent, [string]$Candidate, [string]$Label) {
+	$ParentFull = [IO.Path]::GetFullPath($Parent).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+	$CandidateFull = [IO.Path]::GetFullPath($Candidate)
+	$Prefix = $ParentFull + [IO.Path]::DirectorySeparatorChar
+	if (-not $CandidateFull.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)) {
+		throw "$Label 不在允许目录内：$CandidateFull"
+	}
+	return $CandidateFull
+}
+
 # 3. 先编译当前仓库，再将本地 pi-ai 与 coding-agent 压包安装进 Electron 暂存目录。
 # package.json 仍保留 registry 版本用于基础依赖解析；最终实际装入安装包的 AI 与 agent 都必须来自本仓库。
 $LocalPackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-console-local-packages-" + [guid]::NewGuid().ToString("N"))
@@ -175,8 +185,6 @@ try {
 		if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
 
 		$InstalledAgentRoot = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent"
-		& npm.cmd install --prefix $InstalledAgentRoot --no-audit --no-fund --no-save --package-lock=false --force $LocalAiPackage
-		if ($LASTEXITCODE -ne 0) { throw "将本地 pi-ai 安装到 coding-agent 实际依赖目录失败" }
 	} finally {
 		Pop-Location
 	}
@@ -184,10 +192,145 @@ try {
 	$LocalAgentDist = Join-Path $CodingAgentDir "dist"
 	$LocalAiDist = Join-Path $AiDir "dist"
 	$InstalledAgentDist = Join-Path $InstalledAgentRoot "dist"
-	$InstalledAiDist = Join-Path $InstalledAgentRoot "node_modules\@earendil-works\pi-ai\dist"
-	node $Verifier --source-ai-dist $LocalAiDist --installed-ai-dist $InstalledAiDist --installed-agent-root $InstalledAgentRoot
-	if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 pi-ai 不是本地构建或 coding-agent 仍解析到 registry 副本" }
-	Write-Host "已校验 Electron 暂存目录中的本地 pi-ai 与实际解析路径"
+	$InstalledAiParent = Join-Path $InstalledAgentRoot "node_modules\@earendil-works"
+	$ResolvedInstalledAgentRoot = (Resolve-Path -LiteralPath $InstalledAgentRoot).Path
+	$InstalledAiParent = Assert-PathWithin $ResolvedInstalledAgentRoot ([IO.Path]::GetFullPath($InstalledAiParent)) "pi-ai 依赖父目录创建目标"
+	if (-not (Test-Path -LiteralPath $InstalledAiParent -PathType Container)) {
+		New-Item -ItemType Directory -Path $InstalledAiParent -Force | Out-Null
+	}
+	$ResolvedInstalledAiParent = (Resolve-Path -LiteralPath $InstalledAiParent).Path
+	Assert-PathWithin $ResolvedInstalledAgentRoot $ResolvedInstalledAiParent "pi-ai 依赖父目录" | Out-Null
+	$InstalledAiParent = $ResolvedInstalledAiParent
+	$InstalledAiRoot = Join-Path $InstalledAiParent "pi-ai"
+	$InstalledAiDist = Join-Path $InstalledAiRoot "dist"
+	$InstalledAiRoot = Assert-PathWithin $ResolvedInstalledAgentRoot $InstalledAiRoot "pi-ai 替换目标"
+	# npm 可能把 registry pi-ai 去重到 Electron 根 node_modules。此时 nested 目标原本不存在，
+	# 无需备份；验证失败只删除新激活的 nested 副本，即恢复到原先由根副本解析的布局。
+	$OriginalNestedAiExists = Test-Path -LiteralPath $InstalledAiRoot -PathType Container
+	$ResolvedRegistryAiRoot = $null
+	if ($OriginalNestedAiExists) {
+		$ResolvedRegistryAiRoot = (Resolve-Path -LiteralPath $InstalledAiRoot).Path
+		Assert-PathWithin $ResolvedInstalledAgentRoot $ResolvedRegistryAiRoot "registry pi-ai" | Out-Null
+	}
+
+	# npm pack 产物只能包含 package/ 下的普通文件或目录。先完成条目与类型预检，
+	# 再直接解包到同盘的极短唯一暂存目录，避免 PowerShell Copy-Item 触发 Windows 长路径限制。
+	$TarCommand = Get-Command tar.exe -ErrorAction Stop
+	$ArchiveEntries = @(& $TarCommand.Source -tzf $LocalAiPackage)
+	if ($LASTEXITCODE -ne 0 -or $ArchiveEntries.Count -eq 0) { throw "无法读取本地 pi-ai 压包目录" }
+	foreach ($Entry in $ArchiveEntries) {
+		$NormalizedEntry = "$Entry".Replace('\', '/').Trim()
+		$Segments = @($NormalizedEntry.Split('/', [StringSplitOptions]::RemoveEmptyEntries))
+		if (
+			($NormalizedEntry -ne "package" -and -not $NormalizedEntry.StartsWith("package/", [StringComparison]::Ordinal)) -or
+			[IO.Path]::IsPathRooted($NormalizedEntry) -or
+			$Segments -contains ".."
+		) {
+			throw "本地 pi-ai 压包包含越界路径，已拒绝解包"
+		}
+	}
+	$VerboseArchiveEntries = @(& $TarCommand.Source -tvzf $LocalAiPackage)
+	if ($LASTEXITCODE -ne 0 -or $VerboseArchiveEntries.Count -eq 0) { throw "无法校验本地 pi-ai 压包条目类型" }
+	foreach ($Entry in $VerboseArchiveEntries) {
+		$Type = "$Entry".TrimStart()[0]
+		if ($Type -ne '-' -and $Type -ne 'd') { throw "本地 pi-ai 压包包含链接或特殊条目，已拒绝解包" }
+	}
+
+	$InstalledVolumeRoot = [IO.Path]::GetPathRoot($ResolvedInstalledAgentRoot)
+	$ShortTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+	if (-not [String]::Equals([IO.Path]::GetPathRoot($ShortTempRoot), $InstalledVolumeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+		throw "系统临时目录与 Electron 暂存目录不在同一卷，无法安全原子替换本地 pi-ai"
+	}
+	$ResolvedShortTempRoot = (Resolve-Path -LiteralPath $ShortTempRoot).Path
+	Assert-PathWithin $InstalledVolumeRoot $ResolvedShortTempRoot "pi-ai 同盘短暂存根目录" | Out-Null
+	$ReplacementAiRoot = $null
+	try {
+		for ($Attempt = 0; $Attempt -lt 16 -and -not $ReplacementAiRoot; $Attempt++) {
+			$CandidateAiRoot = Assert-PathWithin $ResolvedShortTempRoot (Join-Path $ResolvedShortTempRoot ("p" + [guid]::NewGuid().ToString("N").Substring(0, 16))) "pi-ai 同盘短暂存目录"
+			if (Test-Path -LiteralPath $CandidateAiRoot) { continue }
+			$CandidateCreated = $false
+			try {
+				New-Item -ItemType Directory -Path $CandidateAiRoot -ErrorAction Stop | Out-Null
+				$CandidateCreated = $true
+				$ReplacementAiRoot = $CandidateAiRoot
+				$ReplacementAiRoot = (Resolve-Path -LiteralPath $CandidateAiRoot).Path
+				Assert-PathWithin $ResolvedShortTempRoot $ReplacementAiRoot "pi-ai 已创建的同盘短暂存目录" | Out-Null
+			} catch {
+				if (-not $CandidateCreated -and (Test-Path -LiteralPath $CandidateAiRoot)) { continue }
+				throw
+			}
+		}
+		if (-not $ReplacementAiRoot) { throw "无法创建唯一的 pi-ai 同盘短暂存目录" }
+
+		& $TarCommand.Source -xzf $LocalAiPackage -C $ReplacementAiRoot --strip-components=1
+		if ($LASTEXITCODE -ne 0) { throw "tar.exe 不支持安全去除 package 根目录或解包本地 pi-ai 失败" }
+		$SourceAiManifest = Get-Content -Raw -LiteralPath (Join-Path $AiDir "package.json") | ConvertFrom-Json
+		$ExtractedAiManifestPath = Join-Path $ReplacementAiRoot "package.json"
+		if (-not (Test-Path -LiteralPath $ExtractedAiManifestPath -PathType Leaf)) { throw "本地 pi-ai 压包缺少 package.json" }
+		$ExtractedAiManifest = Get-Content -Raw -LiteralPath $ExtractedAiManifestPath | ConvertFrom-Json
+		if (
+			$ExtractedAiManifest.name -ne "@earendil-works/pi-ai" -or
+			$ExtractedAiManifest.version -ne $SourceAiManifest.version
+		) {
+			throw "本地 pi-ai 压包名称或版本与当前源码不一致"
+		}
+
+		$RegistryAiBackupRoot = $null
+		for ($Attempt = 0; $Attempt -lt 16 -and -not $RegistryAiBackupRoot; $Attempt++) {
+			$CandidateBackupRoot = Assert-PathWithin $ResolvedInstalledAgentRoot (Join-Path $InstalledAiParent (".b" + [guid]::NewGuid().ToString("N").Substring(0, 16))) "pi-ai 回滚目录"
+			if (-not (Test-Path -LiteralPath $CandidateBackupRoot)) { $RegistryAiBackupRoot = $CandidateBackupRoot }
+		}
+		if (-not $RegistryAiBackupRoot) { throw "无法分配唯一的 pi-ai 回滚目录" }
+		$ExistingAiDependencies = if ($ResolvedRegistryAiRoot) { Join-Path $ResolvedRegistryAiRoot "node_modules" } else { $null }
+		if ($ExistingAiDependencies -and (Test-Path -LiteralPath $ExistingAiDependencies -PathType Container)) {
+			$ReplacementAiDependencies = Join-Path $ReplacementAiRoot "node_modules"
+			if (Test-Path -LiteralPath $ReplacementAiDependencies) { throw "本地 pi-ai 压包不应携带 node_modules" }
+			Copy-Item -LiteralPath $ExistingAiDependencies -Destination $ReplacementAiDependencies -Recurse
+		}
+
+		$BackupCreated = $false
+		$ReplacementActivated = $false
+		try {
+			if ($OriginalNestedAiExists) {
+				Move-Item -LiteralPath $ResolvedRegistryAiRoot -Destination $RegistryAiBackupRoot
+				$BackupCreated = $true
+			}
+			Move-Item -LiteralPath $ReplacementAiRoot -Destination $InstalledAiRoot
+			$ReplacementActivated = $true
+			node $Verifier --source-ai-dist $LocalAiDist --installed-ai-dist $InstalledAiDist --installed-agent-root $InstalledAgentRoot
+			if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 pi-ai 不是本地构建或 coding-agent 仍解析到 registry 副本" }
+		} catch {
+			$ReplacementFailure = $_
+			try {
+				if ($ReplacementActivated -and (Test-Path -LiteralPath $InstalledAiRoot)) {
+					Assert-PathWithin $ResolvedInstalledAgentRoot $InstalledAiRoot "失败的本地 pi-ai" | Out-Null
+					Remove-Item -LiteralPath $InstalledAiRoot -Recurse -Force
+					$ReplacementActivated = $false
+				}
+				if ($BackupCreated -and (Test-Path -LiteralPath $RegistryAiBackupRoot)) {
+					Move-Item -LiteralPath $RegistryAiBackupRoot -Destination $InstalledAiRoot
+					$BackupCreated = $false
+				}
+			} catch {
+				throw "本地 pi-ai 替换失败且 registry 副本自动恢复失败；回滚目录已保留：$RegistryAiBackupRoot"
+			}
+			throw $ReplacementFailure
+		}
+		if ($BackupCreated) {
+			try {
+				Remove-Item -LiteralPath $RegistryAiBackupRoot -Recurse -Force -ErrorAction Stop
+				$BackupCreated = $false
+			} catch {
+				throw "本地 pi-ai 已替换并验证成功，但旧 registry 备份清理失败；已保留可用的本地 pi-ai 与残留备份：$RegistryAiBackupRoot"
+			}
+		}
+		Write-Host "已原子替换并校验 Electron 暂存目录中的本地 pi-ai 与实际解析路径"
+	} finally {
+		if ($ReplacementAiRoot -and (Test-Path -LiteralPath $ReplacementAiRoot)) {
+			Assert-PathWithin $ResolvedShortTempRoot $ReplacementAiRoot "残留 pi-ai 短暂存目录" | Out-Null
+			Remove-Item -LiteralPath $ReplacementAiRoot -Recurse -Force
+		}
+	}
 
 	node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
     if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 coding-agent 与本地构建不一致" }
