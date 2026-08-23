@@ -3,8 +3,9 @@ import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { deflateSync } from "node:zlib";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import definePack, {
+	bindTravelDraftParams,
 	durableAttachment,
 	fillTravelDraft,
 	type InvoiceAttachmentResult,
@@ -130,7 +131,6 @@ class SentinelWorkflowDriver {
 
 	async ensureAllowance(row: TravelDraftExpected["allowance"]): Promise<TravelDraftObservation> {
 		this.upsert(row);
-		this.beforeSaveIntent?.();
 		return this.output();
 	}
 
@@ -140,7 +140,12 @@ class SentinelWorkflowDriver {
 		return this.output();
 	}
 
-	async saveDraft(_expected: TravelDraftExpected): Promise<TravelDraftObservation> {
+	async saveDraft(
+		_expected: TravelDraftExpected,
+		onDispatch?: () => void | Promise<void>,
+	): Promise<TravelDraftObservation> {
+		this.beforeSaveIntent?.();
+		await onDispatch?.();
 		this.onSave();
 		this.state.draft = { saveRequested: true, saved: false };
 		return this.output();
@@ -335,6 +340,50 @@ describe("差旅报销能力包", () => {
 		]);
 	});
 
+	it("控制台直绑的 URL 和附件覆盖弱模型转抄出的错误参数", () => {
+		expect(
+			bindTravelDraftParams(
+				{
+					url: "https://app.ekuaibao.com/帮我报销",
+					paths: ["模型猜测.pdf"],
+					applicationHint: "常州",
+				},
+				{
+					text: "请填常州 8月21日的出差报销并保存草稿",
+					attachments: ["uploads/火车票.pdf", "uploads/查验件.pdf"],
+					ekuaibaoTravelUrl:
+						"https://app.ekuaibao.com/web/app.html?accessToken=pi-browser-secret-fixture#/billEntryDetail",
+				},
+			),
+		).toEqual({
+			url: "https://app.ekuaibao.com/web/app.html?accessToken=pi-browser-secret-fixture#/billEntryDetail",
+			paths: ["uploads/火车票.pdf", "uploads/查验件.pdf"],
+			applicationHint: "常州",
+		});
+	});
+
+	it("当前轮次没有 URL 或附件时不采用弱模型猜测的旧输入", () => {
+		expect(
+			bindTravelDraftParams(
+				{
+					url: "https://app.ekuaibao.com/web/app.html?accessToken=stale#/billEntryDetail",
+					paths: ["上一次行程.pdf"],
+					applicationHint: "常州",
+				},
+				{ text: "继续", attachments: [] },
+			),
+		).toEqual({ url: undefined, paths: undefined, applicationHint: undefined });
+	});
+
+	it("当前轮次原文没有模型给出的申请线索时将其视为幻觉并丢弃", () => {
+		expect(
+			bindTravelDraftParams(
+				{ applicationHint: "苏州 8月22日" },
+				{ text: "请填常州 8月21日的出差报销", attachments: [] },
+			),
+		).toEqual({ url: undefined, paths: undefined, applicationHint: undefined });
+	});
+
 	it("安装版 OCR 脚本优先使用 app.asar.unpacked 物理路径", () => {
 		const modulePath =
 			process.platform === "win32"
@@ -526,6 +575,87 @@ describe("差旅报销能力包", () => {
 		}
 	});
 
+	it("多日行程优先使用住宿发票明确的入住离店日期，而不是整段出差日期", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-hotel-date-plan-test-"));
+		const application: TravelDraftApplication = {
+			id: "TEST-HOTEL-DATES-APPLICATION",
+			title: "出差申请：常州多日支撑",
+			reason: "常州多日支撑",
+			startDate: "2026-08-20",
+			endDate: "2026-08-23",
+			expenseNature: "部门费用",
+		};
+		const ticket = (invoiceNumber: string, fromCity: string, toCity: string, date: string) => ({
+			source: `${invoiceNumber}.pdf`,
+			uploadFile: `${invoiceNumber}.pdf`,
+			trainNumber: invoiceNumber.endsWith("1") ? "G7001" : "G7002",
+			fromStation: `${fromCity}站`,
+			toStation: `${toCity}站`,
+			fromCity,
+			toCity,
+			date,
+			seatClass: "二等座",
+			amount: 72,
+			passenger: "苏爱健",
+			invoiceNumber,
+			verificationFiles: [`${invoiceNumber}-verification.png`],
+			verificationStatus: "ready" as const,
+		});
+		const attachments: InvoiceAttachmentResult = {
+			invoices: [
+				ticket("TEST-HOTEL-DATES-1", "南京", "常州", "2026-08-20"),
+				ticket("TEST-HOTEL-DATES-2", "常州", "南京", "2026-08-23"),
+			],
+			pairingStatus: "ready",
+			lodging: {
+				status: "ready",
+				invoice: {
+					uploadFile: "hotel.pdf",
+					invoiceNumber: "TEST-HOTEL-INVOICE-DATES",
+					amount: 488,
+					verificationFiles: [],
+					checkinDate: "2026-08-21",
+					checkoutDate: "2026-08-22",
+				},
+				candidates: [],
+				issues: [],
+				classifiedFiles: ["hotel.pdf"],
+			},
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		let capturedPlan: TravelDraftPlan | undefined;
+		try {
+			const result = await fillTravelDraft(
+				{ url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail", paths: ["all-attachments.zip"] },
+				cwd,
+				undefined,
+				undefined,
+				{
+					readAttachments: () => structuredClone(attachments),
+					createDriver: () => {
+						const driver = new SentinelWorkflowDriver(application, () => undefined);
+						const precheck = driver.precheck.bind(driver);
+						driver.precheck = async (plan, expected) => {
+							capturedPlan = structuredClone(plan);
+							return precheck(plan, expected);
+						};
+						return driver as unknown as TravelDraftBrowserDriver;
+					},
+				},
+			);
+			expect(result.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
+			expect(capturedPlan?.hotel).toMatchObject({
+				checkinDate: "2026-08-21",
+				checkoutDate: "2026-08-22",
+			});
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("同一行程跨调用和进程重建命中持久化保存意图，新行程不受影响且记录不含敏感值", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-save-intent-test-"));
 		const application: TravelDraftApplication = {
@@ -587,13 +717,21 @@ describe("差旅报销能力包", () => {
 
 			const intentDirectory = join(cwd, ".pi", "travel-expense");
 			const intentFiles = readdirSync(intentDirectory);
-			expect(intentFiles).toHaveLength(1);
-			expect(intentFiles[0]).toMatch(/^save-intent-[a-f0-9]{64}\.json$/);
-			const intentContent = readFileSync(join(intentDirectory, intentFiles[0]), "utf8");
+			expect(intentFiles).toHaveLength(2);
+			const intentFile = intentFiles.find((file) => /^save-intent-[a-f0-9]{64}\.json$/.test(file));
+			const checkpointFile = intentFiles.find((file) => /^checkpoint-[a-f0-9]{64}\.json$/.test(file));
+			expect(intentFile).toBeDefined();
+			expect(checkpointFile).toBeDefined();
+			const intentContent = readFileSync(join(intentDirectory, intentFile!), "utf8");
+			const checkpointContent = readFileSync(join(intentDirectory, checkpointFile!), "utf8");
 			expect(intentContent).not.toContain("accessToken");
 			expect(intentContent).not.toContain("original-secret");
 			expect(intentContent).not.toContain(application.id);
 			expect(intentContent).not.toContain("TEST-SAVE-INTENT-INVOICE-001");
+			expect(checkpointContent).not.toContain("accessToken");
+			expect(checkpointContent).not.toContain("original-secret");
+			expect(checkpointContent).not.toContain(application.id);
+			expect(checkpointContent).not.toContain("TEST-SAVE-INTENT-INVOICE-001");
 
 			const renamedAttachments = structuredClone(attachments);
 			renamedAttachments.invoices[0].source = "D:\\renamed\\second-private-ticket.pdf";
@@ -610,11 +748,10 @@ describe("差旅报销能力包", () => {
 				dependencies(structuredClone(application), renamedAttachments),
 			);
 			expect(rebuiltProcessCall.details).toMatchObject({
-				status: "blocked",
-				stage: "CONFIRM",
-				draftSaved: false,
-				draftSaveStateUncertain: true,
-				draftSaveRequested: true,
+				status: "done",
+				stage: "DONE",
+				draftSaved: true,
+				alreadySaved: true,
 			});
 			expect(saveClicks).toBe(1);
 
@@ -631,8 +768,206 @@ describe("差旅报销能力包", () => {
 			);
 			expect(newTrip.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
 			expect(saveClicks).toBe(2);
-			expect(readdirSync(intentDirectory)).toHaveLength(2);
+			expect(readdirSync(intentDirectory)).toHaveLength(4);
 		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("草稿点击前失败会从持久化 prepared 断点恢复，且最终只派发一次保存", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-prepared-checkpoint-test-"));
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-08-23T08:00:00+08:00"));
+		const application: TravelDraftApplication = {
+			id: "TEST-PREPARED-CHECKPOINT-APPLICATION",
+			title: "出差申请：常州断点恢复",
+			reason: "常州断点恢复",
+			startDate: "2026-08-21",
+			endDate: "2026-08-21",
+			expenseNature: "部门费用",
+		};
+		const attachments: InvoiceAttachmentResult = {
+			invoices: [
+				{
+					source: "checkpoint-ticket.pdf",
+					uploadFile: "checkpoint-ticket.pdf",
+					trainNumber: "G7001",
+					fromStation: "南京站",
+					toStation: "常州站",
+					fromCity: "南京",
+					toCity: "常州",
+					date: "2026-08-21",
+					seatClass: "二等座",
+					amount: 72,
+					passenger: "苏爱健",
+					invoiceNumber: "TEST-PREPARED-CHECKPOINT-INVOICE",
+					verificationFiles: ["checkpoint-verification.png"],
+					verificationStatus: "ready",
+				},
+			],
+			pairingStatus: "ready",
+			lodging: { status: "missing", candidates: [], issues: [], classifiedFiles: [] },
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		let saveClicks = 0;
+		class RetryableSentinelDriver extends SentinelWorkflowDriver {
+			private failBeforeDispatch = true;
+
+			override async saveDraft(
+				expected: TravelDraftExpected,
+				onDispatch?: () => void | Promise<void>,
+			): Promise<TravelDraftObservation> {
+				if (this.failBeforeDispatch) {
+					this.failBeforeDispatch = false;
+					throw new Error("保存按钮尚未派发前页面短暂失效");
+				}
+				return super.saveDraft(expected, onDispatch);
+			}
+		}
+		const driver = new RetryableSentinelDriver(application, () => {
+			saveClicks += 1;
+		});
+		const dependencies = {
+			readAttachments: () => structuredClone(attachments),
+			createDriver: () => driver as unknown as TravelDraftBrowserDriver,
+		};
+		try {
+			const first = await fillTravelDraft(
+				{ url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail", paths: ["checkpoint-ticket.pdf"] },
+				cwd,
+				undefined,
+				undefined,
+				dependencies,
+			);
+			expect(first.details).toMatchObject({
+				status: "blocked",
+				stage: "SAVE_DRAFT",
+				draftSaveRequested: false,
+				draftSaveStateUncertain: false,
+			});
+			expect(saveClicks).toBe(0);
+			const recoveryDirectory = join(cwd, ".pi", "travel-expense");
+			expect(readdirSync(recoveryDirectory)).toEqual([expect.stringMatching(/^checkpoint-[a-f0-9]{64}\.json$/)]);
+
+			vi.setSystemTime(new Date("2026-08-24T08:00:00+08:00"));
+			const resumed = await fillTravelDraft(
+				// Recovery occurs after local midnight. The persisted reimbursement
+				// date must remain part of the original plan instead of invalidating it.
+				{ url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail", paths: ["checkpoint-ticket.pdf"] },
+				cwd,
+				undefined,
+				undefined,
+				dependencies,
+			);
+			expect(resumed.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
+			expect(saveClicks).toBe(1);
+			expect(readdirSync(recoveryDirectory)).toEqual([
+				expect.stringMatching(/^checkpoint-[a-f0-9]{64}\.json$/),
+				expect.stringMatching(/^save-intent-[a-f0-9]{64}\.json$/),
+			]);
+		} finally {
+			vi.useRealTimers();
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("同一行程并发调用只有一个流程可运行，且进度监听异常不影响唯一保存", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "pi-travel-concurrency-test-"));
+		const application: TravelDraftApplication = {
+			id: "TEST-CONCURRENT-APPLICATION",
+			title: "出差申请：常州并发保护",
+			reason: "常州并发保护",
+			startDate: "2026-08-21",
+			endDate: "2026-08-21",
+			expenseNature: "部门费用",
+		};
+		const attachments: InvoiceAttachmentResult = {
+			invoices: [
+				{
+					source: "concurrent-ticket.pdf",
+					uploadFile: "concurrent-ticket.pdf",
+					trainNumber: "G7001",
+					fromStation: "南京站",
+					toStation: "常州站",
+					fromCity: "南京",
+					toCity: "常州",
+					date: "2026-08-21",
+					seatClass: "二等座",
+					amount: 72,
+					passenger: "苏爱健",
+					invoiceNumber: "TEST-CONCURRENT-INVOICE",
+					verificationFiles: ["concurrent-verification.png"],
+					verificationStatus: "ready",
+				},
+			],
+			pairingStatus: "ready",
+			lodging: { status: "missing", candidates: [], issues: [], classifiedFiles: [] },
+			ocrDocuments: [],
+			missing: [],
+			ambiguous: [],
+			unmatched: [],
+		};
+		let signalFirstEntered: (() => void) | undefined;
+		let releaseBlockedDriver: (() => void) | undefined;
+		const firstEntered = new Promise<void>((resolve) => {
+			signalFirstEntered = resolve;
+		});
+		const releaseFirst = new Promise<void>((resolve) => {
+			releaseBlockedDriver = resolve;
+		});
+		let driverIndex = 0;
+		let saveClicks = 0;
+		class BlockingDriver extends SentinelWorkflowDriver {
+			private readonly shouldBlock: boolean;
+
+			constructor(shouldBlock: boolean) {
+				super(application, () => {
+					saveClicks += 1;
+				});
+				this.shouldBlock = shouldBlock;
+			}
+
+			override async precheck(plan: TravelDraftPlan, expected: TravelDraftExpected) {
+				if (this.shouldBlock) {
+					signalFirstEntered?.();
+					await releaseFirst;
+				}
+				return super.precheck(plan, expected);
+			}
+		}
+		const dependencies = {
+			readAttachments: () => structuredClone(attachments),
+			createDriver: () => new BlockingDriver(driverIndex++ === 0) as unknown as TravelDraftBrowserDriver,
+		};
+		try {
+			const first = fillTravelDraft(
+				{ url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail", paths: ["concurrent-ticket.pdf"] },
+				cwd,
+				undefined,
+				() => {
+					throw new Error("UI progress listener failed");
+				},
+				dependencies,
+			);
+			await firstEntered;
+			const second = await fillTravelDraft(
+				{ url: "https://app.ekuaibao.com/web/app.html#/billEntryDetail", paths: ["concurrent-ticket.pdf"] },
+				cwd,
+				undefined,
+				undefined,
+				dependencies,
+			);
+			expect(second.details).toMatchObject({ status: "blocked", stage: "PRECHECK", draftSaved: false });
+			expect(saveClicks).toBe(0);
+			releaseBlockedDriver?.();
+			const firstResult = await first;
+			expect(firstResult.details).toMatchObject({ status: "done", stage: "DONE", draftSaved: true });
+			expect(saveClicks).toBe(1);
+		} finally {
+			releaseBlockedDriver?.();
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
@@ -693,7 +1028,9 @@ describe("差旅报销能力包", () => {
 							() => {
 								if (sabotaged) return;
 								sabotaged = true;
-								writeFileSync(join(cwd, ".pi"), "not-a-directory", "utf8");
+								const recoveryDirectory = join(cwd, ".pi", "travel-expense");
+								rmSync(recoveryDirectory, { recursive: true, force: true });
+								writeFileSync(recoveryDirectory, "not-a-directory", "utf8");
 							},
 						) as unknown as TravelDraftBrowserDriver,
 				},
@@ -702,12 +1039,12 @@ describe("差旅报销能力包", () => {
 				status: "blocked",
 				stage: "SAVE_DRAFT",
 				draftSaved: false,
-				draftSaveStateUncertain: true,
-				draftSaveRequested: true,
+				draftSaveStateUncertain: false,
+				draftSaveRequested: false,
 			});
 			expect(saveClicks).toBe(0);
 			expect((output.content ?? []).map((block) => (block.type === "text" ? block.text : "")).join("\n")).toContain(
-				"保存意图无法持久化",
+				"保存派发状态无法持久化",
 			);
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
@@ -1449,6 +1786,36 @@ describe("差旅报销能力包", () => {
 				},
 				classifiedFiles: ["hotel-invoice.pdf"],
 			});
+			expect(result.invoice).not.toHaveProperty("checkinDate");
+			expect(result.invoice).not.toHaveProperty("checkoutDate");
+		});
+
+		it.each([
+			["入住日期：2026-8-20 离店日期：2026-08-22", "2026-08-20", "2026-08-22"],
+			["入住时间：2026年8月20日 退房时间：2026年8月22日", "2026-08-20", "2026-08-22"],
+			["住宿起止日期：2026/8/20 至 2026/8/22", "2026-08-20", "2026-08-22"],
+		])("只从住宿邻近标签保守提取入住离店日期：%s", (dateText, checkinDate, checkoutDate) => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: `${lodgingInvoiceText()} ${dateText}` },
+			]);
+			expect(result).toMatchObject({
+				status: "ready",
+				invoice: { checkinDate, checkoutDate },
+			});
+		});
+
+		it.each([
+			"住宿起止日期：2026-08-20 至 2026-08-22 入住日期：2026-08-21 离店日期：2026-08-22",
+			"住宿日期：2026年8月22日 至 2026年8月20日",
+		])("住宿日期范围冲突或倒置时返回 ambiguous：%s", (dateText) => {
+			const result = resolveLodgingInvoiceCandidate([
+				{ file: "hotel-invoice.pdf", text: `${lodgingInvoiceText()} ${dateText}` },
+			]);
+			expect(result.status).toBe("ambiguous");
+			expect(result.invoice).toBeUndefined();
+			expect(result.issues).toContainEqual(
+				expect.objectContaining({ kind: "ambiguous", reason: expect.stringContaining("住宿日期范围") }),
+			);
 		});
 
 		it("同票号住宿查验件绑定到主发票而不成为第二张候选", () => {

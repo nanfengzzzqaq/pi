@@ -60,6 +60,8 @@ export interface LodgingInvoiceCandidate {
 	amount: number;
 	uploadFile: string;
 	verificationFiles: string[];
+	checkinDate?: string;
+	checkoutDate?: string;
 }
 
 export interface LodgingOcrIssue {
@@ -608,6 +610,79 @@ interface ParsedLodgingOcr {
 	issue?: LodgingOcrIssue;
 }
 
+interface LodgingDateResolution {
+	checkinDate?: string;
+	checkoutDate?: string;
+	ambiguous: boolean;
+}
+
+const LODGING_DATE_TOKEN_SOURCE = String.raw`\d{4}(?:-\d{1,2}-\d{1,2}|\/\d{1,2}\/\d{1,2}|年\d{1,2}月\d{1,2}日)`;
+const LODGING_DATE_LABEL_GAP = String.raw`[\s：:（）()【】]{0,16}`;
+
+function normalizeLodgingDate(value: string): string | undefined {
+	const match = /^(\d{4})(?:-(\d{1,2})-(\d{1,2})|\/(\d{1,2})\/(\d{1,2})|年(\d{1,2})月(\d{1,2})日)$/u.exec(
+		value.replace(/\s+/g, ""),
+	);
+	if (!match) return undefined;
+	const year = Number(match[1]);
+	const month = Number(match[2] ?? match[4] ?? match[6]);
+	const day = Number(match[3] ?? match[5] ?? match[7]);
+	const date = new Date(Date.UTC(year, month - 1, day));
+	if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+		return undefined;
+	}
+	return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function collectLodgingLabelledDates(text: string, labelSource: string): string[] {
+	const pattern = new RegExp(`${labelSource}${LODGING_DATE_LABEL_GAP}(${LODGING_DATE_TOKEN_SOURCE})`, "gu");
+	return unique(
+		[...text.matchAll(pattern)]
+			.map((match) => normalizeLodgingDate(match[1]))
+			.filter((value): value is string => Boolean(value)),
+	);
+}
+
+/**
+ * Extract dates only when the OCR places them directly beside lodging-specific
+ * labels. Invoice dates, verification dates, and other unlabelled dates are
+ * deliberately ignored. Multiple distinct endpoints or a reversed range are
+ * treated as conflicting evidence instead of being guessed.
+ */
+function resolveLodgingDates(text: string): LodgingDateResolution {
+	const checkinDates = collectLodgingLabelledDates(
+		text,
+		String.raw`(?:入住(?:日期|时间)?|住宿(?:开始|起始|起)日期)`,
+	);
+	const checkoutDates = collectLodgingLabelledDates(
+		text,
+		String.raw`(?:离店(?:日期|时间)?|退房(?:日期|时间)?|住宿(?:结束|截止|止)日期)`,
+	);
+	const rangePattern = new RegExp(
+		String.raw`(?:住宿(?:起止日期|日期范围|期间|日期|时间)|入住(?:日期|时间)?(?:至|到|\/|—|–|-)离店(?:日期|时间)?)${LODGING_DATE_LABEL_GAP}(${LODGING_DATE_TOKEN_SOURCE})[\s~～至到—–－-]{1,16}(${LODGING_DATE_TOKEN_SOURCE})`,
+		"gu",
+	);
+	let invalidRange = false;
+	for (const match of text.matchAll(rangePattern)) {
+		const checkinDate = normalizeLodgingDate(match[1]);
+		const checkoutDate = normalizeLodgingDate(match[2]);
+		if (!checkinDate || !checkoutDate || checkoutDate < checkinDate) {
+			invalidRange = true;
+			continue;
+		}
+		checkinDates.push(checkinDate);
+		checkoutDates.push(checkoutDate);
+	}
+	const uniqueCheckinDates = unique(checkinDates);
+	const uniqueCheckoutDates = unique(checkoutDates);
+	const ambiguous = invalidRange || uniqueCheckinDates.length > 1 || uniqueCheckoutDates.length > 1;
+	return {
+		...(uniqueCheckinDates.length === 1 ? { checkinDate: uniqueCheckinDates[0] } : {}),
+		...(uniqueCheckoutDates.length === 1 ? { checkoutDate: uniqueCheckoutDates[0] } : {}),
+		ambiguous,
+	};
+}
+
 /**
  * Classify a lodging OCR document conservatively. An authoritative invoice must
  * look like an invoice rather than a verification result: it needs the invoice
@@ -646,6 +721,21 @@ function parseLodgingOcrDocument(document: Pick<TravelOcrDocument, "file" | "tex
 		/(?:项目名称|货物或应税劳务、服务名称)/u.test(compact) &&
 		/(?:税率|税额)/u.test(compact) &&
 		/(?:开票日期|开票人)/u.test(compact);
+	const lodgingDates = resolveLodgingDates(compact);
+	if (hasAuthoritativeLayout && invoiceNumbers.length === 1 && amounts.length === 1 && lodgingDates.ambiguous) {
+		return {
+			kind: "ambiguous",
+			invoiceNumbers,
+			amounts,
+			issue: {
+				file: document.file,
+				kind: "ambiguous",
+				reason: "住宿 PDF 中识别到相互冲突或倒置的住宿日期范围",
+				invoiceNumbers,
+				amounts,
+			},
+		};
+	}
 	if (hasAuthoritativeLayout && invoiceNumbers.length === 1 && amounts.length === 1) {
 		return {
 			kind: "invoice",
@@ -656,6 +746,8 @@ function parseLodgingOcrDocument(document: Pick<TravelOcrDocument, "file" | "tex
 				amount: amounts[0],
 				uploadFile: document.file,
 				verificationFiles: [],
+				...(lodgingDates.checkinDate ? { checkinDate: lodgingDates.checkinDate } : {}),
+				...(lodgingDates.checkoutDate ? { checkoutDate: lodgingDates.checkoutDate } : {}),
 			},
 		};
 	}

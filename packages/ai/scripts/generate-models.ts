@@ -260,7 +260,7 @@ const ANTHROPIC_ALLOWED_FALLBACK_MODELS = {
 	"claude-opus-5": ["claude-opus-4-8"],
 } satisfies Record<string, string[]>;
 
-const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
+const DEEPSEEK_V4_BASE_THINKING_LEVEL_MAP = {
 	minimal: null,
 	low: null,
 	medium: null,
@@ -268,8 +268,20 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	max: "max",
 } as const;
 const DEEPSEEK_V4_FLASH_THINKING_LEVEL_MAP = {
-	...DEEPSEEK_V4_THINKING_LEVEL_MAP,
+	...DEEPSEEK_V4_BASE_THINKING_LEVEL_MAP,
 	low: "low",
+} as const;
+// The direct DeepSeek API exposes three distinct effort values. Keep aliases
+// disabled so the client does not show duplicate medium/xhigh choices that
+// would both be sent as high.
+// https://api-docs.deepseek.com/guides/thinking_mode
+const DEEPSEEK_DIRECT_THINKING_LEVEL_MAP = {
+	minimal: null,
+	low: "low",
+	medium: null,
+	high: "high",
+	xhigh: null,
+	max: "max",
 } as const;
 const QWEN_TOKEN_PLAN_HIGH_MAX_THINKING_LEVEL_MAP = {
 	minimal: null,
@@ -577,6 +589,7 @@ const OPENAI_COMPLETIONS_DEFAULT_COMPAT = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
 	supportsReasoningEffort: true,
+	supportsToolChoiceWithThinking: true,
 	supportsUsageInStreaming: true,
 	supportsFinishReason: true,
 	maxTokensField: "max_completion_tokens",
@@ -584,6 +597,7 @@ const OPENAI_COMPLETIONS_DEFAULT_COMPAT = {
 	requiresAssistantAfterToolResult: false,
 	requiresThinkingAsText: false,
 	requiresReasoningContentOnAssistantMessages: false,
+	requiresAssistantContentOnToolCalls: false,
 	thinkingFormat: "openai",
 	openRouterRouting: {},
 	vercelGatewayRouting: {},
@@ -665,6 +679,7 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		supportsDeveloperRole: isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter),
 		supportsReasoningEffort:
 			!isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAntLing,
+		supportsToolChoiceWithThinking: !isDeepSeek,
 		supportsUsageInStreaming: true,
 		supportsFinishReason: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
@@ -672,6 +687,7 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		requiresAssistantAfterToolResult: false,
 		requiresThinkingAsText: false,
 		requiresReasoningContentOnAssistantMessages: isDeepSeek,
+		requiresAssistantContentOnToolCalls: isDeepSeek,
 		thinkingFormat: isDeepSeek
 			? "deepseek"
 			: isZai
@@ -883,12 +899,14 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(
 			model,
-			model.provider === "openrouter"
-				? { ...DEEPSEEK_V4_THINKING_LEVEL_MAP, xhigh: "xhigh", max: null }
-				: (model.provider === "deepseek" || model.provider === "opencode" || model.provider === "opencode-go") &&
+			model.provider === "deepseek"
+				? DEEPSEEK_DIRECT_THINKING_LEVEL_MAP
+				: model.provider === "openrouter"
+					? { ...DEEPSEEK_V4_BASE_THINKING_LEVEL_MAP, xhigh: "xhigh", max: null }
+					: (model.provider === "opencode" || model.provider === "opencode-go") &&
 					model.id.includes("deepseek-v4-flash")
 					? DEEPSEEK_V4_FLASH_THINKING_LEVEL_MAP
-					: DEEPSEEK_V4_THINKING_LEVEL_MAP,
+					: DEEPSEEK_V4_BASE_THINKING_LEVEL_MAP,
 		);
 	}
 	if (isGoogleThinkingApi(model) && isGemini3ProModel(model.id)) {
@@ -2453,8 +2471,13 @@ async function generateModels() {
 		}
 	}
 
+	// DeepSeek's official integration notes require reasoning replay and non-null
+	// assistant content for tool calls, and reject tool_choice in thinking mode.
+	// https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi
 	const deepseekCompat: OpenAICompletionsCompat = {
 		requiresReasoningContentOnAssistantMessages: true,
+		requiresAssistantContentOnToolCalls: true,
+		supportsToolChoiceWithThinking: false,
 		thinkingFormat: "deepseek",
 	};
 	const deepseekV4Models: Model<"openai-completions">[] = [
@@ -2466,6 +2489,27 @@ async function generateModels() {
 			provider: "deepseek",
 			reasoning: true,
 			input: ["text"],
+			cost: {
+				input: 0.14,
+				output: 0.28,
+				cacheRead: 0.0028,
+				cacheWrite: 0,
+			},
+			contextWindow: 1000000,
+			maxTokens: 384000,
+			compat: deepseekCompat,
+		},
+		// Released 2026-08-21 with the same text behavior and limits as V4 Flash,
+		// plus native image input.
+		// https://api-docs.deepseek.com/updates
+		{
+			id: "deepseek-v4-flash-vision-exp",
+			name: "DeepSeek V4 Flash Vision Exp",
+			api: "openai-completions",
+			baseUrl: "https://api.deepseek.com",
+			provider: "deepseek",
+			reasoning: true,
+			input: ["text", "image"],
 			cost: {
 				input: 0.14,
 				output: 0.28,

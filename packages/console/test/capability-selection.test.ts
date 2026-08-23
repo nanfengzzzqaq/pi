@@ -237,7 +237,7 @@ describe("按本轮选择能力", () => {
 		).toBeUndefined();
 		expect(travelWorkflowPromptToolChoice("openai-completions", ["travel_fill_draft"])).toEqual({
 			toolChoice: "required",
-			toolChoiceAfterToolResult: { success: "none", error: "required" },
+			toolChoiceAfterToolResult: { success: "none", error: "none" },
 		});
 		expect(travelWorkflowPromptToolChoice("anthropic-messages", ["travel_fill_draft"])).toEqual({});
 	});

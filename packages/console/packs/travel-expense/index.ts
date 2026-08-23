@@ -6,7 +6,7 @@
  * 驱动客户端内置浏览器完成草稿填报。
  */
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	constants as fsConstants,
 	closeSync,
@@ -19,6 +19,7 @@ import {
 	openSync,
 	readFileSync,
 	readdirSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -30,7 +31,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { redactSensitiveText } from "../../src/agent-browser-runtime.ts";
-import type { PackContext } from "../../src/packs.ts";
+import type { PackContext, PackTurnContext } from "../../src/packs.ts";
 import {
 	extractRailwayEmbeddedXml,
 	matchVerificationFiles,
@@ -44,7 +45,9 @@ import { TravelDraftBrowserDriver, type TravelDraftBrowserDriverOptions } from "
 import {
 	runTravelDraft,
 	TRAVEL_DRAFT_CURRENT_USER,
+	travelDraftPlanFingerprint,
 	travelDraftSaveIdentity,
+	type TravelDraftCheckpoint,
 	type TravelDraftIssue,
 	type TravelDraftPlan,
 	type TravelDraftRunResult,
@@ -1261,23 +1264,80 @@ export interface FillTravelDraftParams {
 	applicationHint?: string;
 }
 
+function bindTrustedApplicationHint(value: string | undefined, sourceText: string): string | undefined {
+	const candidate = value?.trim();
+	if (!candidate || candidate.length > 80 || /https?:\/\//i.test(candidate)) return undefined;
+	const normalize = (text: string) =>
+		text
+			.replace(/[\s,，、;；|:：()（）_\-]+/g, "")
+			.toLocaleLowerCase("zh-CN");
+	const normalizedCandidate = normalize(candidate);
+	return normalizedCandidate && normalize(sourceText).includes(normalizedCandidate) ? candidate : undefined;
+}
+
+/** 控制台直绑的 URL/附件优先于模型参数，模型只保留可选的申请线索。 */
+export function bindTravelDraftParams(
+	params: FillTravelDraftParams,
+	turnContext: PackTurnContext | undefined,
+): FillTravelDraftParams {
+	if (!turnContext) {
+		return {
+			url: params.url,
+			paths: params.paths ? [...params.paths] : undefined,
+			applicationHint: params.applicationHint,
+		};
+	}
+	const boundUrl = turnContext?.ekuaibaoTravelUrl?.trim();
+	const boundPaths = turnContext.attachments.filter((path) => path.trim().length > 0);
+	return {
+		url: boundUrl || undefined,
+		paths: boundPaths.length > 0 ? [...boundPaths] : undefined,
+		applicationHint: bindTrustedApplicationHint(params.applicationHint, turnContext.text),
+	};
+}
+
 export interface FillTravelDraftDependencies {
 	readAttachments?: (paths: string[], cwd: string) => InvoiceAttachmentResult;
 	createDriver?: (options: TravelDraftBrowserDriverOptions) => TravelDraftBrowserDriver;
 }
 
 const TRAVEL_SAVE_INTENT_VERSION = 1;
+const TRAVEL_CHECKPOINT_ENVELOPE_VERSION = 1;
+const activeTravelDrafts = new Set<string>();
+const activeTravelWorkspaces = new Set<string>();
+
+function travelWorkspaceKey(cwd: string): string {
+	const absolute = resolve(cwd);
+	return process.platform === "win32" ? absolute.toLocaleLowerCase("en-US") : absolute;
+}
 
 function travelSaveIntentPath(cwd: string, plan: TravelDraftPlan): string {
 	return join(cwd, ".pi", "travel-expense", `save-intent-${travelDraftSaveIdentity(plan)}.json`);
 }
 
-function travelSaveIntentExists(cwd: string, plan: TravelDraftPlan): boolean {
+interface TravelSaveIntent {
+	version: typeof TRAVEL_SAVE_INTENT_VERSION;
+	saveIdentity: string;
+	state: "save_requested";
+}
+
+function readTravelSaveIntent(cwd: string, plan: TravelDraftPlan): TravelSaveIntent | undefined {
+	const identity = travelDraftSaveIdentity(plan);
 	try {
-		lstatSync(travelSaveIntentPath(cwd, plan));
-		return true;
+		const target = travelSaveIntentPath(cwd, plan);
+		const stat = lstatSync(target);
+		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("保存意图记录不是普通文件");
+		const parsed = JSON.parse(readFileSync(target, "utf8")) as Partial<TravelSaveIntent>;
+		if (
+			parsed.version !== TRAVEL_SAVE_INTENT_VERSION ||
+			parsed.saveIdentity !== identity ||
+			parsed.state !== "save_requested"
+		) {
+			throw new Error("保存意图记录损坏或不属于当前行程");
+		}
+		return parsed as TravelSaveIntent;
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
 }
@@ -1291,7 +1351,9 @@ function persistTravelSaveIntent(cwd: string, plan: TravelDraftPlan): void {
 	try {
 		descriptor = openSync(target, "wx", 0o600);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new Error("同一行程已有另一个流程取得草稿保存派发权；本流程不会点击保存");
+		}
 		throw error;
 	}
 	try {
@@ -1301,8 +1363,92 @@ function persistTravelSaveIntent(cwd: string, plan: TravelDraftPlan): void {
 			"utf8",
 		);
 		fsyncSync(descriptor);
+	} catch (error) {
+		// The browser click is still forbidden while this function is running. Do
+		// not leave a partial final-path marker that would masquerade as a dispatch.
+		try {
+			closeSync(descriptor);
+		} finally {
+			rmSync(target, { force: true });
+		}
+		throw error;
 	} finally {
-		closeSync(descriptor);
+		try {
+			closeSync(descriptor);
+		} catch {
+			// The exceptional write path already closed the descriptor.
+		}
+	}
+}
+
+interface TravelCheckpointEnvelope {
+	version: typeof TRAVEL_CHECKPOINT_ENVELOPE_VERSION;
+	saveIdentity: string;
+	reimbursementDate: string;
+	checkpoint: TravelDraftCheckpoint;
+	checksum: string;
+}
+
+function travelCheckpointPath(cwd: string, plan: TravelDraftPlan): string {
+	return join(cwd, ".pi", "travel-expense", `checkpoint-${travelDraftSaveIdentity(plan)}.json`);
+}
+
+function checkpointChecksum(checkpoint: TravelDraftCheckpoint): string {
+	return createHash("sha256").update(JSON.stringify(checkpoint)).digest("hex");
+}
+
+function readTravelCheckpoint(
+	cwd: string,
+	plan: TravelDraftPlan,
+): { checkpoint: TravelDraftCheckpoint; reimbursementDate: string } | undefined {
+	const target = travelCheckpointPath(cwd, plan);
+	let raw: string;
+	try {
+		raw = readFileSync(target, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+	const parsed = JSON.parse(raw) as Partial<TravelCheckpointEnvelope>;
+	const identity = travelDraftSaveIdentity(plan);
+	if (
+		parsed.version !== TRAVEL_CHECKPOINT_ENVELOPE_VERSION ||
+		parsed.saveIdentity !== identity ||
+		typeof parsed.reimbursementDate !== "string" ||
+		!/^\d{4}-\d{2}-\d{2}$/.test(parsed.reimbursementDate) ||
+		!parsed.checkpoint ||
+		typeof parsed.checkpoint !== "object" ||
+		parsed.checksum !== checkpointChecksum(parsed.checkpoint)
+	) {
+		throw new Error("差旅恢复点损坏或不属于当前行程");
+	}
+	return { checkpoint: parsed.checkpoint, reimbursementDate: parsed.reimbursementDate };
+}
+
+function persistTravelCheckpoint(cwd: string, plan: TravelDraftPlan, checkpoint: TravelDraftCheckpoint): void {
+	const identity = travelDraftSaveIdentity(plan);
+	const directory = join(cwd, ".pi", "travel-expense");
+	const target = travelCheckpointPath(cwd, plan);
+	const temporary = join(directory, `checkpoint-${identity}.${process.pid}.${randomUUID()}.tmp`);
+	const envelope: TravelCheckpointEnvelope = {
+		version: TRAVEL_CHECKPOINT_ENVELOPE_VERSION,
+		saveIdentity: identity,
+		reimbursementDate: plan.reimbursementDate,
+		checkpoint: structuredClone(checkpoint),
+		checksum: checkpointChecksum(checkpoint),
+	};
+	mkdirSync(directory, { recursive: true });
+	try {
+		const descriptor = openSync(temporary, "w", 0o600);
+		try {
+			writeFileSync(descriptor, `${JSON.stringify(envelope)}\n`, "utf8");
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(temporary, target);
+	} finally {
+		rmSync(temporary, { force: true });
 	}
 }
 
@@ -1478,8 +1624,39 @@ export async function fillTravelDraft(
 	onUpdate: ((result: AgentToolResult<unknown>) => void) | undefined,
 	dependencies: FillTravelDraftDependencies = {},
 ): Promise<AgentToolResult<unknown>> {
-	const progress = (message: string, stage: string) =>
-		onUpdate?.(textResult(message, { status: "running", stage, draftSaved: false }));
+	const workspaceKey = travelWorkspaceKey(cwd);
+	if (activeTravelWorkspaces.size > 0) {
+		return stoppedWorkflowResult(
+			"blocked",
+			"PRECHECK",
+			[],
+			[],
+			["内置浏览器已有差旅自动填报正在运行；本调用没有读取或修改页面，也不会并发保存"],
+		);
+	}
+	activeTravelWorkspaces.add(workspaceKey);
+	try {
+		return await fillTravelDraftLocked(params, cwd, signal, onUpdate, dependencies);
+	} finally {
+		activeTravelWorkspaces.delete(workspaceKey);
+	}
+}
+
+async function fillTravelDraftLocked(
+	params: FillTravelDraftParams,
+	cwd: string,
+	signal: AbortSignal | undefined,
+	onUpdate: ((result: AgentToolResult<unknown>) => void) | undefined,
+	dependencies: FillTravelDraftDependencies = {},
+): Promise<AgentToolResult<unknown>> {
+	const progress = (message: string, stage: string) => {
+		try {
+			onUpdate?.(textResult(message, { status: "running", stage, draftSaved: false }));
+		} catch {
+			// Progress delivery is informational. A UI listener must never be able to
+			// interrupt durable journaling or turn a confirmed browser save into failure.
+		}
+	};
 	if (signal?.aborted) return stoppedWorkflowResult("interrupted", "PRECHECK", [], [], ["用户已停止任务"]);
 	const url = typeof params.url === "string" ? params.url.trim() : "";
 	const paths = Array.isArray(params.paths) ? params.paths : [];
@@ -1588,8 +1765,8 @@ export async function fillTravelDraft(
 		hotel:
 			days > 1 && lodging
 				? {
-						checkinDate: discovery.application.startDate,
-						checkoutDate: discovery.application.endDate,
+						checkinDate: lodging.checkinDate ?? discovery.application.startDate,
+						checkoutDate: lodging.checkoutDate ?? discovery.application.endDate,
 						amount: lodging.amount,
 						invoiceNumber: lodging.invoiceNumber,
 						uploadFile: lodging.uploadFile,
@@ -1597,83 +1774,190 @@ export async function fillTravelDraft(
 					}
 				: undefined,
 	};
+	const expectedTotal =
+		transport.reduce((sum, row) => sum + row.amount, 0) + (plan.hotel?.amount ?? 0) + days * 180;
+	const successfulResult = (actionsUsed: number, total: number, alreadySaved = false) =>
+		textResult(
+			`${alreadySaved ? "草稿此前已确认保存" : "草稿保存成功"}：已关联 ${discovery.application.title}（${discovery.application.id}），填写 ${tickets.length} 条火车/高铁、${days > 1 ? "1 条住宿、" : "无住宿、"}1 条其他省份补助，系统核验合计 ¥${total.toFixed(2)}。未提交送审。`,
+			{
+				status: "done",
+				stage: "DONE",
+				draftSaved: true,
+				submitted: false,
+				alreadySaved,
+				actionsUsed,
+				expectedTotal: total,
+				application: discovery.application,
+				transportCount: tickets.length,
+				attachmentAssignments: tickets.map((ticket) => ({
+					invoiceNumber: ticket.invoiceNumber,
+					trainNumber: ticket.trainNumber,
+					ticket: basename(ticket.uploadFile),
+					verification: ticket.verificationFiles.map((file) => basename(file)),
+				})),
+				hotelCount: days > 1 ? 1 : 0,
+				allowanceDays: days,
+				allowanceAmount: days * 180,
+			},
+		);
+	const activeKey = `${travelWorkspaceKey(cwd)}\0${travelDraftSaveIdentity(plan)}`;
+	if (activeTravelDrafts.has(activeKey)) {
+		return stoppedWorkflowResult(
+			"blocked",
+			"PRECHECK",
+			[],
+			[],
+			["同一行程已有自动填报正在运行；本调用没有执行页面操作，也不会并发点击保存"],
+		);
+	}
+	activeTravelDrafts.add(activeKey);
 	try {
-		if (travelSaveIntentExists(cwd, plan)) {
+		let resumeCheckpoint: TravelDraftCheckpoint | undefined;
+		let existingSaveIntent: TravelSaveIntent | undefined;
+		try {
+			const recovered = readTravelCheckpoint(cwd, plan);
+			if (recovered) {
+				plan.reimbursementDate = recovered.reimbursementDate;
+				if (recovered.checkpoint.planFingerprint !== travelDraftPlanFingerprint(plan)) {
+					throw new Error("差旅恢复点的计划摘要与当前票据或申请事实不一致");
+				}
+				resumeCheckpoint = recovered.checkpoint;
+			}
+		} catch (error) {
+			return stoppedWorkflowResult(
+				"blocked",
+				"PRECHECK",
+				[],
+				[],
+				[
+					`无法安全读取同一行程的本地恢复记录，已停止且不会从头重放：${error instanceof Error ? error.message : String(error)}`,
+				],
+			);
+		}
+		if (
+			resumeCheckpoint?.stage === "DONE" &&
+			resumeCheckpoint.saveState === "confirmed" &&
+			resumeCheckpoint.saveRequested
+		) {
+			return successfulResult(resumeCheckpoint.actionsUsed, expectedTotal, true);
+		}
+		try {
+			existingSaveIntent = readTravelSaveIntent(cwd, plan);
+		} catch (error) {
+			return stoppedWorkflowResult(
+				"blocked",
+				resumeCheckpoint?.stage ?? "PRECHECK",
+				[],
+				[],
+				[
+					`无法安全读取同一行程的草稿保存意图，已停止且不会重复保存：${error instanceof Error ? error.message : String(error)}`,
+				],
+				true,
+				true,
+			);
+		}
+		if (existingSaveIntent && !resumeCheckpoint) {
 			return stoppedWorkflowResult(
 				"blocked",
 				"CONFIRM",
 				[],
 				[],
-				["检测到同一行程已经发起过草稿保存；请在易快报中人工确认草稿状态，不会再次点击保存"],
+				["检测到旧版草稿保存意图，但缺少可校验的恢复日志；请在合思中人工确认，本流程绝不再次点击保存"],
 				true,
 				true,
 			);
 		}
-	} catch {
-		return stoppedWorkflowResult(
-			"blocked",
-			"CONFIRM",
-			[],
-			[],
-			["无法安全核对同一行程的保存意图记录；为防止重复保存已停止，请人工确认草稿状态"],
-			true,
-			true,
+		if (existingSaveIntent && resumeCheckpoint && !resumeCheckpoint.saveRequested) {
+			// A legacy crash or a competing process may leave the exclusive marker
+			// ahead of the journal. Treat this as potentially dispatched: reconciliation
+			// may inspect it, but SAVE_DRAFT can never be re-entered.
+			resumeCheckpoint = {
+				...resumeCheckpoint,
+				stage: "CONFIRM",
+				saveState: "dispatched",
+				saveRequested: true,
+				errors: [...resumeCheckpoint.errors, "检测到保存意图领先于恢复日志，已转入只读确认且不会重发保存"],
+			};
+			try {
+				persistTravelCheckpoint(cwd, plan, resumeCheckpoint);
+			} catch (error) {
+				return stoppedWorkflowResult(
+					"blocked",
+					"CONFIRM",
+					[],
+					[],
+					[`无法固化草稿保存不确定态：${error instanceof Error ? error.message : String(error)}`],
+					true,
+					true,
+				);
+			}
+		}
+		progress(
+			resumeCheckpoint
+				? `已恢复申请 ${discovery.application.id} 的安全断点，正在读取页面后继续…`
+				: `已锁定申请 ${discovery.application.id}，正在按固定流程填写并逐项回读…`,
+			resumeCheckpoint?.stage ?? "HEADER",
 		);
+		let run: TravelDraftRunResult;
+		let latestCheckpoint = resumeCheckpoint ? structuredClone(resumeCheckpoint) : undefined;
+		let saveIntentPersisted = Boolean(existingSaveIntent);
+		try {
+			run = await runTravelDraft(driver, plan, {
+				signal,
+				checkpoint: resumeCheckpoint,
+				maxActions: 60,
+				maxStageRetries: 2,
+				maxNoProgress: 2,
+				onCheckpoint: (checkpoint) => {
+					latestCheckpoint = structuredClone(checkpoint);
+					// The atomic, checksummed journal is written first. Only after its
+					// dispatched state is durable may this process acquire the exclusive
+					// save marker and allow the browser click hook to return.
+					persistTravelCheckpoint(cwd, plan, checkpoint);
+					if (checkpoint.saveRequested && !saveIntentPersisted) {
+						persistTravelSaveIntent(cwd, plan);
+						saveIntentPersisted = true;
+					}
+					progress(`自动填报进行中：${checkpoint.stage}（${checkpoint.actionsUsed}/60）`, checkpoint.stage);
+				},
+			});
+		} catch (error) {
+			let durableIntent = saveIntentPersisted;
+			try {
+				durableIntent ||= Boolean(readTravelSaveIntent(cwd, plan));
+			} catch {
+				durableIntent = true;
+			}
+			const draftSaveRequested = latestCheckpoint?.saveRequested === true || durableIntent;
+			return stoppedWorkflowResult(
+				"blocked",
+				latestCheckpoint?.stage ?? "PRECHECK",
+				[],
+				[],
+				[error instanceof Error ? error.message : String(error)],
+				draftSaveRequested,
+				draftSaveRequested,
+			);
+		}
+		if (run.status !== "done" || run.stage !== "DONE") {
+			const draftSaveRequested = run.checkpoint.saveRequested || run.observation?.draft?.saveRequested === true;
+			return stoppedWorkflowResult(
+				run.status === "done" ? "blocked" : run.status,
+				run.stage,
+				run.missing,
+				run.ambiguous,
+				run.errors,
+				draftSaveRequested || ["CONFIRM", "DONE"].includes(run.stage),
+				draftSaveRequested,
+			);
+		}
+		// Keep the confirmed, checksummed terminal receipt. It makes a repeated
+		// call idempotently report the known success instead of degrading to an
+		// unresolvable save-intent warning after the toast disappears.
+		return successfulResult(run.actionsUsed, run.expectedTotal);
+	} finally {
+		activeTravelDrafts.delete(activeKey);
 	}
-	progress(`已锁定申请 ${discovery.application.id}，正在按固定流程填写并逐项回读…`, "HEADER");
-	let run: TravelDraftRunResult;
-	let saveIntentPersisted = false;
-	try {
-		run = await runTravelDraft(driver, plan, {
-			signal,
-			maxActions: 60,
-			maxStageRetries: 2,
-			maxNoProgress: 2,
-			onCheckpoint: (checkpoint) => {
-				if (checkpoint.saveRequested && !saveIntentPersisted) {
-					persistTravelSaveIntent(cwd, plan);
-					saveIntentPersisted = true;
-				}
-				progress(`自动填报进行中：${checkpoint.stage}（${checkpoint.actionsUsed}/60）`, checkpoint.stage);
-			},
-		});
-	} catch (error) {
-		return stoppedWorkflowResult("blocked", "PRECHECK", [], [], [error instanceof Error ? error.message : String(error)]);
-	}
-	if (run.status !== "done" || run.stage !== "DONE") {
-		const draftSaveRequested = run.checkpoint.saveRequested || run.observation?.draft?.saveRequested === true;
-		return stoppedWorkflowResult(
-			run.status === "done" ? "blocked" : run.status,
-			run.stage,
-			run.missing,
-			run.ambiguous,
-			run.errors,
-			draftSaveRequested || ["SAVE_DRAFT", "CONFIRM", "DONE"].includes(run.stage),
-			draftSaveRequested,
-		);
-	}
-	return textResult(
-		`草稿保存成功：已关联 ${discovery.application.title}（${discovery.application.id}），填写 ${tickets.length} 条火车/高铁、${days > 1 ? "1 条住宿、" : "无住宿、"}1 条其他省份补助，系统核验合计 ¥${run.expectedTotal.toFixed(2)}。未提交送审。`,
-		{
-			status: "done",
-			stage: "DONE",
-			draftSaved: true,
-			submitted: false,
-			actionsUsed: run.actionsUsed,
-			expectedTotal: run.expectedTotal,
-			application: discovery.application,
-			transportCount: tickets.length,
-			attachmentAssignments: tickets.map((ticket) => ({
-				invoiceNumber: ticket.invoiceNumber,
-				trainNumber: ticket.trainNumber,
-				ticket: basename(ticket.uploadFile),
-				verification: ticket.verificationFiles.map((file) => basename(file)),
-			})),
-			hotelCount: days > 1 ? 1 : 0,
-			allowanceDays: days,
-			allowanceAmount: days * 180,
-		},
-	);
 }
 
 export default function definePack(ctx: PackContext) {
@@ -1692,18 +1976,23 @@ export default function definePack(ctx: PackContext) {
 			],
 			parameters: Type.Object({
 				url: Type.Optional(
-					Type.String({ minLength: 1, description: "用户提供的易快报差旅费用报销链接；安全凭据引用必须原样传入" }),
+					Type.String({
+						minLength: 1,
+						description: "兼容字段；客户端会直接绑定当前流程的易快报链接，模型无需填写或转抄",
+					}),
 				),
 				paths: Type.Optional(
 					Type.Array(Type.String({ minLength: 1 }), {
 						maxItems: MAX_TRAVEL_INPUT_FILES,
-						description: "本次行程全部附件路径：每程铁路电子票及对应查验 PDF/PNG/JPG；多日再含住宿发票 PDF",
+						description: "兼容字段；客户端会直接绑定当前流程附件，模型无需填写或转抄路径",
 					}),
 				),
-				applicationHint: Type.Optional(Type.String({ description: "可选的已有出差申请标题、城市或申请编号线索，如 常州" })),
+				applicationHint: Type.Optional(
+					Type.String({ description: "仅转交用户原文明确给出的申请编号、城市或日期线索，如 常州 8月21日" }),
+				),
 			}),
 			execute: async (_id, rawParams, signal, onUpdate) => {
-				const params = rawParams as FillTravelDraftParams;
+				const params = bindTravelDraftParams(rawParams as FillTravelDraftParams, ctx.getTurnContext?.());
 				return fillTravelDraft(params, workspaceRoot(), signal, onUpdate);
 			},
 		},

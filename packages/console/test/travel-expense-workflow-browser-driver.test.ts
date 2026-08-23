@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	buildTravelDraftExpected,
 	runTravelDraft,
+	TRAVEL_DRAFT_CURRENT_USER,
 	TRAVEL_DRAFT_DEPARTMENT,
 	type TravelDraftAllowanceExpected,
 	type TravelDraftExpected,
@@ -25,8 +26,17 @@ import type {
 	AgentBrowserState,
 	AgentBrowserTarget,
 	AgentBrowserUploadFile,
+	EkuaibaoTrustedApplicationSourceState,
+	EkuaibaoTrustedCommand,
+	EkuaibaoTrustedField,
+	EkuaibaoTrustedPageState,
+	EkuaibaoTrustedResult,
 } from "../src/agent-browser-runtime.ts";
-import { vaultSensitiveUrlsInText } from "../src/agent-browser-runtime.ts";
+import {
+	EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+	EKUAIBAO_TRUSTED_PAGE_FINGERPRINT,
+	vaultSensitiveUrlsInText,
+} from "../src/agent-browser-runtime.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -259,7 +269,8 @@ function applicationCandidatesSnapshot(candidates: ApplicationCandidateFixture[]
 			`${candidate.title} ${candidate.id} | ${candidate.startDate ?? "2026-08-21"} 至 ${candidate.endDate ?? "2026-08-21"} | 无金额 | 详情`,
 	);
 	const rows = candidates.map(
-		(candidate, index) => `[e${index + 1}] input （无文字） (label=${candidate.title} ${candidate.id} type=radio)`,
+		(candidate, index) =>
+			`[e${index + 1}] input （无文字） (label=${candidate.title} ${candidate.id} 申请事由：${candidate.reason ?? candidate.title.replace(/^出差申请[：:]\s*/, "")} 费用性质：${candidate.expenseNature ?? "部门费用"} type=radio)`,
 	);
 	if (withConfirm) rows.push("[e90] button 确认 (type=button)");
 	return ["标题：合思", "可操作元素：", ...rows, "页面正文：", ...details].join("\n");
@@ -322,6 +333,88 @@ class QueueRuntime extends FakeRuntime {
 		const value = this.snapshots.shift();
 		if (!value) throw new Error("测试快照队列已耗尽");
 		return value;
+	}
+}
+
+function trustedApplicationPage(
+	overlay: EkuaibaoTrustedPageState["overlay"],
+	digest: string,
+	applicationSource?: EkuaibaoTrustedApplicationSourceState,
+): EkuaibaoTrustedPageState {
+	return {
+		contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+		pageToken: "trusted-application-page",
+		pageFingerprint: EKUAIBAO_TRUSTED_PAGE_FINGERPRINT,
+		route: "bill-entry-detail",
+		overlay,
+		digest,
+		fields: {},
+		controls: {},
+		multipleRecipients: { present: true, checked: false, source: "native-input" },
+		...(applicationSource ? { applicationSource } : {}),
+		validationErrors: [],
+		foldedDetails: [],
+		draftConfirmationVisible: false,
+	};
+}
+
+class TrustedApplicationDetailsRuntime extends QueueRuntime {
+	private trustedState = trustedApplicationPage("none", "trusted-main");
+	private readonly applicationSource: EkuaibaoTrustedApplicationSourceState;
+	private readonly failOpen: boolean;
+
+	constructor(
+		snapshots: string[],
+		applicationSource: EkuaibaoTrustedApplicationSourceState,
+		options: { failOpen?: boolean } = {},
+	) {
+		super(snapshots);
+		this.applicationSource = applicationSource;
+		this.failOpen = options.failOpen === true;
+	}
+
+	async runEkuaibaoTrustedCommand(command: EkuaibaoTrustedCommand): Promise<EkuaibaoTrustedResult> {
+		this.calls.push({ method: "trusted", value: structuredClone(command) });
+		if (command.op === "inspect") return this.success(this.trustedState);
+		if (command.pageToken !== this.trustedState.pageToken || command.expectedDigest !== this.trustedState.digest) {
+			return { ok: false, code: "stale_state", message: "测试可信状态已过期" };
+		}
+		if (command.op === "click" && command.control === "open-application") {
+			this.trustedState = trustedApplicationPage("application-dialog", "trusted-dialog");
+			return this.success(this.trustedState);
+		}
+		if (command.op === "type" && command.field === "application-search") {
+			this.trustedState = trustedApplicationPage("application-dialog", "trusted-search");
+			return this.success(this.trustedState);
+		}
+		if (command.op === "select-exact") {
+			this.trustedState = trustedApplicationPage("application-dialog", "trusted-selected");
+			return this.success(this.trustedState);
+		}
+		if (command.op === "click" && command.control === "open-application-details") {
+			if (this.failOpen) return { ok: false, code: "contract_mismatch", message: "详情契约不匹配" };
+			this.trustedState = trustedApplicationPage("application-details", "trusted-details", this.applicationSource);
+			return this.success(this.trustedState);
+		}
+		if (command.op === "click" && command.control === "close-application-details") {
+			this.trustedState = trustedApplicationPage("application-dialog", "trusted-closed");
+			return this.success(this.trustedState);
+		}
+		if (command.op === "click" && command.control === "confirm-application") {
+			this.trustedState = trustedApplicationPage("none", "trusted-confirmed");
+			return this.success(this.trustedState);
+		}
+		return { ok: false, code: "invalid_command", message: "测试不支持该可信命令" };
+	}
+
+	private success(state: EkuaibaoTrustedPageState): EkuaibaoTrustedResult {
+		return {
+			ok: true,
+			message: "测试可信命令成功",
+			beforeDigest: state.digest,
+			afterDigest: state.digest,
+			state,
+		};
 	}
 }
 
@@ -789,33 +882,33 @@ class UnknownExistingDetailRuntime extends FakeRuntime {
 }
 
 class CompleteTwoRailRuntime extends FakeRuntime {
-	private readonly expected: TravelDraftExpected;
-	private readonly preboundSecondTransport: boolean;
-	private readonly hotelRecognitionCount: number;
-	private readonly savedKeys = new Set<string>();
-	private drawerOpen = false;
-	private typedFeeType: string | undefined;
-	private feeTypeSelected = false;
-	private activeRow:
+	protected readonly expected: TravelDraftExpected;
+	protected readonly preboundSecondTransport: boolean;
+	protected readonly hotelRecognitionCount: number;
+	protected readonly savedKeys = new Set<string>();
+	protected drawerOpen = false;
+	protected typedFeeType: string | undefined;
+	protected feeTypeSelected = false;
+	protected activeRow:
 		| TravelDraftTransportExpected
 		| TravelDraftHotelExpected
 		| TravelDraftAllowanceExpected
 		| undefined;
-	private reporterSelected = false;
-	private paymentSelected = false;
-	private recipientPicker: "费用报销人" | "支付信息" | undefined;
-	private invoiceMenuOpen = false;
-	private invoiceDialog = false;
-	private invoiceUploaded = false;
-	private recognized = false;
-	private invoiceSelected = false;
-	private invoiceBound = false;
-	private attachmentsUploaded = false;
-	private draftSaved = false;
-	private applicationDialog = false;
-	private applicationSearchTyped = false;
-	private applicationCandidateSelected = false;
-	private applicationConfirmed = false;
+	protected reporterSelected = false;
+	protected paymentSelected = false;
+	protected recipientPicker: "费用报销人" | "支付信息" | undefined;
+	protected invoiceMenuOpen = false;
+	protected invoiceDialog = false;
+	protected invoiceUploaded = false;
+	protected recognized = false;
+	protected invoiceSelected = false;
+	protected invoiceBound = false;
+	protected attachmentsUploaded = false;
+	protected draftSaved = false;
+	protected applicationDialog = false;
+	protected applicationSearchTyped = false;
+	protected applicationCandidateSelected = false;
+	protected applicationConfirmed = false;
 	private readonly hiddenDetailDrift: HiddenDetailDrift | undefined;
 	private readonly draftFailure: CompleteRuntimeOptions["draftFailure"];
 	private readonly detailReopenCounts = new Map<string, number>();
@@ -843,22 +936,22 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		this.draftConfirmationText = options.confirmationText ?? "草稿保存成功";
 	}
 
-	private activeInvoiceRow(): TravelDraftTransportExpected | TravelDraftHotelExpected | undefined {
+	protected activeInvoiceRow(): TravelDraftTransportExpected | TravelDraftHotelExpected | undefined {
 		return this.activeRow?.kind === "allowance" ? undefined : this.activeRow;
 	}
 
-	private nextTransport(): TravelDraftTransportExpected | undefined {
+	protected nextTransport(): TravelDraftTransportExpected | undefined {
 		return this.expected.transport.find((row) => !this.savedKeys.has(row.key));
 	}
 
-	private rowFeeType(): string | undefined {
+	protected rowFeeType(): string | undefined {
 		if (this.activeRow?.kind === "transport") return FEE_TYPE;
 		if (this.activeRow?.kind === "hotel") return HOTEL_FEE_TYPE;
 		if (this.activeRow?.kind === "allowance") return ALLOWANCE_FEE_TYPE;
 		return undefined;
 	}
 
-	private rowDates(): { startDate: string; endDate: string } | undefined {
+	protected rowDates(): { startDate: string; endDate: string } | undefined {
 		const row = this.activeRow;
 		if (!row) return undefined;
 		return row.kind === "hotel"
@@ -866,7 +959,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 			: { startDate: row.startDate, endDate: row.endDate };
 	}
 
-	private resetDrawer(): void {
+	protected resetDrawer(): void {
 		this.typedFeeType = undefined;
 		this.feeTypeSelected = false;
 		this.activeRow = undefined;
@@ -882,7 +975,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		this.attachmentsUploaded = false;
 	}
 
-	private applyHiddenDetailDrift(
+	protected applyHiddenDetailDrift(
 		row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
 	): void {
 		const reopenNumber = (this.detailReopenCounts.get(row.key) ?? 0) + 1;
@@ -894,7 +987,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		if (this.hiddenDetailDrift.field === "attachment") this.attachmentsUploaded = false;
 	}
 
-	private mainSnapshot(): string {
+	protected mainSnapshot(): string {
 		const total = [
 			...this.expected.transport,
 			...(this.expected.hotel ? [this.expected.hotel] : []),
@@ -924,6 +1017,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 						`[e13] input/disabled 差旅费报销：${this.expected.application.reason} (label=标题 testid=field-text-title placeholder=请输入标题 type=text)`,
 					]
 				: []),
+			"[e14] div 苏爱健（个人账户） (label=支付信息)",
 			`[e40] div CNY ${total.toFixed(2)} (label=支付金额总计 testid=payment-amount-total)`,
 			"页面正文：",
 			"差旅费用报销单",
@@ -934,18 +1028,18 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		].join("\n");
 	}
 
-	private applicationCandidateSnapshot(): string {
+	protected applicationCandidateSnapshot(): string {
 		const application = this.expected.application;
 		return [
 			"可操作元素：",
-			`[e301] input （无文字） (label=${application.title} ${application.id} type=radio)`,
+			`[e301] input （无文字） (label=${application.title} ${application.id} 申请事由：${application.reason} 费用性质：${application.expenseNature} type=radio)`,
 			...(this.applicationCandidateSelected ? ["[e302] button 确认 (type=button)"] : []),
 			"页面正文：",
 			`${application.title} ${application.id} | ${application.startDate} 至 ${application.endDate} | 无金额 | 详情`,
 		].join("\n");
 	}
 
-	private detailForm(extra: string[] = []): string {
+	protected detailForm(extra: string[] = []): string {
 		const row = this.activeRow;
 		if (!row) return `${SNAPSHOT_SCOPE_MISS_FOR_TEST} 当前明细`;
 		const feeType = this.rowFeeType();
@@ -991,7 +1085,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		].join("\n");
 	}
 
-	private foldedTransport(row: TravelDraftTransportExpected, index: number): string {
+	protected foldedTransport(row: TravelDraftTransportExpected, index: number): string {
 		return [
 			"可操作元素：",
 			`[e${200 + index}] div ${FEE_TYPE}（COST68） ${row.startDate} – ${row.endDate} 差旅天数：1天 出发城市：江苏省/${row.fromCity}市 到达城市：江苏省/${row.toCity}市 乘坐火车席别：${row.seatClass} 费用报销人：苏爱健（CIC023） 报销费用金额：¥${row.amount.toFixed(2)} 核减金额：¥0.00 费用说明：无 发票金额：¥${row.amount.toFixed(2)} 支付方式：全额支付`,
@@ -1002,7 +1096,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		].join("\n");
 	}
 
-	private foldedAllowance(row: TravelDraftAllowanceExpected): string {
+	protected foldedAllowance(row: TravelDraftAllowanceExpected): string {
 		return [
 			"可操作元素：",
 			`[e220] div ${ALLOWANCE_FEE_TYPE} ${row.startDate} – ${row.endDate} 补助类型：${row.allowanceType} 补助天数：${row.days}天 费用报销人：苏爱健（CIC023） 报销费用金额：¥${row.amount.toFixed(2)} 核减金额：¥0.00 支付方式：全额支付`,
@@ -1013,7 +1107,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		].join("\n");
 	}
 
-	private foldedHotel(row: TravelDraftHotelExpected): string {
+	protected foldedHotel(row: TravelDraftHotelExpected): string {
 		return [
 			"可操作元素：",
 			`[e210] div ${HOTEL_FEE_TYPE} ${row.checkinDate} – ${row.checkoutDate} 费用报销人：苏爱健（CIC023） 报销费用金额：¥${row.amount.toFixed(2)} 核减金额：¥0.00 发票金额：¥${row.amount.toFixed(2)} 支付方式：全额支付`,
@@ -1024,7 +1118,7 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 		].join("\n");
 	}
 
-	private savedDetailForScope(scope: string[]): string | undefined {
+	protected savedDetailForScope(scope: string[]): string | undefined {
 		if (scope[0] === FEE_TYPE) {
 			if (scope.length === 1) return `[e190] div ${FEE_TYPE} (testid=template-feeType-item)`;
 			const rows = this.expected.transport
@@ -1200,7 +1294,11 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 
 	override async click(target: AgentBrowserTarget): Promise<string> {
 		const output = await super.click(target);
-		if (target.selector === '[data-testid="field-expenseLink-select"]') this.applicationDialog = true;
+		if (target.selector === '[data-testid="field-expenseLink-select"]') {
+			this.applicationDialog = true;
+			this.applicationSearchTyped = false;
+			this.applicationCandidateSelected = false;
+		}
 		if (target.ref === "e301" && this.applicationDialog) this.applicationCandidateSelected = true;
 		if (target.ref === "e302" && this.applicationCandidateSelected) {
 			this.applicationDialog = false;
@@ -1329,6 +1427,470 @@ class CompleteTwoRailRuntime extends FakeRuntime {
 	}
 }
 
+class NameOnlyTwoRailPaymentRuntime extends CompleteTwoRailRuntime {
+	mainPaymentSelections = 0;
+	readonly paymentSelectionRows: string[] = [];
+	private mainPaymentPickerOpen = false;
+
+	override async snapshot(options: AgentBrowserSnapshotOptions): Promise<string> {
+		if (this.mainPaymentPickerOpen && options.scopeTexts?.includes(TRAVEL_DRAFT_CURRENT_USER)) {
+			this.calls.push({ method: "snapshot", value: structuredClone(options) });
+			return ["可操作元素：", "[e110] div/option 苏爱健（个人账户）", "页面正文：", "苏爱健（个人账户）"].join("\n");
+		}
+		const requestedScope = options.scopeTexts ?? [];
+		if (
+			!this.drawerOpen &&
+			!this.applicationDialog &&
+			requestedScope.some((label) =>
+				["报销说明", "驻地", "费用性质", "申请人部门", "费用所属部门", "报销日期", "支付信息"].includes(label),
+			)
+		) {
+			this.calls.push({ method: "snapshot", value: structuredClone(options) });
+			return this.mainSnapshot().replace(
+				"[e14] div 苏爱健（个人账户） (label=支付信息)",
+				"[e14] div 苏爱健 (label=支付信息)",
+			);
+		}
+		let output = await super.snapshot(options);
+		const scope = options.scopeTexts ?? [];
+		if (!this.drawerOpen && !this.applicationDialog) {
+			output = output.replace("[e14] div 苏爱健（个人账户） (label=支付信息)", "[e14] div 苏爱健 (label=支付信息)");
+		}
+		const isCurrentDetail = this.drawerOpen && scope.includes("添加明细") && !this.recipientPicker;
+		const isFoldedDetail = scope[0] === FEE_TYPE || scope[0] === HOTEL_FEE_TYPE || scope[0] === ALLOWANCE_FEE_TYPE;
+		if (!isCurrentDetail && !isFoldedDetail) return output;
+		return output.replaceAll("苏爱健（个人账户）", "苏爱健").replaceAll("请选择支付信息", "苏爱健");
+	}
+
+	override async click(target: AgentBrowserTarget): Promise<string> {
+		if (target.ref === "e14") this.mainPaymentPickerOpen = true;
+		if (target.ref === "e110" && this.mainPaymentPickerOpen) {
+			this.mainPaymentSelections += 1;
+			this.mainPaymentPickerOpen = false;
+		}
+		if (target.ref === "e9" && this.activeRow) this.paymentSelectionRows.push(this.activeRow.key);
+		return super.click(target);
+	}
+}
+
+/**
+ * Full production-flow fixture for the main-process trusted contract. Read-only
+ * snapshots remain available for evidence checks, but every generic mutation is
+ * a hard test failure. This catches accidental ref/selector fallbacks immediately.
+ */
+class TrustedOnlyCompleteRuntime extends CompleteTwoRailRuntime {
+	private revision = 0;
+	private documentToken = "trusted-complete-page-1";
+	private applicationDetailsOpen = false;
+	private mainWritableInvalidated = false;
+	private mainPaymentSelected = true;
+	private pendingMainSelection: EkuaibaoTrustedField | undefined;
+	private readonly mainValues: Partial<Record<EkuaibaoTrustedField, string>> = {};
+	private readonly detailValues: Partial<Record<EkuaibaoTrustedField, string>> = {};
+
+	invalidateWritableDefaults(): void {
+		this.mainWritableInvalidated = true;
+		this.mainPaymentSelected = false;
+		for (const field of [
+			"description",
+			"station",
+			"reimbursement-date",
+			"expense-nature",
+			"applicant-department",
+			"expense-department",
+			"main-payment-recipient",
+		] as const) {
+			delete this.mainValues[field];
+		}
+	}
+
+	rotateDocumentToken(): void {
+		this.documentToken = `trusted-complete-page-${this.revision + 2}`;
+		this.revision += 1;
+	}
+
+	private digest(): string {
+		return `trusted-complete-${this.revision}`;
+	}
+
+	private overlay(): EkuaibaoTrustedPageState["overlay"] {
+		if (this.applicationDetailsOpen) return "application-details";
+		if (this.applicationDialog) return "application-dialog";
+		if (this.invoiceDialog) return "invoice-dialog";
+		if (this.recognized) return "invoice-results";
+		if (this.invoiceMenuOpen) return "invoice-menu";
+		if (this.drawerOpen) return this.feeTypeSelected ? "detail-drawer" : "detail-picker";
+		return "none";
+	}
+
+	private field(value: string | undefined, required = true) {
+		return { present: true, ambiguous: false, required, disabled: false, ...(value !== undefined ? { value } : {}) };
+	}
+
+	private currentMainValue(field: EkuaibaoTrustedField): string | undefined {
+		if (this.mainValues[field] !== undefined) return this.mainValues[field];
+		if (this.mainWritableInvalidated) return undefined;
+		if (field === "description") return this.applicationConfirmed ? this.expected.header.explanation : undefined;
+		if (field === "station") return "江苏省/南京";
+		if (field === "reimbursement-date") return this.expected.header.reimbursementDate;
+		if (field === "expense-nature") return this.expected.header.expenseNature;
+		if (field === "applicant-department" || field === "expense-department") return TRAVEL_DRAFT_DEPARTMENT;
+		if (field === "main-payment-recipient") return this.mainPaymentSelected ? "苏爱健" : undefined;
+		return undefined;
+	}
+
+	private foldedSummary(
+		row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+	): string {
+		const money = row.amount.toFixed(2);
+		if (row.kind === "transport") {
+			return `${FEE_TYPE} ${row.startDate} – ${row.endDate} 出发城市：江苏省/${row.fromCity}市 到达城市：江苏省/${row.toCity}市 乘坐火车席别：${row.seatClass} 费用报销人：苏爱健（CIC023） 报销费用金额：¥${money} 已有发票*1 支付信息 苏爱健 CNY ${money}`;
+		}
+		if (row.kind === "hotel") {
+			return `${HOTEL_FEE_TYPE} ${row.checkinDate} – ${row.checkoutDate} 费用报销人：苏爱健（CIC023） 报销费用金额：¥${money} 已有发票*1 支付信息 苏爱健 CNY ${money}`;
+		}
+		return `${ALLOWANCE_FEE_TYPE} ${row.startDate} – ${row.endDate} 补助类型：${row.allowanceType} 补助天数：${row.days}天 费用报销人：苏爱健（CIC023） 报销费用金额：¥${money} 支付信息 苏爱健 CNY ${money}`;
+	}
+
+	private trustedState(): EkuaibaoTrustedPageState {
+		const overlay = this.overlay();
+		const fields: EkuaibaoTrustedPageState["fields"] = {};
+		if (overlay === "none") {
+			fields.company = this.field(this.expected.header.company, false);
+			fields.submitter = this.field(TRAVEL_DRAFT_CURRENT_USER, false);
+			fields.description = this.field(this.currentMainValue("description"));
+			fields.station = this.field(this.currentMainValue("station"));
+			fields["reimbursement-date"] = this.field(this.currentMainValue("reimbursement-date"));
+			fields["expense-nature"] = this.field(this.currentMainValue("expense-nature"));
+			fields["applicant-department"] = this.field(this.currentMainValue("applicant-department"));
+			fields["expense-department"] = this.field(this.currentMainValue("expense-department"));
+			fields["main-payment-recipient"] = this.field(this.currentMainValue("main-payment-recipient"));
+		}
+		if (overlay === "application-dialog")
+			fields["application-search"] = this.field(this.applicationSearchTyped ? this.expected.application.id : "");
+		if (overlay === "detail-picker") fields["fee-type-search"] = this.field(this.typedFeeType ?? "");
+		if (overlay === "detail-drawer" && this.activeRow) {
+			for (const field of [
+				"detail-start-date",
+				"detail-end-date",
+				"departure-city",
+				"arrival-city",
+				"seat-class",
+				"reimbursement-amount",
+				"allowance-type",
+			] as const) {
+				fields[field] = this.field(this.detailValues[field]);
+			}
+			fields["expense-reporter"] = this.field(this.reporterSelected ? "苏爱健（CIC023）" : undefined);
+			fields["payment-recipient"] = this.field(this.paymentSelected ? "苏爱健" : undefined);
+		}
+		const rows = [
+			...this.expected.transport,
+			...(this.expected.hotel ? [this.expected.hotel] : []),
+			this.expected.allowance,
+		].filter((row) => this.savedKeys.has(row.key));
+		const total = rows.reduce((sum, row) => sum + row.amount, 0);
+		return {
+			contractVersion: EKUAIBAO_TRUSTED_CONTRACT_VERSION,
+			pageToken: this.documentToken,
+			pageFingerprint: EKUAIBAO_TRUSTED_PAGE_FINGERPRINT,
+			route: "bill-entry-detail",
+			overlay,
+			digest: this.digest(),
+			fields,
+			controls: {
+				"save-draft": { present: overlay === "none", ambiguous: false, disabled: false },
+				"save-detail": { present: overlay === "detail-drawer", ambiguous: false, disabled: false },
+			},
+			multipleRecipients: { present: true, checked: false, source: "native-input" },
+			...(this.applicationConfirmed
+				? {
+						linkedApplication: {
+							id: this.expected.application.id,
+							title: this.expected.application.title,
+							startDate: this.expected.application.startDate,
+							endDate: this.expected.application.endDate,
+						},
+					}
+				: {}),
+			...(this.applicationDetailsOpen
+				? {
+						applicationSource: {
+							id: this.expected.application.id,
+							title: this.expected.application.title,
+							reason: this.expected.application.reason,
+							expenseNature: this.expected.application.expenseNature,
+						},
+					}
+				: {}),
+			detailCount: this.savedKeys.size,
+			calculatedTotal: total.toFixed(2),
+			validationErrors: [],
+			foldedDetails: rows.map((row) => ({
+				feeType: row.kind,
+				summary: this.foldedSummary(row),
+				amount: row.amount.toFixed(2),
+				invoiceCount: row.kind === "allowance" ? 0 : 1,
+			})),
+			draftConfirmationVisible: this.draftSaved,
+		};
+	}
+
+	private trustedSuccess(beforeDigest: string): EkuaibaoTrustedResult {
+		const state = this.trustedState();
+		return { ok: true, message: "测试可信命令成功", beforeDigest, afterDigest: state.digest, state };
+	}
+
+	private populateReopenedRow(
+		row: TravelDraftTransportExpected | TravelDraftHotelExpected | TravelDraftAllowanceExpected,
+	): void {
+		this.resetDrawer();
+		this.drawerOpen = true;
+		this.activeRow = row;
+		this.typedFeeType = this.rowFeeType();
+		this.feeTypeSelected = true;
+		this.reporterSelected = true;
+		this.paymentSelected = true;
+		const dates = this.rowDates();
+		if (dates) {
+			this.detailValues["detail-start-date"] = dates.startDate;
+			this.detailValues["detail-end-date"] = dates.endDate;
+		}
+		this.detailValues["reimbursement-amount"] = String(row.amount);
+		if (row.kind === "transport") {
+			this.detailValues["departure-city"] = `江苏省/${row.fromCity}`;
+			this.detailValues["arrival-city"] = `江苏省/${row.toCity}`;
+			this.detailValues["seat-class"] = row.seatClass;
+			this.invoiceBound = true;
+			this.attachmentsUploaded = true;
+		}
+		if (row.kind === "hotel") {
+			this.invoiceBound = true;
+			this.attachmentsUploaded = true;
+		}
+		if (row.kind === "allowance") this.detailValues["allowance-type"] = row.allowanceType;
+		this.applyHiddenDetailDrift(row);
+	}
+
+	private rowForOpen(command: Extract<EkuaibaoTrustedCommand, { op: "click" }>) {
+		const candidates = [
+			...this.expected.transport,
+			...(this.expected.hotel ? [this.expected.hotel] : []),
+			this.expected.allowance,
+		].filter((row) => row.kind === command.detailKind && this.savedKeys.has(row.key));
+		const matches = candidates.filter((row) =>
+			(command.evidence ?? []).every((value) => this.foldedSummary(row).includes(value)),
+		);
+		return matches.length === 1 ? matches[0] : undefined;
+	}
+
+	override async snapshot(options: AgentBrowserSnapshotOptions): Promise<string> {
+		let output = await super.snapshot(options);
+		if (this.mainWritableInvalidated && !this.drawerOpen && !this.applicationDialog) {
+			const replace = (from: string | undefined, to: string | undefined) =>
+				from ? output.replace(from, to ?? "（无文字）") : output;
+			output = replace(this.expected.header.explanation, this.currentMainValue("description"));
+			output = replace("江苏省/南京", this.currentMainValue("station"));
+			output = replace(this.expected.header.reimbursementDate, this.currentMainValue("reimbursement-date"));
+			output = output.replace(
+				`[e7] div ${this.expected.header.expenseNature} (label=费用性质)`,
+				`[e7] div ${this.currentMainValue("expense-nature") ?? "（无文字）"} (label=费用性质)`,
+			);
+			output = output.replace(
+				`[e8] div ${TRAVEL_DRAFT_DEPARTMENT} (label=申请人部门)`,
+				`[e8] div ${this.currentMainValue("applicant-department") ?? "（无文字）"} (label=申请人部门)`,
+			);
+			output = output.replace(
+				`[e9] div ${TRAVEL_DRAFT_DEPARTMENT} (label=费用所属部门)`,
+				`[e9] div ${this.currentMainValue("expense-department") ?? "（无文字）"} (label=费用所属部门)`,
+			);
+			output = output.replace(
+				"[e14] div 苏爱健（个人账户） (label=支付信息)",
+				`[e14] div ${this.currentMainValue("main-payment-recipient") ?? "请选择支付信息"} (label=支付信息)`,
+			);
+		}
+		if (
+			this.drawerOpen &&
+			this.feeTypeSelected &&
+			this.activeRow &&
+			(options.scopeTexts ?? []).includes("添加明细")
+		) {
+			const dates = this.rowDates();
+			if (dates) {
+				output = output.replace(dates.startDate, this.detailValues["detail-start-date"] ?? "（无文字）");
+				output = output.replace(dates.endDate, this.detailValues["detail-end-date"] ?? "（无文字）");
+			}
+			output = output.replace(
+				`[e8] input ${this.activeRow.amount}`,
+				`[e8] input ${this.detailValues["reimbursement-amount"] ?? "（无文字）"}`,
+			);
+			if (this.activeRow.kind === "transport") {
+				output = output.replace(
+					`江苏省/${this.activeRow.fromCity}`,
+					this.detailValues["departure-city"] ?? "（无文字）",
+				);
+				output = output.replace(
+					`江苏省/${this.activeRow.toCity}`,
+					this.detailValues["arrival-city"] ?? "（无文字）",
+				);
+				output = output.replace(this.activeRow.seatClass, this.detailValues["seat-class"] ?? "（无文字）");
+			}
+			if (this.activeRow.kind === "allowance") {
+				output = output.replace(this.activeRow.allowanceType, this.detailValues["allowance-type"] ?? "（无文字）");
+			}
+			output = output.replaceAll("苏爱健（个人账户）", "苏爱健");
+		}
+		if ([FEE_TYPE, HOTEL_FEE_TYPE, ALLOWANCE_FEE_TYPE].includes((options.scopeTexts ?? [])[0] ?? "")) {
+			output = output.replaceAll("苏爱健（个人账户）", "苏爱健");
+		}
+		return output;
+	}
+
+	async runEkuaibaoTrustedCommand(command: EkuaibaoTrustedCommand): Promise<EkuaibaoTrustedResult> {
+		this.calls.push({ method: "trusted", value: structuredClone(command) });
+		if (command.op === "inspect") {
+			const state = this.trustedState();
+			return { ok: true, message: "测试可信检查成功", beforeDigest: state.digest, afterDigest: state.digest, state };
+		}
+		if (command.pageToken !== this.documentToken || command.expectedDigest !== this.digest()) {
+			return { ok: false, code: "stale_state", message: "测试可信状态已过期" };
+		}
+		const beforeDigest = this.digest();
+		if (command.op === "click") {
+			if (command.control === "open-application") {
+				this.applicationDialog = true;
+				this.applicationSearchTyped = false;
+				this.applicationCandidateSelected = false;
+			}
+			if (command.control === "open-application-details") this.applicationDetailsOpen = true;
+			if (command.control === "close-application-details") this.applicationDetailsOpen = false;
+			if (command.control === "confirm-application") {
+				this.applicationDialog = false;
+				this.applicationConfirmed = true;
+			}
+			if (command.control === "add-detail") {
+				this.resetDrawer();
+				this.drawerOpen = true;
+				for (const field of Object.keys(this.detailValues) as EkuaibaoTrustedField[])
+					delete this.detailValues[field];
+			}
+			if (command.control === "open-detail") {
+				const row = this.rowForOpen(command);
+				if (!row) return { ok: false, code: "ambiguous_anchor", message: "测试折叠行证据不唯一" };
+				this.populateReopenedRow(row);
+			}
+			if (command.control === "close-detail") this.drawerOpen = false;
+			if (command.control === "open-main-payment-recipient") this.mainPaymentSelected = false;
+			if (command.control === "open-expense-reporter") this.recipientPicker = "费用报销人";
+			if (command.control === "open-payment-recipient") this.recipientPicker = "支付信息";
+			if (command.control === "open-smart-invoice") {
+				this.invoiceMenuOpen = false;
+				this.invoiceDialog = true;
+			}
+			if (command.control === "confirm-invoice-upload" && this.invoiceUploaded) {
+				this.invoiceDialog = false;
+				this.recognized = true;
+			}
+			if (command.control === "bind-recognized-invoice" && this.invoiceSelected) {
+				this.recognized = false;
+				this.invoiceBound = true;
+			}
+			if (command.control === "save-detail" && this.activeRow) {
+				this.savedKeys.add(this.activeRow.key);
+				this.drawerOpen = false;
+			}
+		}
+		if (command.op === "hover") this.invoiceMenuOpen = true;
+		if (command.op === "type") {
+			if (command.field === "application-search") this.applicationSearchTyped = true;
+			else if (command.field === "fee-type-search") {
+				this.typedFeeType = command.value;
+				this.activeRow =
+					command.value === ALLOWANCE_FEE_TYPE
+						? this.expected.allowance
+						: command.value === HOTEL_FEE_TYPE
+							? this.expected.hotel
+							: this.nextTransport();
+			} else if (command.scope.kind === "main") {
+				this.mainValues[command.field] = command.value;
+				this.pendingMainSelection = command.field;
+			} else this.detailValues[command.field] = command.value;
+		}
+		if (command.op === "select-exact") {
+			if (command.optionKind === "application") this.applicationCandidateSelected = true;
+			if (command.optionKind === "fee-type") this.feeTypeSelected = true;
+			if (command.optionKind === "station") this.mainValues.station = "江苏省/南京";
+			if (command.optionKind === "expense-nature") this.mainValues["expense-nature"] = command.value;
+			if (command.optionKind === "department") {
+				const field =
+					this.pendingMainSelection === "applicant-department" ||
+					this.pendingMainSelection === "expense-department"
+						? this.pendingMainSelection
+						: undefined;
+				if (field) this.mainValues[field] = TRAVEL_DRAFT_DEPARTMENT;
+			}
+			if (command.optionKind === "payment-recipient") {
+				if (command.scope.kind === "main") {
+					this.mainPaymentSelected = true;
+					this.mainValues["main-payment-recipient"] = "苏爱健";
+				} else {
+					this.paymentSelected = true;
+					this.recipientPicker = undefined;
+				}
+			}
+			if (command.optionKind === "expense-reporter") {
+				this.reporterSelected = true;
+				this.recipientPicker = undefined;
+			}
+			if (command.optionKind === "city") {
+				const field = this.detailValues["departure-city"] ? "arrival-city" : "departure-city";
+				this.detailValues[field] = `江苏省/${command.value}`;
+			}
+			if (command.optionKind === "seat-class") this.detailValues["seat-class"] = command.value;
+			if (command.optionKind === "allowance-type") {
+				this.detailValues["allowance-type"] = command.value;
+				if (this.activeRow?.kind === "allowance") {
+					// This field is system-calculated after the allowance type/dates are set.
+					this.detailValues["reimbursement-amount"] = String(this.activeRow.amount);
+				}
+			}
+			if (command.optionKind === "recognized-invoice") this.invoiceSelected = true;
+		}
+		if (command.op === "upload") {
+			if (command.slot === "smart-invoice") this.invoiceUploaded = true;
+			else this.attachmentsUploaded = true;
+		}
+		if (command.op === "save-draft") this.draftSaved = true;
+		this.revision += 1;
+		return this.trustedSuccess(beforeDigest);
+	}
+
+	override async click(_target: AgentBrowserTarget): Promise<string> {
+		throw new Error("trusted-only fixture forbids generic click");
+	}
+
+	override async hover(_target: AgentBrowserTarget): Promise<string> {
+		throw new Error("trusted-only fixture forbids generic hover");
+	}
+
+	override async type(
+		_target: AgentBrowserTarget,
+		_value: string,
+		_pressEnter: boolean,
+		_commit: boolean,
+	): Promise<string> {
+		throw new Error("trusted-only fixture forbids generic type");
+	}
+
+	override async uploadFiles(
+		_files: AgentBrowserUploadFile[],
+		_target: AgentBrowserTarget | undefined,
+		_allowedOrigin?: string,
+	): Promise<string> {
+		throw new Error("trusted-only fixture forbids generic upload");
+	}
+}
+
 async function prepareCompleteDriverForSave(options: CompleteRuntimeOptions = {}) {
 	const complete = fixture();
 	const runtime = new CompleteTwoRailRuntime(complete.expected, options);
@@ -1355,16 +1917,16 @@ async function prepareCompleteDriverForSave(options: CompleteRuntimeOptions = {}
 class CompleteHeaderRuntime extends FakeRuntime {
 	protected readonly expected: TravelDraftExpected;
 	private readonly company: string;
-	private readonly topPayment: string;
+	protected topPayment: string;
 	protected applicantDepartment: string;
 	protected expenseDepartment: string;
 
 	constructor(
 		expected: TravelDraftExpected,
 		company: string = expected.header.company,
-		topPayment = "请选择支付信息",
-		applicantDepartment = "工业信息安全组",
-		expenseDepartment = "工业信息安全组",
+		topPayment = "苏爱健（个人账户）",
+		applicantDepartment = TRAVEL_DRAFT_DEPARTMENT,
+		expenseDepartment = TRAVEL_DRAFT_DEPARTMENT,
 	) {
 		super();
 		this.expected = expected;
@@ -1399,11 +1961,112 @@ class CompleteHeaderRuntime extends FakeRuntime {
 	}
 }
 
+class TrustedHeaderReadRuntime extends CompleteHeaderRuntime {
+	private readonly trustedPayment: string;
+	private readonly trustedApplicantDepartment: string;
+	private readonly trustedExpenseDepartment: string;
+
+	constructor(expected: TravelDraftExpected, payment: string, applicantDepartment: string, expenseDepartment: string) {
+		super(expected, expected.header.company, payment, applicantDepartment, expenseDepartment);
+		this.trustedPayment = payment;
+		this.trustedApplicantDepartment = applicantDepartment;
+		this.trustedExpenseDepartment = expenseDepartment;
+	}
+
+	async runEkuaibaoTrustedCommand(command: EkuaibaoTrustedCommand): Promise<EkuaibaoTrustedResult> {
+		this.calls.push({ method: "trusted", value: structuredClone(command) });
+		if (command.op !== "inspect") return { ok: false, code: "invalid_command", message: "只读表头测试不允许写操作" };
+		const field = (value: string) => ({
+			present: true,
+			ambiguous: false,
+			required: true,
+			disabled: false,
+			value,
+		});
+		const state: EkuaibaoTrustedPageState = {
+			...trustedApplicationPage("none", "trusted-header-read"),
+			fields: {
+				company: field(this.expected.header.company),
+				description: field(this.expected.header.explanation),
+				submitter: field(TRAVEL_DRAFT_CURRENT_USER),
+				station: field("江苏省/南京"),
+				"reimbursement-date": field(this.expected.header.reimbursementDate),
+				"expense-nature": field(this.expected.header.expenseNature),
+				"applicant-department": field(this.trustedApplicantDepartment),
+				"expense-department": field(this.trustedExpenseDepartment),
+				"main-payment-recipient": field(this.trustedPayment),
+			},
+			detailCount: 0,
+			calculatedTotal: "0.00",
+		};
+		return {
+			ok: true,
+			message: "已读取测试表头",
+			beforeDigest: state.digest,
+			afterDigest: state.digest,
+			state,
+		};
+	}
+}
+
+class PaymentHeaderRuntime extends CompleteHeaderRuntime {
+	private pickerOpen = false;
+
+	override async snapshot(options: AgentBrowserSnapshotOptions): Promise<string> {
+		if (this.pickerOpen && options.scopeTexts?.includes(TRAVEL_DRAFT_CURRENT_USER)) {
+			this.calls.push({ method: "snapshot", value: structuredClone(options) });
+			return ["可操作元素：", "[e110] div/option 苏爱健（个人账户）", "页面正文：", "苏爱健（个人账户）"].join("\n");
+		}
+		return super.snapshot(options);
+	}
+
+	override async click(target: AgentBrowserTarget): Promise<string> {
+		const output = await super.click(target);
+		if (target.ref === "e37") this.pickerOpen = true;
+		if (target.ref === "e110" && this.pickerOpen) {
+			this.topPayment = "苏爱健（个人账户）";
+			this.pickerOpen = false;
+		}
+		return output;
+	}
+}
+
+class NameOnlyPaymentHeaderRuntime extends CompleteHeaderRuntime {
+	private pickerOpen = false;
+
+	constructor(expected: TravelDraftExpected) {
+		super(expected, expected.header.company, "苏爱健");
+	}
+
+	showPayment(value: string): void {
+		this.topPayment = value;
+	}
+
+	override async snapshot(options: AgentBrowserSnapshotOptions): Promise<string> {
+		if (this.pickerOpen && options.scopeTexts?.includes(TRAVEL_DRAFT_CURRENT_USER)) {
+			this.calls.push({ method: "snapshot", value: structuredClone(options) });
+			return ["可操作元素：", "[e110] div/option 苏爱健", "页面正文：", "支付信息", "苏爱健", "个人账户"].join("\n");
+		}
+		return super.snapshot(options);
+	}
+
+	override async click(target: AgentBrowserTarget): Promise<string> {
+		const output = await super.click(target);
+		if (target.ref === "e37") this.pickerOpen = true;
+		if (target.ref === "e110" && this.pickerOpen) {
+			// The real field can collapse the selected personal account to display name only.
+			this.topPayment = "苏爱健";
+			this.pickerOpen = false;
+		}
+		return output;
+	}
+}
+
 class DepartmentSelectionRuntime extends CompleteHeaderRuntime {
 	private pickerOpen = false;
 
 	constructor(expected: TravelDraftExpected) {
-		super(expected, expected.header.company, "请选择支付信息", "", "工业信息安全组");
+		super(expected, expected.header.company, "苏爱健（个人账户）", "", TRAVEL_DRAFT_DEPARTMENT);
 	}
 
 	override async snapshot(options: AgentBrowserSnapshotOptions): Promise<string> {
@@ -1497,7 +2160,7 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(parseTravelPaymentTotal("票号 TEST-327-IGNORE\n申请金额总计 CNY 327.00")).toBeUndefined();
 	});
 
-	it("候选仅有编号标题日期，确认后从主表读取自动带出的申请事实", async () => {
+	it("候选来源明确事由和费用性质，确认后主表只证明关联编号与日期", async () => {
 		const runtime = new QueueRuntime([
 			unselectedApplicationSnapshot(),
 			applicationSearchSnapshot(),
@@ -1533,7 +2196,7 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		]);
 	});
 
-	it("申请标题可以概括，确认后主表自动带出的报销说明是权威事由", async () => {
+	it("申请标题可以概括，以候选来源的显式申请事由为准", async () => {
 		const candidate = {
 			id: "S26002261",
 			title: "出差申请：常州",
@@ -1561,7 +2224,7 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(result.application.title).toBe("出差申请：常州");
 	});
 
-	it("确认前默认部门费用、确认后自动带出项目费用时使用关联后的事实", async () => {
+	it("主表默认部门费用不参与判断，以候选来源的项目费用为准", async () => {
 		const candidate = {
 			id: "S26002261",
 			title: "出差申请：常州业务拓展",
@@ -1589,17 +2252,212 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(unselectedApplicationSnapshot()).toContain("部门费用");
 	});
 
-	it("显式申请 ID 的日期相同但申请城市与票据不符时 fail closed", async () => {
+	it("主表默认说明和费用性质不作为申请事实，必须从唯一申请详情读取", async () => {
+		const candidate = { id: "S26002261", title: "出差申请：常州业务拓展" };
+		const candidateWithoutSource = [
+			"可操作元素：",
+			`[e1] input （无文字） (label=${candidate.title} ${candidate.id} type=radio)`,
+			"[e70] button 详情 (type=button)",
+			"页面正文：",
+			`${candidate.title} ${candidate.id} | 2026-08-21 至 2026-08-21 | 无金额 | 详情`,
+		].join("\n");
+		const detailSnapshot = [
+			"可操作元素：",
+			"[e71] div 常州现场业务拓展 (label=申请事由)",
+			"[e72] div 项目费用 (label=费用性质)",
+			"[e73] button 关闭 (type=button)",
+			"页面正文：",
+			candidate.title,
+			candidate.id,
+		].join("\n");
+		const runtime = new QueueRuntime([
+			unselectedApplicationSnapshot(),
+			applicationSearchSnapshot(),
+			candidateWithoutSource,
+			detailSnapshot,
+			candidateWithoutSource,
+			`${candidateWithoutSource}\n[e90] button 确认 (type=button)`,
+			selectedApplicationSnapshot({ reason: "主表默认说明", expenseNature: "部门费用" }),
+		]);
+
+		const result = await discoverTravelApplication(
+			{
+				url: "https://app.ekuaibao.com/example",
+				hint: candidate.id,
+				invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+			},
+			{ runtime, waitMilliseconds: 100 },
+		);
+
+		expect(result.status).toBe("selected");
+		if (result.status !== "selected") throw new Error("expected selected");
+		expect(result.application).toMatchObject({
+			reason: "常州现场业务拓展",
+			expenseNature: "项目费用",
+		});
+		const clicks = runtime.calls.filter((call) => call.method === "click").map((call) => call.value);
+		expect(clicks).toContainEqual({ ref: "e70", scopeTexts: [candidate.id, candidate.title] });
+		expect(clicks).toContainEqual({
+			ref: "e73",
+			scopeTexts: [candidate.id, candidate.title, "费用性质"],
+		});
+	});
+
+	it("新运行时按 select-exact → open details → read → close 的可信顺序读取申请事实", async () => {
+		const candidate = { id: "S26002261", title: "出差申请：常州业务拓展" };
+		const candidateSnapshot = [
+			"可操作元素：",
+			`[e1] input （无文字） (label=${candidate.title} ${candidate.id} type=radio)`,
+			"页面正文：",
+			`${candidate.title} ${candidate.id} | 2026-08-21 至 2026-08-21 | 无金额 | 详情`,
+		].join("\n");
+		const runtime = new TrustedApplicationDetailsRuntime(
+			[
+				unselectedApplicationSnapshot(),
+				applicationSearchSnapshot(),
+				candidateSnapshot,
+				candidateSnapshot,
+				`${candidateSnapshot}\n[e90] button 确认 (type=button)`,
+				selectedApplicationSnapshot({ reason: "主表默认说明", expenseNature: "部门费用" }),
+			],
+			{
+				id: candidate.id,
+				title: candidate.title,
+				reason: "常州现场业务拓展",
+				expenseNature: "项目费用",
+			},
+		);
+
+		const result = await discoverTravelApplication(
+			{
+				url: "https://app.ekuaibao.com/example",
+				hint: candidate.id,
+				invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+			},
+			{ runtime, waitMilliseconds: 100 },
+		);
+
+		expect(result.status).toBe("selected");
+		if (result.status !== "selected") throw new Error("expected selected");
+		expect(result.application).toMatchObject({ reason: "常州现场业务拓展", expenseNature: "项目费用" });
+		const trusted = runtime.calls.filter((call) => call.method === "trusted").map((call) => call.value);
+		expect(
+			trusted.map((value) => {
+				const command = value as EkuaibaoTrustedCommand;
+				return command.op === "click"
+					? `${command.op}:${command.control}`
+					: command.op === "type"
+						? `${command.op}:${command.field}`
+						: command.op;
+			}),
+		).toEqual([
+			"inspect",
+			"click:open-application",
+			"inspect",
+			"type:application-search",
+			"inspect",
+			"select-exact",
+			"click:open-application-details",
+			"click:close-application-details",
+			"inspect",
+			"click:confirm-application",
+		]);
+		expect(trusted[5]).toMatchObject({
+			expectedDigest: "trusted-search",
+			optionKind: "application",
+			value: candidate.id,
+			evidence: [candidate.title],
+		});
+		const genericClicks = runtime.calls.filter((call) => call.method === "click").map((call) => call.value);
+		expect(genericClicks).toEqual([]);
+	});
+
+	it("可信申请详情事实不一致时关闭详情后 fail closed，绝不回退通用快照点击", async () => {
+		const candidate = { id: "S26002261", title: "出差申请：常州业务拓展" };
+		const candidateSnapshot = [
+			"可操作元素：",
+			`[e1] input （无文字） (label=${candidate.title} ${candidate.id} type=radio)`,
+			"页面正文：",
+			`${candidate.title} ${candidate.id} | 2026-08-21 至 2026-08-21 | 无金额 | 详情`,
+		].join("\n");
+		const invalidSources = [
+			{ id: "S26009999", title: candidate.title, reason: "常州业务拓展", expenseNature: "部门费用" },
+			{ id: candidate.id, title: "出差申请：其他事项", reason: "常州业务拓展", expenseNature: "部门费用" },
+			{ id: candidate.id, title: candidate.title, reason: " ", expenseNature: "部门费用" },
+			{ id: candidate.id, title: candidate.title, reason: "常州业务拓展", expenseNature: "默认值" },
+		];
+		for (const invalidSource of invalidSources) {
+			const runtime = new TrustedApplicationDetailsRuntime(
+				[unselectedApplicationSnapshot(), applicationSearchSnapshot(), candidateSnapshot],
+				invalidSource as EkuaibaoTrustedApplicationSourceState,
+			);
+			await expect(
+				discoverTravelApplication(
+					{
+						url: "https://app.ekuaibao.com/example",
+						hint: candidate.id,
+						invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+					},
+					{ runtime, waitMilliseconds: 100 },
+				),
+			).rejects.toMatchObject({
+				details: { code: "unsafe_page_state", operation: "核对关联申请详情" },
+			});
+			const trusted = runtime.calls.filter((call) => call.method === "trusted").map((call) => call.value);
+			expect(trusted).toHaveLength(8);
+			expect(trusted.at(-1)).toMatchObject({ control: "close-application-details" });
+			const genericClicks = runtime.calls.filter((call) => call.method === "click").map((call) => call.value);
+			expect(genericClicks).toEqual([]);
+		}
+	});
+
+	it("可信详情打开失败时直接阻断且不尝试通用详情定位", async () => {
+		const candidate = { id: "S26002261", title: "出差申请：常州业务拓展" };
+		const candidateSnapshot = applicationCandidatesSnapshot([candidate]);
+		const runtime = new TrustedApplicationDetailsRuntime(
+			[unselectedApplicationSnapshot(), applicationSearchSnapshot(), candidateSnapshot],
+			{ id: candidate.id, title: candidate.title, reason: "常州业务拓展", expenseNature: "部门费用" },
+			{ failOpen: true },
+		);
+		await expect(
+			discoverTravelApplication(
+				{
+					url: "https://app.ekuaibao.com/example",
+					hint: candidate.id,
+					invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+				},
+				{ runtime, waitMilliseconds: 100 },
+			),
+		).rejects.toMatchObject({ details: { code: "unverified_state", operation: "核对关联申请详情" } });
+		const trusted = runtime.calls.filter((call) => call.method === "trusted").map((call) => call.value);
+		expect(trusted.map((command) => (command as EkuaibaoTrustedCommand).op)).toEqual([
+			"inspect",
+			"click",
+			"inspect",
+			"type",
+			"inspect",
+			"select-exact",
+			"click",
+		]);
+		expect(trusted.at(-1)).toMatchObject({ control: "open-application-details" });
+		expect(runtime.calls.filter((call) => call.method === "click")).toHaveLength(0);
+	});
+
+	it("显式申请 ID 可匹配不含城市的业务标题，避免把标题误当行程事实", async () => {
 		const candidate = {
 			id: "S26002261",
-			title: "出差申请：苏州业务拓展",
+			title: "出差申请：管局演练支撑",
 		};
 		const runtime = new QueueRuntime([
 			unselectedApplicationSnapshot(),
 			applicationSearchSnapshot(),
 			applicationCandidatesSnapshot([candidate]),
 			applicationCandidatesSnapshot([candidate], true),
-			selectedApplicationSnapshot({ title: candidate.title, reason: "苏州业务拓展" }),
+			selectedApplicationSnapshot({
+				title: candidate.title,
+				reason: "管局演练支撑",
+				endDate: "2026-08-23",
+			}),
 		]);
 		const result = await discoverTravelApplication(
 			{
@@ -1610,13 +2468,57 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 			{ runtime, waitMilliseconds: 100 },
 		);
 
-		expect(result.status).toBe("needs_input");
-		if (result.status !== "needs_input") throw new Error("expected needs_input");
-		expect(result.ambiguous.map((item) => item.code)).toContain("application_city_conflict");
+		expect(result.status).toBe("selected");
 		expect(runtime.calls.filter((call) => call.method === "click").map((call) => call.value)).toContainEqual({
 			ref: "e90",
 			scopeTexts: [candidate.id, candidate.title],
 		});
+	});
+
+	it("多城市多段行程可关联同一申请，但票据集合仍必须包含驻地南京", async () => {
+		const candidate = { id: "S26002261", title: "出差申请：管局演练支撑" };
+		const selectedRuntime = new QueueRuntime([
+			unselectedApplicationSnapshot(),
+			applicationSearchSnapshot(),
+			applicationCandidatesSnapshot([candidate]),
+			applicationCandidatesSnapshot([candidate], true),
+			selectedApplicationSnapshot({
+				title: candidate.title,
+				reason: "管局演练支撑",
+				endDate: "2026-08-23",
+			}),
+		]);
+		const selected = await discoverTravelApplication(
+			{
+				url: "https://app.ekuaibao.com/example",
+				hint: candidate.id,
+				invoiceFacts: {
+					travelDates: ["2026-08-21", "2026-08-22", "2026-08-23"],
+					cities: ["南京", "常州", "苏州"],
+				},
+			},
+			{ runtime: selectedRuntime, waitMilliseconds: 100 },
+		);
+		expect(selected.status).toBe("selected");
+
+		const rejectedRuntime = new QueueRuntime([
+			unselectedApplicationSnapshot(),
+			applicationSearchSnapshot(),
+			applicationCandidatesSnapshot([candidate]),
+			applicationCandidatesSnapshot([candidate], true),
+			selectedApplicationSnapshot({ title: candidate.title, reason: "管局演练支撑" }),
+		]);
+		const rejected = await discoverTravelApplication(
+			{
+				url: "https://app.ekuaibao.com/example",
+				hint: candidate.id,
+				invoiceFacts: { travelDates: ["2026-08-21"], cities: ["常州", "苏州"] },
+			},
+			{ runtime: rejectedRuntime, waitMilliseconds: 100 },
+		);
+		expect(rejected.status).toBe("needs_input");
+		if (rejected.status !== "needs_input") throw new Error("expected needs_input");
+		expect(rejected.ambiguous.map((item) => item.code)).toContain("application_city_conflict");
 	});
 
 	it("将用户原句“常州8月21的出差”解析为城市搜索词，日期只与票据和申请范围核对", async () => {
@@ -1642,7 +2544,7 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(searchType.value).toBe("常州");
 	});
 
-	it("连接中断后主表已关联同一申请时直接恢复，不清空或重复选择", async () => {
+	it("连接中断后重新核对同一申请来源，不清空或切换为其他申请", async () => {
 		const complete = twoRailFixture();
 		const runtime = new CompleteTwoRailRuntime(complete.expected);
 		const first = new TravelDraftBrowserDriver({ runtime, cwd: complete.cwd, waitMilliseconds: 100 });
@@ -1662,7 +2564,12 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		});
 
 		expect(recovered.status).toBe("selected");
-		expect(runtime.calls.filter((call) => call.method === "click")).toHaveLength(clicksBeforeRetry);
+		const retryClicks = runtime.calls.filter((call) => call.method === "click").slice(clicksBeforeRetry);
+		expect(retryClicks.map((call) => call.value)).toEqual([
+			{ selector: '[data-testid="field-expenseLink-select"]', scopeTexts: ["关联申请"] },
+			{ ref: "e301", scopeTexts: [complete.expected.application.id, complete.expected.application.title] },
+			{ ref: "e302", scopeTexts: [complete.expected.application.id, complete.expected.application.title] },
+		]);
 	});
 
 	it("只在导航边界还原 vaulted URL，使用合成凭据完成打开", async () => {
@@ -1827,6 +2734,197 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 			),
 		).toHaveLength(160);
 		expect(JSON.stringify(limitedRuntime.calls)).not.toMatch(/flexable-button-submit|提交送审|删除单据/);
+	});
+
+	it("两条同类型交通明细的姓名折叠支付凭证按业务行隔离，新 driver 不继承", async () => {
+		const complete = twoRailFixture();
+		const runtime = new NameOnlyTwoRailPaymentRuntime(complete.expected);
+		const driver = new TravelDraftBrowserDriver({
+			runtime,
+			cwd: complete.cwd,
+			waitMilliseconds: 100,
+			maxBrowserActions: 320,
+		});
+		const discovery = await driver.discoverApplication({
+			url: complete.plan.url,
+			hint: complete.expected.application.id,
+			invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+		});
+		expect(discovery.status).toBe("selected");
+		await driver.precheck(complete.plan, complete.expected);
+		await driver.ensureHeader(complete.expected.header);
+		for (const [index, row] of complete.expected.transport.entries()) await driver.ensureTransport(row, index);
+
+		expect(runtime.mainPaymentSelections).toBe(1);
+		expect(runtime.paymentSelectionRows).toEqual(complete.expected.transport.map((row) => row.key));
+		const sameDriver = await driver.observe(complete.expected);
+		expect(sameDriver.details.filter((row) => row.kind === "transport").map((row) => row.key)).toEqual(
+			complete.expected.transport.map((row) => row.key),
+		);
+
+		const recovered = await new TravelDraftBrowserDriver({
+			runtime,
+			cwd: complete.cwd,
+			waitMilliseconds: 100,
+		}).observe(complete.expected);
+		expect(recovered.header?.paymentRecipient).toBeUndefined();
+		expect(recovered.details.filter((row) => row.kind === "transport")).toEqual([]);
+		expect(runtime.paymentSelectionRows).toEqual(complete.expected.transport.map((row) => row.key));
+	});
+
+	it.each([
+		["同日往返", twoRailFixture, false],
+		["多日含住宿", multiDayFixture, true],
+	] as const)("%s 完整流程只允许 typed trusted 写操作", async (_name, makeFixture, includesHotel) => {
+		const complete = makeFixture();
+		const runtime = new TrustedOnlyCompleteRuntime(complete.expected);
+		const driver = new TravelDraftBrowserDriver({
+			runtime,
+			cwd: complete.cwd,
+			waitMilliseconds: 100,
+			maxBrowserActions: 1_000,
+		});
+		const discovery = await driver.discoverApplication({
+			url: complete.plan.url,
+			hint: complete.expected.application.id,
+			invoiceFacts: {
+				travelDates: complete.expected.transport.map((row) => row.travelDate),
+				cities: complete.expected.transport.flatMap((row) => [row.fromCity, row.toCity]),
+			},
+		});
+		expect(discovery.status, JSON.stringify(discovery)).toBe("selected");
+		// Exercise trusted writes even for fields that the synthetic page originally
+		// populated, while retaining the already verified linked-application facts.
+		runtime.invalidateWritableDefaults();
+
+		const done = await runTravelDraft(driver, complete.plan);
+		expect(done.status, JSON.stringify(done)).toBe("done");
+		expect(done.stage).toBe("DONE");
+		expect(runtime.calls.filter((call) => ["click", "hover", "type", "uploadFiles"].includes(call.method))).toEqual(
+			[],
+		);
+
+		const commands = runtime.calls
+			.filter((call) => call.method === "trusted")
+			.map((call) => call.value as EkuaibaoTrustedCommand);
+		const controls = commands.flatMap((command) =>
+			command.op === "click" || command.op === "hover" ? [command.control] : [],
+		);
+		const fields = commands.flatMap((command) => (command.op === "type" ? [command.field] : []));
+		const options = commands.flatMap((command) => (command.op === "select-exact" ? [command.optionKind] : []));
+		const uploads = commands.flatMap((command) => (command.op === "upload" ? [command.slot] : []));
+
+		expect(controls).toEqual(
+			expect.arrayContaining([
+				"open-application",
+				"open-application-details",
+				"close-application-details",
+				"confirm-application",
+				"open-main-payment-recipient",
+				"add-detail",
+				"open-expense-reporter",
+				"open-payment-recipient",
+				"show-invoice-menu",
+				"open-smart-invoice",
+				"confirm-invoice-upload",
+				"bind-recognized-invoice",
+				"save-detail",
+				"open-detail",
+				"close-detail",
+			]),
+		);
+		expect(fields).toEqual(
+			expect.arrayContaining([
+				"application-search",
+				"description",
+				"station",
+				"reimbursement-date",
+				"expense-nature",
+				"applicant-department",
+				"expense-department",
+				"fee-type-search",
+				"detail-start-date",
+				"detail-end-date",
+				"departure-city",
+				"arrival-city",
+				"seat-class",
+				"reimbursement-amount",
+			]),
+		);
+		expect(options).toEqual(
+			expect.arrayContaining([
+				"application",
+				"station",
+				"expense-nature",
+				"department",
+				"fee-type",
+				"city",
+				"seat-class",
+				"expense-reporter",
+				"payment-recipient",
+				"allowance-type",
+				"recognized-invoice",
+			]),
+		);
+		expect(uploads).toEqual(expect.arrayContaining(["smart-invoice", "detail-attachments"]));
+		expect(commands.some((command) => command.op === "save-draft")).toBe(true);
+		expect(
+			commands.some(
+				(command) =>
+					command.op === "click" &&
+					command.control === "open-detail" &&
+					command.detailKind === (includesHotel ? "hotel" : "transport") &&
+					(command.evidence?.length ?? 0) >= 4,
+			),
+		).toBe(true);
+	});
+
+	it("同一 driver 看到新 pageToken 后撤销主表和逐行业务凭证，主表重选但旧明细不放行", async () => {
+		const complete = twoRailFixture();
+		const runtime = new TrustedOnlyCompleteRuntime(complete.expected);
+		const driver = new TravelDraftBrowserDriver({
+			runtime,
+			cwd: complete.cwd,
+			waitMilliseconds: 100,
+			maxBrowserActions: 1_000,
+		});
+		const discovery = await driver.discoverApplication({
+			url: complete.plan.url,
+			hint: complete.expected.application.id,
+			invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+		});
+		expect(discovery.status).toBe("selected");
+		runtime.invalidateWritableDefaults();
+		const done = await runTravelDraft(driver, complete.plan);
+		expect(done.status, JSON.stringify(done)).toBe("done");
+
+		const paymentSelections = () =>
+			runtime.calls
+				.filter((call) => call.method === "trusted")
+				.map((call) => call.value as EkuaibaoTrustedCommand)
+				.filter(
+					(command): command is Extract<EkuaibaoTrustedCommand, { op: "select-exact" }> =>
+						command.op === "select-exact" && command.optionKind === "payment-recipient",
+				);
+		const mainBefore = paymentSelections().filter((command) => command.scope.kind === "main").length;
+		const detailsBefore = paymentSelections().filter((command) => command.scope.kind === "detail-drawer").length;
+		expect(mainBefore).toBe(1);
+		expect(detailsBefore).toBe(3);
+
+		runtime.rotateDocumentToken();
+		const header = await driver.ensureHeader(complete.expected.header);
+		expect(header.header?.paymentRecipient).toBe(TRAVEL_DRAFT_CURRENT_USER);
+		expect(paymentSelections().filter((command) => command.scope.kind === "main")).toHaveLength(mainBefore + 1);
+		expect(paymentSelections().filter((command) => command.scope.kind === "detail-drawer")).toHaveLength(
+			detailsBefore,
+		);
+
+		const verification = await driver.verify(complete.expected);
+		expect(verification.verification).toMatchObject({ valid: false });
+		expect(verification.details).toEqual([]);
+		expect(paymentSelections().filter((command) => command.scope.kind === "detail-drawer")).toHaveLength(
+			detailsBefore,
+		);
 	});
 
 	it("controller 仅按费用类型只返回标题时，同日同金额往返仍按出发到达方向分别新增和恢复", async () => {
@@ -2020,10 +3118,10 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(actions).toEqual([]);
 	});
 
-	it("顶部支付信息为“请选择”或“多收款人”都不点击，只以独立 checkbox=false 为准", async () => {
+	it("顶部支付信息为空、摘要或仅含姓名时，checkbox=false 仍必须选择精确个人账户", async () => {
 		const { cwd, plan, expected } = fixture();
-		for (const topPayment of ["请选择支付信息", "多收款人"]) {
-			const runtime = new CompleteHeaderRuntime(expected, expected.header.company, topPayment);
+		for (const topPayment of ["请选择支付信息", "多收款人", "苏爱健", "苏爱健（公司账户） 招商银行 尾号1234"]) {
+			const runtime = new PaymentHeaderRuntime(expected, expected.header.company, topPayment);
 			const driver = new TravelDraftBrowserDriver({ runtime, cwd, waitMilliseconds: 100 });
 			await driver.precheck(plan, expected);
 			runtime.openState = true;
@@ -2035,12 +3133,90 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 				applicantDepartment: TRAVEL_DRAFT_DEPARTMENT,
 				expenseDepartment: TRAVEL_DRAFT_DEPARTMENT,
 			});
-			expect(observation.header?.paymentRecipient).toBeUndefined();
-			expect(
-				runtime.calls.filter((call) => ["click", "type", "hover", "uploadFiles"].includes(call.method)),
-			).toEqual([]);
+			expect(observation.header?.paymentRecipient).toBe(TRAVEL_DRAFT_CURRENT_USER);
+			const clicks = runtime.calls.filter((call) => call.method === "click").map((call) => call.value);
+			expect(clicks).toContainEqual({ ref: "e37", scopeTexts: ["支付信息"] });
+			expect(clicks).toContainEqual({ ref: "e110", scopeTexts: [TRAVEL_DRAFT_CURRENT_USER] });
+			expect(JSON.stringify(clicks)).not.toContain("e39");
 		}
 	});
+
+	it("主表本轮选择唯一个人账户后允许字段折叠为姓名，但新 driver 不继承该凭证", async () => {
+		const { cwd, plan, expected } = fixture();
+		const runtime = new NameOnlyPaymentHeaderRuntime(expected);
+		const driver = new TravelDraftBrowserDriver({ runtime, cwd, waitMilliseconds: 100 });
+		await driver.precheck(plan, expected);
+		runtime.openState = true;
+
+		const selected = await driver.ensureHeader(expected.header);
+		expect(selected.header?.paymentRecipient).toBe(TRAVEL_DRAFT_CURRENT_USER);
+		expect(runtime.calls).toContainEqual({ method: "click", value: { ref: "e37", scopeTexts: ["支付信息"] } });
+		expect(runtime.calls).toContainEqual({
+			method: "click",
+			value: { ref: "e110", scopeTexts: [TRAVEL_DRAFT_CURRENT_USER] },
+		});
+		runtime.showPayment("苏爱健（公司账户） 招商银行 尾号1234");
+		const drifted = await driver.verify(expected);
+		expect(drifted.verification).toMatchObject({ valid: false });
+		expect(drifted.header?.paymentRecipient).toBeUndefined();
+
+		runtime.showPayment("苏爱健");
+		const recovered = await new TravelDraftBrowserDriver({ runtime, cwd, waitMilliseconds: 100 }).verify(expected);
+		expect(recovered.verification).toMatchObject({ valid: false });
+		expect(recovered.header?.paymentRecipient).toBeUndefined();
+	});
+
+	it.each(["legacy snapshot", "trusted state"] as const)(
+		"新进程最终核验拒绝末级部门和非个人支付摘要：%s",
+		async (mode) => {
+			const { cwd, expected } = fixture();
+			const makeRuntime = (payment: string, applicantDepartment: string, expenseDepartment: string) =>
+				mode === "trusted state"
+					? new TrustedHeaderReadRuntime(expected, payment, applicantDepartment, expenseDepartment)
+					: new CompleteHeaderRuntime(
+							expected,
+							expected.header.company,
+							payment,
+							applicantDepartment,
+							expenseDepartment,
+						);
+
+			const leafRuntime = makeRuntime("苏爱健（个人账户）", "工业信息安全组", "工业信息安全组");
+			leafRuntime.openState = true;
+			const leafVerification = await new TravelDraftBrowserDriver({
+				runtime: leafRuntime,
+				cwd,
+				waitMilliseconds: 100,
+			}).verify(expected);
+			expect(leafVerification.verification).toMatchObject({ valid: false });
+			expect(leafVerification.header?.applicantDepartment).toBeUndefined();
+			expect(leafVerification.header?.expenseDepartment).toBeUndefined();
+			expect(leafVerification.header?.paymentRecipient).toBe(TRAVEL_DRAFT_CURRENT_USER);
+
+			const paymentRuntime = makeRuntime(
+				"苏爱健（公司账户） 招商银行 尾号1234",
+				TRAVEL_DRAFT_DEPARTMENT,
+				TRAVEL_DRAFT_DEPARTMENT,
+			);
+			paymentRuntime.openState = true;
+			const paymentVerification = await new TravelDraftBrowserDriver({
+				runtime: paymentRuntime,
+				cwd,
+				waitMilliseconds: 100,
+			}).verify(expected);
+			expect(paymentVerification.verification).toMatchObject({ valid: false });
+			expect(paymentVerification.header).toMatchObject({
+				applicantDepartment: TRAVEL_DRAFT_DEPARTMENT,
+				expenseDepartment: TRAVEL_DRAFT_DEPARTMENT,
+			});
+			expect(paymentVerification.header?.paymentRecipient).toBeUndefined();
+			for (const runtime of [leafRuntime, paymentRuntime]) {
+				expect(
+					runtime.calls.filter((call) => ["click", "type", "hover", "uploadFiles"].includes(call.method)),
+				).toEqual([]);
+			}
+		},
+	);
 
 	it("所属公司只读核验：空值或错误公司均在任何填写前 blocker", async () => {
 		const { cwd, plan, expected } = fixture();
@@ -2776,8 +3952,46 @@ describe("差旅确定性工作流的浏览器生产适配器", () => {
 		expect(first.stage).toBe("SAVE_DRAFT");
 		expect(first.checkpoint.saveRequested).toBe(true);
 
-		const resumed = await runTravelDraft(driver, complete.plan, { checkpoint: first.checkpoint });
+		const restartCallIndex = runtime.calls.length;
+		const restartedDriver = new TravelDraftBrowserDriver({ runtime, cwd: complete.cwd, waitMilliseconds: 100 });
+		const resumed = await runTravelDraft(restartedDriver, complete.plan, { checkpoint: first.checkpoint });
 		expect(resumed.status).toBe("done");
+		expect(resumed.checkpoint.saveState).toBe("confirmed");
+		expect(runtime.calls.slice(restartCallIndex).some((call) => call.method === "click")).toBe(false);
+		expect(
+			runtime.calls.filter(
+				(call) =>
+					call.method === "click" &&
+					(call.value as AgentBrowserTarget | undefined)?.selector === '[data-testid="flexable-button-edit"]',
+			),
+		).toHaveLength(1);
+	});
+
+	it("保存可能已派发但重启后成功提示消失时保持 unknown，且绝不补点", async () => {
+		const complete = fixture();
+		const runtime = new CompleteTwoRailRuntime(complete.expected, { draftFailure: "interrupt_after_click" });
+		const driver = new TravelDraftBrowserDriver({ runtime, cwd: complete.cwd, waitMilliseconds: 100 });
+		const discovery = await driver.discoverApplication({
+			url: complete.plan.url,
+			hint: complete.expected.application.id,
+			invoiceFacts: { travelDates: ["2026-08-21"], cities: ["南京", "常州"] },
+		});
+		expect(discovery.status).toBe("selected");
+
+		const first = await runTravelDraft(driver, complete.plan);
+		expect(first.status).toBe("interrupted");
+		expect(first.checkpoint.saveState).toBe("dispatched");
+		runtime.configureDraftSave({ explicitSuccess: false });
+		const restartCallIndex = runtime.calls.length;
+
+		const restartedDriver = new TravelDraftBrowserDriver({ runtime, cwd: complete.cwd, waitMilliseconds: 100 });
+		const resumed = await runTravelDraft(restartedDriver, complete.plan, { checkpoint: first.checkpoint });
+
+		expect(resumed.status).toBe("blocked");
+		expect(resumed.stage).toBe("CONFIRM");
+		expect(resumed.checkpoint.saveState).toBe("dispatched");
+		expect(resumed.errors.join("\n")).toContain("状态仍为 unknown，绝不补点或重试保存");
+		expect(runtime.calls.slice(restartCallIndex).some((call) => call.method === "click")).toBe(false);
 		expect(
 			runtime.calls.filter(
 				(call) =>
