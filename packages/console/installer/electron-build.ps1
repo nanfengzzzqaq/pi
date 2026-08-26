@@ -4,7 +4,10 @@
 #       → 校验本地 agent → electron-builder 打 NSIS 安装包 → 校验 app.asar
 # 产物：中文安装包及供客户端更新使用的 PiConsole-Setup-<version>.exe
 #
-# 用法：powershell -ExecutionPolicy Bypass -File electron-build.ps1
+# 用法：powershell -ExecutionPolicy Bypass -File electron-build.ps1 [-OutputDir dist]
+# OutputDir 用于产物目录被占用（如杀软/残留句柄锁定旧 dist）时换目录重构建。
+
+param([string]$OutputDir = "dist")
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -139,7 +142,8 @@ function Assert-PathWithin([string]$Parent, [string]$Candidate, [string]$Label) 
 $LocalPackageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pi-console-local-packages-" + [guid]::NewGuid().ToString("N"))
 $LocalAiPackageDir = Join-Path $LocalPackageDir "pi-ai"
 $LocalAgentPackageDir = Join-Path $LocalPackageDir "coding-agent"
-New-Item -ItemType Directory -Path $LocalAiPackageDir, $LocalAgentPackageDir -Force | Out-Null
+$LocalAgentCorePackageDir = Join-Path $LocalPackageDir "agent-core"
+New-Item -ItemType Directory -Path $LocalAiPackageDir, $LocalAgentPackageDir, $LocalAgentCorePackageDir -Force | Out-Null
 try {
     Push-Location $RepositoryRoot
     try {
@@ -148,6 +152,9 @@ try {
 
 		& npm.cmd pack --workspace=@earendil-works/pi-ai --pack-destination $LocalAiPackageDir
 		if ($LASTEXITCODE -ne 0) { throw "本地 pi-ai 打包失败" }
+
+		& npm.cmd pack --workspace=@earendil-works/pi-agent-core --pack-destination $LocalAgentCorePackageDir
+		if ($LASTEXITCODE -ne 0) { throw "本地 pi-agent-core 打包失败" }
 
 		& npm.cmd pack --workspace=@earendil-works/pi-coding-agent --pack-destination $LocalAgentPackageDir
 		if ($LASTEXITCODE -ne 0) { throw "本地 coding-agent 打包失败" }
@@ -160,6 +167,12 @@ try {
 		throw "本地 pi-ai 压包数量异常：$($LocalAiPackages.Count)"
 	}
 	$LocalAiPackage = $LocalAiPackages[0].FullName
+
+	$LocalAgentCorePackages = @(Get-ChildItem -LiteralPath $LocalAgentCorePackageDir -Filter "*.tgz" -File)
+	if ($LocalAgentCorePackages.Count -ne 1) {
+		throw "本地 pi-agent-core 压包数量异常：$($LocalAgentCorePackages.Count)"
+	}
+	$LocalAgentCorePackage = $LocalAgentCorePackages[0].FullName
 
 	$LocalAgentPackages = @(Get-ChildItem -LiteralPath $LocalAgentPackageDir -Filter "*.tgz" -File)
     if ($LocalAgentPackages.Count -ne 1) {
@@ -181,8 +194,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的控制台关键资源与源码不一致" }
         Write-Host "已校验 Electron 暂存目录中的控制台关键资源"
 
-		& npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage
-		if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent 失败" }
+		# 一次性安装本地 agent / agent-core / pi-ai 三个压包：
+		# 单独安装 agent 会让 agent-core 的 pi-ai 依赖重新解析到 registry 最新版
+		# （如 0.84.3），把第二份 pi-ai 提升到根级，破坏打包校验的唯一性约束。
+		& npm.cmd install --no-audit --no-fund --no-save --package-lock=false --force $LocalAgentPackage $LocalAgentCorePackage $LocalAiPackage
+		if ($LASTEXITCODE -ne 0) { throw "安装本地 coding-agent/pi-agent-core/pi-ai 失败" }
 
 		$InstalledAgentRoot = Join-Path $ElectronDir "node_modules\@earendil-works\pi-coding-agent"
 	} finally {
@@ -215,8 +231,12 @@ try {
 
 	# npm pack 产物只能包含 package/ 下的普通文件或目录。先完成条目与类型预检，
 	# 再直接解包到同盘的极短唯一暂存目录，避免 PowerShell Copy-Item 触发 Windows 长路径限制。
-	$TarCommand = Get-Command tar.exe -ErrorAction Stop
-	$ArchiveEntries = @(& $TarCommand.Source -tzf $LocalAiPackage)
+	# 必须用 System32 的 bsdtar：PATH 里若有 Git Bash 的 GNU tar，会把 C:\ 路径当成远程主机。
+	$TarSource = Join-Path $env:SystemRoot "System32\tar.exe"
+	if (-not (Test-Path -LiteralPath $TarSource)) {
+		$TarSource = (Get-Command tar.exe -ErrorAction Stop).Source
+	}
+	$ArchiveEntries = @(& $TarSource -tzf $LocalAiPackage)
 	if ($LASTEXITCODE -ne 0 -or $ArchiveEntries.Count -eq 0) { throw "无法读取本地 pi-ai 压包目录" }
 	foreach ($Entry in $ArchiveEntries) {
 		$NormalizedEntry = "$Entry".Replace('\', '/').Trim()
@@ -229,7 +249,7 @@ try {
 			throw "本地 pi-ai 压包包含越界路径，已拒绝解包"
 		}
 	}
-	$VerboseArchiveEntries = @(& $TarCommand.Source -tvzf $LocalAiPackage)
+	$VerboseArchiveEntries = @(& $TarSource -tvzf $LocalAiPackage)
 	if ($LASTEXITCODE -ne 0 -or $VerboseArchiveEntries.Count -eq 0) { throw "无法校验本地 pi-ai 压包条目类型" }
 	foreach ($Entry in $VerboseArchiveEntries) {
 		$Type = "$Entry".TrimStart()[0]
@@ -262,7 +282,7 @@ try {
 		}
 		if (-not $ReplacementAiRoot) { throw "无法创建唯一的 pi-ai 同盘短暂存目录" }
 
-		& $TarCommand.Source -xzf $LocalAiPackage -C $ReplacementAiRoot --strip-components=1
+		& $TarSource -xzf $LocalAiPackage -C $ReplacementAiRoot --strip-components=1
 		if ($LASTEXITCODE -ne 0) { throw "tar.exe 不支持安全去除 package 根目录或解包本地 pi-ai 失败" }
 		$SourceAiManifest = Get-Content -Raw -LiteralPath (Join-Path $AiDir "package.json") | ConvertFrom-Json
 		$ExtractedAiManifestPath = Join-Path $ReplacementAiRoot "package.json"
@@ -340,13 +360,13 @@ try {
     Push-Location $ElectronDir
     try {
         node scripts/generate-icon.js
-        & npx.cmd electron-builder --win nsis
+        & npx.cmd electron-builder --win nsis "--config.directories.output=$OutputDir"
         if ($LASTEXITCODE -ne 0) { throw "electron-builder 失败" }
     } finally {
         Pop-Location
     }
 
-    $PackagedAsar = Join-Path $ElectronDir "dist\win-unpacked\resources\app.asar"
+    $PackagedAsar = Join-Path $ElectronDir "$OutputDir\win-unpacked\resources\app.asar"
     if (-not (Test-Path -LiteralPath $PackagedAsar)) { throw "未找到打包结果 $PackagedAsar" }
 	node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
 	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
@@ -360,7 +380,7 @@ try {
 	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的可信浏览器控制器与暂存源码不一致" }
 	Write-Host "已校验 app.asar 中的可信浏览器控制器"
 
-    $PackagedUnpackedApp = Join-Path $ElectronDir "dist\win-unpacked\resources\app.asar.unpacked"
+    $PackagedUnpackedApp = Join-Path $ElectronDir "$OutputDir\win-unpacked\resources\app.asar.unpacked"
     if (-not (Test-Path -LiteralPath $PackagedUnpackedApp)) { throw "未找到解包资源 $PackagedUnpackedApp" }
     node $Verifier --source-console $ConsoleDir --unpacked-app $PackagedUnpackedApp
     if ($LASTEXITCODE -ne 0) { throw "安装包中的控制台关键资源与源码不一致" }
@@ -371,9 +391,9 @@ try {
 	}
 }
 
-$SetupExe = Join-Path $ElectronDir "dist\Pi控制台-Setup-$Version.exe"
+$SetupExe = Join-Path $ElectronDir "$OutputDir\Pi控制台-Setup-$Version.exe"
 if (-not (Test-Path $SetupExe)) { throw "未找到产物 $SetupExe" }
-$UpdateAsset = Join-Path $ElectronDir "dist\PiConsole-Setup-$Version.exe"
+$UpdateAsset = Join-Path $ElectronDir "$OutputDir\PiConsole-Setup-$Version.exe"
 Copy-Item -LiteralPath $SetupExe -Destination $UpdateAsset -Force
 $SizeMb = [math]::Round((Get-Item $SetupExe).Length / 1MB, 1)
 Write-Host ""
