@@ -54,13 +54,16 @@ export function travelWorkflowPromptToolChoice(
 ):
 	| {
 			toolChoice: "required";
-			toolChoiceAfterToolResult: { success: "none"; error: "required" };
+			toolChoiceAfterToolResult: { success: "none"; error: "none" };
 	  }
 	| Record<string, never> {
 	if (!requiredTravelWorkflowToolChoice(api, activeToolNames)) return {};
 	return {
 		toolChoice: "required",
-		toolChoiceAfterToolResult: { success: "none", error: "required" },
+		// One user turn receives exactly one workflow dispatch. Even a provider or
+		// schema error must return control to the user instead of re-entering a
+		// browser workflow whose mutation boundary may be unknown.
+		toolChoiceAfterToolResult: { success: "none", error: "none" },
 	};
 }
 

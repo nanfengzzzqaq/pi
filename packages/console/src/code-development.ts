@@ -251,6 +251,11 @@ async function downloadArchive(
 	onProgress({ ...progress, receivedBytes: 0, totalBytes: total });
 	mkdirSync(dirname(destination), { recursive: true });
 	const writer = createWriteStream(destination);
+	// 立即挂 error 监听：磁盘满/文件被占用时若无人监听，未捕获的 'error' 事件会击穿整个进程
+	let writeError: Error | null = null;
+	writer.on("error", (error) => {
+		writeError = error;
+	});
 	const reader = response.body.getReader();
 	for (;;) {
 		const chunk = await reader.read();
@@ -258,6 +263,7 @@ async function downloadArchive(
 		const state = currentProgress(pluginProgress);
 		onProgress({ ...state, receivedBytes: state.receivedBytes + chunk.value.byteLength, totalBytes: total });
 		if (!writer.write(chunk.value)) await new Promise<void>((done) => writer.once("drain", done));
+		if (writeError) throw writeError;
 	}
 	await new Promise<void>((done, reject) => {
 		writer.end(done);

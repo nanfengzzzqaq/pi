@@ -1533,7 +1533,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 			return;
 		}
 		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
-		createReadStream(asset.path).pipe(res);
+		// 传输途中资源目录被卸载删除时，无 error 监听的流会击穿进程
+		createReadStream(asset.path)
+			.on("error", () => res.destroy())
+			.pipe(res);
 		return;
 	}
 	if (req.method === "GET" && pathname.startsWith("/pdfjs/")) {
@@ -1543,7 +1546,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 			return;
 		}
 		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
-		createReadStream(asset.path).pipe(res);
+		createReadStream(asset.path)
+			.on("error", () => res.destroy())
+			.pipe(res);
 		return;
 	}
 

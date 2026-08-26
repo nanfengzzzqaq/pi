@@ -681,13 +681,28 @@ agentBrowserAddressEl.addEventListener("keydown", (event) => {
 	void navigateAgentBrowser();
 });
 agentBrowserBackEl.addEventListener("click", async () => {
-	if (window.piDesktop?.browserBack) renderAgentBrowserState(await window.piDesktop.browserBack());
+	if (!window.piDesktop?.browserBack) return;
+	try {
+		renderAgentBrowserState(await window.piDesktop.browserBack());
+	} catch (error) {
+		showError(`后退失败：${error.message}`);
+	}
 });
 agentBrowserForwardEl.addEventListener("click", async () => {
-	if (window.piDesktop?.browserForward) renderAgentBrowserState(await window.piDesktop.browserForward());
+	if (!window.piDesktop?.browserForward) return;
+	try {
+		renderAgentBrowserState(await window.piDesktop.browserForward());
+	} catch (error) {
+		showError(`前进失败：${error.message}`);
+	}
 });
 agentBrowserRefreshEl.addEventListener("click", async () => {
-	if (window.piDesktop?.browserReload) renderAgentBrowserState(await window.piDesktop.browserReload());
+	if (!window.piDesktop?.browserReload) return;
+	try {
+		renderAgentBrowserState(await window.piDesktop.browserReload());
+	} catch (error) {
+		showError(`刷新失败：${error.message}`);
+	}
 });
 agentBrowserExternalEl.addEventListener("click", () => {
 	if (agentBrowserState?.url) openExternalUrl(agentBrowserState.url);
@@ -759,7 +774,16 @@ document.addEventListener("keydown", (event) => {
 		else showSidePanel(activeSideTab || "terminal");
 		return;
 	}
-	if (event.key === "Escape" && sidePanelVisible()) closeSidePanel();
+	if (event.key === "Escape" && sidePanelVisible()) {
+		// 输入类控件里的 Esc 意图是取消输入/清除选择，不应连带关掉整个工作台
+		const target = event.target;
+		const interactive =
+			target instanceof HTMLElement &&
+			(target.isContentEditable ||
+				["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName) ||
+				target.closest(".monaco-editor"));
+		if (!interactive) closeSidePanel();
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -1413,9 +1437,17 @@ async function refreshFromHistory() {
 // 左栏：对话列表（历史会话，点击切换）
 // ---------------------------------------------------------------------------
 
+/** 上次渲染的列表签名：5 秒轮询数据无变化时跳过 DOM 重建，避免闪烁与 hover 丢失 */
+let lastSessionsSignature = "";
+
 async function loadSessions() {
 	try {
 		const list = await api("/api/sessions");
+		const signature = list
+			.map((s) => `${s.id}:${s.title}:${s.updatedAt}:${s.streaming ? 1 : 0}:${s.id === sessionId ? 1 : 0}`)
+			.join("|");
+		if (signature === lastSessionsSignature) return;
+		lastSessionsSignature = signature;
 		sessionsListEl.innerHTML = "";
 		if (list.length === 0) {
 			sessionsListEl.innerHTML = '<div class="skills-empty">暂无历史对话</div>';
@@ -1445,6 +1477,7 @@ async function loadSessions() {
 			sessionsListEl.appendChild(row);
 		}
 	} catch (error) {
+		lastSessionsSignature = "";
 		sessionsListEl.textContent = `加载失败：${error.message}`;
 	}
 }
@@ -1476,6 +1509,8 @@ let sessionContextMenuEl = null;
 /** 删除会话：记录与对话内容删除，工作区文件保留；删除当前会话后跳转到列表第一个会话 */
 async function deleteSession(id) {
 	if (!window.confirm("删除此对话？\n（对话记录将被删除，工作区里的文件会保留）")) return;
+	// 编辑器还开着（可能有未保存修改）时先让用户确认关闭，取消则中止删除
+	if (id === sessionId && !codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	try {
 		await api(`/api/sessions/${id}`, { method: "DELETE" });
 		if (id === sessionId) {
@@ -1483,6 +1518,7 @@ async function deleteSession(id) {
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
 			clearMessages();
+			clearTerminal();
 			lastSeq = -1;
 			if (list.length > 0) {
 				// 跳转到会话栏第一个会话
@@ -1559,12 +1595,14 @@ document.addEventListener("contextmenu", hideSessionContextMenu);
 
 sessionNewBtnEl.addEventListener("click", async () => {
 	try {
+		if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 		await closeOfficePreview();
 		disconnectSSE();
 		const result = await api("/api/sessions", { method: "POST", body: "{}" });
 		sessionId = result.sessionId;
 		localStorage.setItem(SESSION_KEY, sessionId);
 		clearMessages();
+		clearTerminal();
 		lastSeq = -1;
 		await ensureSession();
 		connectSSE();
@@ -2837,6 +2875,7 @@ async function sendMessage() {
 	errorBarEl.hidden = true;
 	setRunning(true);
 	setIndicator(true, "思考中…");
+	let userBubble = null;
 
 	try {
 		const images = [];
@@ -2856,7 +2895,7 @@ async function sendMessage() {
 			renderAttachments();
 		}
 		if (targetSessionId === sessionId) {
-			appendMessage(
+			userBubble = appendMessage(
 				"user",
 				redactSensitiveDisplayText(text || `发送了 ${attachmentsToSend.length} 个文件`),
 				savedPaths,
@@ -2869,7 +2908,21 @@ async function sendMessage() {
 		void loadSessions(); // 首条消息后标题更新，并显示后台运行状态。
 	} catch (error) {
 		showError(error.message);
-		if (targetSessionId === sessionId) setRunning(false);
+		if (targetSessionId === sessionId) {
+			setRunning(false);
+			// 发送失败：撤回乐观渲染的气泡，并把内容放回输入框，避免长文案丢失
+			userBubble?.el?.closest(".message")?.remove();
+			if (!inputEl.value.trim() && text) {
+				inputEl.value = text;
+				resizeComposerInput();
+			}
+			const missing = attachmentsToSend.filter((attachment) => !pendingAttachments.includes(attachment));
+			if (missing.length > 0) {
+				pendingAttachments = [...missing, ...pendingAttachments];
+				renderAttachments();
+			}
+			inputEl.focus();
+		}
 	}
 }
 
@@ -4728,6 +4781,13 @@ updateRunBtnEl.addEventListener("click", async () => {
 			updateRunBtnEl.disabled = false;
 			updateProgressEl.hidden = true;
 			updateOverlayEl.hidden = true;
+		} else {
+			// 已结束且无错误（未进入安装阶段即完成）：停止轮询并恢复界面，避免按钮永久灰死
+			clearInterval(timer);
+			updateStatusEl.textContent = "更新已结束，如未自动重启请重新检查更新";
+			updateRunBtnEl.disabled = false;
+			updateProgressEl.hidden = true;
+			updateOverlayEl.hidden = true;
 		}
 	}, 1000);
 });
@@ -4763,7 +4823,8 @@ async function autoCheckUpdate() {
 (async function init() {
 	try {
 		await Promise.all([
-			refreshCatalog(),
+			// 目录接口失败不阻断启动：其余能力照常可用，目录稍后手动刷新
+			refreshCatalog().catch(() => showError("工具目录加载失败，可在工具页重试")),
 			loadModels(),
 			loadFsRoots(),
 			loadContextPanel(),

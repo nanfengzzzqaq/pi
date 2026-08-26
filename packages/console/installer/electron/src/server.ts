@@ -59,6 +59,7 @@ import {
 	loadPacks,
 	mountedPacks,
 	mountPack,
+	type PackTurnContext,
 	packSummaries,
 	selectCapabilities,
 	toolDisplayName,
@@ -71,7 +72,7 @@ import {
 	disposeSessionBeforeDelete,
 	type TrackedSessionPrompt,
 } from "./session-lifecycle.ts";
-import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
+import { appendAttachmentAnnotation, extractEkuaibaoTravelUrl, parseUserMessage } from "./session-messages.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -176,6 +177,8 @@ interface ConsoleSession {
 	activePackTools: Map<string, Set<string>>;
 	/** 进行中的差旅填报跨轮保留，直到草稿保存成功或用户明确取消。 */
 	pinnedPackTools: Map<string, Set<string>>;
+	/** 控制台直接绑定的本轮输入；能力工具读取它，避免弱模型转抄 URL 或附件路径。 */
+	packTurnContextState: { current: PackTurnContext };
 	/** 已点击草稿按钮、等待工具成功结果的调用 ID。 */
 	pendingDraftSaveCalls: Set<string>;
 	/** DOM 点击成功后仍需等待页面明确显示草稿保存成功。 */
@@ -640,6 +643,25 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 	return trace;
 }
 
+/**
+ * 差旅工具直接消费控制台收到的 URL 与附件，模型只负责触发工具。跨轮补充附件时
+ * 采用有序去重合并；完成或取消后 releaseTravelWorkflow 会立即清空绑定。
+ */
+function bindTravelTurnContext(cs: ConsoleSession, text: string, attachments: string[]): void {
+	const previous = cs.packTurnContextState.current;
+	const ekuaibaoTravelUrl = extractEkuaibaoTravelUrl(text) ?? previous.ekuaibaoTravelUrl;
+	const mergedAttachments = [...new Set([...previous.attachments, ...attachments])].slice(0, 32);
+	const accumulatedText = [previous.text, text]
+		.filter((part) => part.trim().length > 0)
+		.join("\n")
+		.slice(-8_000);
+	cs.packTurnContextState.current = {
+		text: accumulatedText,
+		attachments: mergedAttachments,
+		ekuaibaoTravelUrl,
+	};
+}
+
 function releaseTurnCapabilities(cs: ConsoleSession): void {
 	if (cs.activePackTools.size === 0) return;
 	cs.activePackTools.clear();
@@ -653,6 +675,7 @@ function releaseTravelWorkflow(cs: ConsoleSession): void {
 	cs.activePackTools.delete(AGENT_BROWSER_PACK_NAME);
 	cs.pendingDraftSaveCalls.clear();
 	cs.awaitingDraftSaveConfirmation = false;
+	cs.packTurnContextState.current = { text: "", attachments: [] };
 	persistPinnedPackTools(cs);
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
 }
@@ -692,6 +715,7 @@ async function buildSession(
 	enabledPacks: Set<string>;
 	activePackTools: Map<string, Set<string>>;
 	pinnedPackTools: Map<string, Set<string>>;
+	packTurnContextState: { current: PackTurnContext };
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -702,6 +726,9 @@ async function buildSession(
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
 	const pinnedPackTools = new Map<string, Set<string>>();
+	const packTurnContextState: { current: PackTurnContext } = {
+		current: { text: "", attachments: [] },
+	};
 	for (const [packName, names] of Object.entries(restoredPinnedPackTools ?? {})) {
 		// 当前唯一允许跨重启续作的是确定性差旅状态机。不要相信旧/损坏索引里
 		// 任意包名和工具名，否则可能永久恢复通用 browser 写操作。
@@ -730,6 +757,7 @@ async function buildSession(
 			...instantiateWindowsTools({ getWorkspaceRoot: () => cwd }),
 			...instantiatePackTools({
 				getWorkspaceRoot: () => cwd,
+				getTurnContext: () => structuredClone(packTurnContextState.current),
 				activatePack: (packName) => {
 					if (!enabledPacks.has(packName)) return;
 					activePackTools.set(packName, new Set(fullPackToolNames(packName)));
@@ -769,6 +797,7 @@ async function buildSession(
 		enabledPacks,
 		activePackTools,
 		pinnedPackTools,
+		packTurnContextState,
 	};
 }
 
@@ -800,8 +829,15 @@ async function createConsoleSession(
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, pinnedPackTools } =
-		await buildSession(cwd, enabledPackNames);
+	const {
+		session,
+		sessionFile,
+		modelFallbackMessage,
+		enabledPacks,
+		activePackTools,
+		pinnedPackTools,
+		packTurnContextState,
+	} = await buildSession(cwd, enabledPackNames);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -812,6 +848,7 @@ async function createConsoleSession(
 		enabledPacks,
 		activePackTools,
 		pinnedPackTools,
+		packTurnContextState,
 		pendingDraftSaveCalls: new Set(),
 		awaitingDraftSaveConfirmation: false,
 		lastCapabilityTrace: null,
@@ -839,8 +876,15 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	try {
 		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
 		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
-		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, pinnedPackTools } =
-			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile, entry.pinnedPackTools);
+		const {
+			session,
+			sessionFile,
+			modelFallbackMessage,
+			enabledPacks,
+			activePackTools,
+			pinnedPackTools,
+			packTurnContextState,
+		} = await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile, entry.pinnedPackTools);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -850,6 +894,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			enabledPacks,
 			activePackTools,
 			pinnedPackTools,
+			packTurnContextState,
 			pendingDraftSaveCalls: new Set(),
 			awaitingDraftSaveConfirmation: false,
 			lastCapabilityTrace: null,
@@ -1488,7 +1533,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 			return;
 		}
 		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
-		createReadStream(asset.path).pipe(res);
+		// 传输途中资源目录被卸载删除时，无 error 监听的流会击穿进程
+		createReadStream(asset.path)
+			.on("error", () => res.destroy())
+			.pipe(res);
 		return;
 	}
 	if (req.method === "GET" && pathname.startsWith("/pdfjs/")) {
@@ -1498,7 +1546,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 			return;
 		}
 		res.writeHead(200, { "Content-Type": asset.mimeType, "Cache-Control": "no-cache" });
-		createReadStream(asset.path).pipe(res);
+		createReadStream(asset.path)
+			.on("error", () => res.destroy())
+			.pipe(res);
 		return;
 	}
 
@@ -2142,6 +2192,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
+			if (cs.pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft")) {
+				bindTravelTurnContext(cs, safeText, attachments);
+			}
 			const promptToolChoice = travelWorkflowPromptToolChoice(
 				cs.session.model?.api,
 				cs.session.getActiveToolNames(),

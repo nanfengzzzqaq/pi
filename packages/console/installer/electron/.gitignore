@@ -1,0 +1,6 @@
+# src/web/packs/skills 副本必须与 packages/console 正本保持一致：
+# 构建（electron-build.ps1）会重新拷贝，test/agent-browser-tools.test.ts 等测试校验一致性。
+/data/
+/dist/
+/node_modules/
+icon.png

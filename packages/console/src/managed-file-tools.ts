@@ -319,6 +319,11 @@ async function installLibreOffice(id: ManagedToolId, staging: string): Promise<{
 	});
 	if (!response.ok || !response.body) throw new Error(`下载 LibreOffice 失败：HTTP ${response.status}`);
 	const writer = createWriteStream(installer);
+	// 立即挂 error 监听：下载数百 MB 期间磁盘出错时，无监听的 'error' 事件会击穿整个进程
+	let writeError: Error | null = null;
+	writer.on("error", (error) => {
+		writeError = error;
+	});
 	const reader = response.body.getReader();
 	progressById.set(id, {
 		...getManagedToolProgress(id),
@@ -330,6 +335,7 @@ async function installLibreOffice(id: ManagedToolId, staging: string): Promise<{
 		const state = getManagedToolProgress(id);
 		progressById.set(id, { ...state, receivedBytes: state.receivedBytes + chunk.value.byteLength });
 		if (!writer.write(chunk.value)) await new Promise<void>((done) => writer.once("drain", done));
+		if (writeError) throw writeError;
 	}
 	await new Promise<void>((done, reject) => {
 		writer.end(done);
