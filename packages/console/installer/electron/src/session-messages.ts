@@ -1,41 +1,8 @@
 const JSON_ATTACHMENT_PREFIX = "[附件文件:";
-const EKUAIBAO_URL = /https:\/\/app\.ekuaibao\.com\/[^\s<>"'\]]+/giu;
 
 export interface ParsedUserMessage {
 	text: string;
 	attachments: string[];
-}
-
-/**
- * 从用户原文或 Markdown 链接中提取合思页面地址。该函数在 URL 凭据已经被
- * vaultSensitiveUrlsInText 替换后调用，因此返回值可以安全地绑定给业务工具。
- */
-export function extractEkuaibaoTravelUrl(text: string): string | undefined {
-	for (const matched of text.matchAll(EKUAIBAO_URL)) {
-		let candidate = matched[0].replace(/\\([_&=?#])/g, "$1");
-		while (/[.,;!，。；！、]$/u.test(candidate)) candidate = candidate.slice(0, -1);
-		while (candidate.endsWith(")")) {
-			const opens = [...candidate].filter((character) => character === "(").length;
-			const closes = [...candidate].filter((character) => character === ")").length;
-			if (closes <= opens) break;
-			candidate = candidate.slice(0, -1);
-		}
-		try {
-			const url = new URL(candidate);
-			if (
-				url.protocol === "https:" &&
-				url.hostname === "app.ekuaibao.com" &&
-				url.port === "" &&
-				!url.username &&
-				!url.password
-			) {
-				return url.toString();
-			}
-		} catch {
-			// 继续尝试同一条消息里的下一个 URL；不让损坏的 Markdown 地址覆盖可信绑定。
-		}
-	}
-	return undefined;
 }
 
 /**

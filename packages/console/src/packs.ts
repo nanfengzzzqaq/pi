@@ -12,20 +12,10 @@ import { getShellConfig, type ToolDefinition } from "@earendil-works/pi-coding-a
 import { DATA_DIR } from "./paths.ts";
 import { isPrivateBashAvailable, isWindowsPowerShellAvailable } from "./windows-tools.ts";
 
-/** 当前固定工作流中由控制台直接接收、跨补充轮次合并且无需模型转抄的可信输入。 */
-export interface PackTurnContext {
-	text: string;
-	attachments: string[];
-	/** 已在进入模型前完成凭据保险箱替换的合思差旅页面 URL。 */
-	ekuaibaoTravelUrl?: string;
-}
-
 /** 注入给能力包的上下文 */
 export interface PackContext {
 	/** 解析“本次调用所属会话”的工作目录 */
 	getWorkspaceRoot(): string;
-	/** 读取控制台在本轮直接绑定的输入；模型工具参数不得覆盖这些值。 */
-	getTurnContext?: () => PackTurnContext;
 	/** 兼容旧能力包的元工具；新能力包优先使用 pack.json 的通用激活规则。 */
 	activatePack?: (packName: string) => void;
 }

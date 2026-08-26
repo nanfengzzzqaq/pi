@@ -1202,16 +1202,6 @@ test("accepts the same critical console resources before and after packaging", (
 	);
 });
 
-test("rejects a stale packaged travel workflow", () => {
-	const fixture = createConsoleFixture();
-	writeFileSync(join(fixture.unpackedApp, "packs/travel-expense/workflow.ts"), "stale workflow");
-
-	assert.throws(
-		() => verifyPackagedConsole(fixture.sourceConsole, fixture.unpackedApp),
-		/控制台关键资源校验失败/u,
-	);
-});
-
 test("accepts the packaged trusted browser controller and rejects a stale one", async () => {
 	const fixture = createFixture();
 	const sourceElectron = addElectronFixture(fixture.directory, fixture.appDirectory);

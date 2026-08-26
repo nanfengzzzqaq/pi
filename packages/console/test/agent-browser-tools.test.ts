@@ -10,7 +10,6 @@ import {
 	resolveSensitiveBrowserUrl,
 	vaultSensitiveUrlsInText,
 } from "../src/agent-browser-runtime.ts";
-import { classifyBrowserClick } from "../src/agent-browser-safety.ts";
 import { instantiateAgentBrowserTools, readAgentBrowserUploadFiles } from "../src/agent-browser-tools.ts";
 
 function fakeBrowser(calls: string[], url = "https://example.com"): AgentBrowserRuntime {
@@ -133,7 +132,7 @@ describe("客户端浏览器工具", () => {
 		const hover = tools.find((tool) => tool.name === "browser_hover");
 		await snapshot?.execute(
 			"call-scope",
-			{ maxChars: 4000, maxElements: 700, scopeTexts: ["常州", "¥75.00"] },
+			{ maxChars: 4000, maxElements: 700, scopeTexts: ["收件人", "¥75.00"] },
 			undefined,
 			undefined,
 			undefined as never,
@@ -141,56 +140,28 @@ describe("客户端浏览器工具", () => {
 		const output = await hover?.execute(
 			"call-hover",
 			{
-				text: "添加发票",
+				text: "更多操作",
 				occurrence: 2,
-				scopeTexts: ["常州", "南京"],
+				scopeTexts: ["收件人", "张三"],
 				within: { selector: '[role="dialog"]', occurrence: 1 },
 			},
 			undefined,
 			undefined,
 			undefined as never,
 		);
-		expect(calls).toContain('snapshot:{"maxChars":4000,"maxElements":700,"scopeTexts":["常州","¥75.00"]}');
+		expect(calls).toContain('snapshot:{"maxChars":4000,"maxElements":700,"scopeTexts":["收件人","¥75.00"]}');
 		expect(calls).toContain(
-			'hover:{"text":"添加发票","occurrence":2,"scopeTexts":["常州","南京"],"within":{"selector":"[role=\\"dialog\\"]","occurrence":1}}',
+			'hover:{"text":"更多操作","occurrence":2,"scopeTexts":["收件人","张三"],"within":{"selector":"[role=\\"dialog\\"]","occurrence":1}}',
 		);
-		expect(output?.content[0]).toMatchObject({ type: "text", text: "hover:添加发票" });
-	});
-
-	it("易快报禁止 browser_type 通过回车确认，但普通网页保留该能力", async () => {
-		const blockedCalls: string[] = [];
-		registerAgentBrowserRuntime(fakeBrowser(blockedCalls, "https://app.ekuaibao.com/web/app.html#/bill"));
-		const cwd = mkdtempSync(join(tmpdir(), "pi-browser-enter-"));
-		const blockedType = instantiateAgentBrowserTools(cwd).find((tool) => tool.name === "browser_type");
-		await expect(
-			blockedType?.execute(
-				"call-block-enter",
-				{ ref: "e12", value: "南京", submit: true },
-				undefined,
-				undefined,
-				undefined as never,
-			),
-		).rejects.toThrow("安全策略已禁止在易快报页面通过回车确认");
-		expect(blockedCalls).toEqual([`download:${cwd}`]);
-
-		const allowedCalls: string[] = [];
-		registerAgentBrowserRuntime(fakeBrowser(allowedCalls));
-		const allowedType = instantiateAgentBrowserTools(cwd).find((tool) => tool.name === "browser_type");
-		await allowedType?.execute(
-			"call-allow-enter",
-			{ ref: "e12", value: "南京", submit: true },
-			undefined,
-			undefined,
-			undefined as never,
-		);
-		expect(allowedCalls).toContain("type:e12:南京:true:true");
+		expect(output?.content[0]).toMatchObject({ type: "text", text: "hover:更多操作" });
 	});
 
 	it("浏览器工具输出会脱敏 URL 中的登录令牌，但导航仍收到原始 URL", async () => {
 		const calls: string[] = [];
 		registerAgentBrowserRuntime(fakeBrowser(calls));
 		const navigate = instantiateAgentBrowserTools(tmpdir()).find((item) => item.name === "browser_navigate");
-		const raw = "https://app.ekuaibao.com/web/app.html?accessToken=secret-value&provisionalToken=second-secret#/bill";
+		const raw =
+			"https://portal.example.com/web/app.html?accessToken=secret-value&provisionalToken=second-secret#/home";
 		const output = await navigate?.execute("call-token", { url: raw }, undefined, undefined, undefined as never);
 		const text = output?.content[0]?.type === "text" ? output.content[0].text : "";
 		expect(calls).toContain(`navigate:${raw}`);
@@ -203,7 +174,7 @@ describe("客户端浏览器工具", () => {
 		const calls: string[] = [];
 		registerAgentBrowserRuntime(fakeBrowser(calls));
 		const navigate = instantiateAgentBrowserTools(tmpdir()).find((item) => item.name === "browser_navigate");
-		const raw = "https://app.ekuaibao.com/web/app.html?accessToken=query-secret#/bill?provisionalToken=hash-secret";
+		const raw = "https://portal.example.com/web/app.html?accessToken=query-secret#/home?provisionalToken=hash-secret";
 		const persistedUrl = vaultSensitiveUrlsInText(raw);
 		expect(persistedUrl).not.toContain("query-secret");
 		expect(persistedUrl).not.toContain("hash-secret");
@@ -264,15 +235,15 @@ describe("客户端浏览器工具", () => {
 		const calls: string[] = [];
 		registerAgentBrowserRuntime(fakeBrowser(calls));
 		const cwd = mkdtempSync(join(tmpdir(), "pi-browser-upload-"));
-		writeFileSync(join(cwd, "ticket.png"), "fake-png-bytes");
+		writeFileSync(join(cwd, "photo.png"), "fake-png-bytes");
 		const upload = instantiateAgentBrowserTools(cwd).find((tool) => tool.name === "browser_upload");
 		const output = await upload?.execute(
 			"call-3",
 			{
-				paths: ["ticket.png"],
+				paths: ["photo.png"],
 				selector: 'input[type="file"]',
 				occurrence: 2,
-				scopeTexts: ["常州", "南京"],
+				scopeTexts: ["收件人", "张三"],
 				within: { selector: '[role="dialog"]', occurrence: 1 },
 			},
 			undefined,
@@ -281,17 +252,17 @@ describe("客户端浏览器工具", () => {
 		);
 		expect(calls).toEqual([
 			`download:${cwd}`,
-			'upload:ticket.png:{"selector":"input[type=\\"file\\"]","occurrence":2,"scopeTexts":["常州","南京"],"within":{"selector":"[role=\\"dialog\\"]","occurrence":1}}:https://example.com',
+			'upload:photo.png:{"selector":"input[type=\\"file\\"]","occurrence":2,"scopeTexts":["收件人","张三"],"within":{"selector":"[role=\\"dialog\\"]","occurrence":1}}:https://example.com',
 		]);
 		expect(output?.content[0]).toMatchObject({ type: "text", text: "已选择 1 个文件" });
 	});
 
 	it("公开上传 helper 复用 MIME、base64 和体积限制", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "pi-browser-upload-helper-"));
-		writeFileSync(join(cwd, "ticket.pdf"), "fake-pdf-bytes");
-		expect(readAgentBrowserUploadFiles(cwd, ["ticket.pdf"])).toEqual([
+		writeFileSync(join(cwd, "report.pdf"), "fake-pdf-bytes");
+		expect(readAgentBrowserUploadFiles(cwd, ["report.pdf"])).toEqual([
 			{
-				name: "ticket.pdf",
+				name: "report.pdf",
 				mimeType: "application/pdf",
 				dataBase64: Buffer.from("fake-pdf-bytes").toString("base64"),
 			},
@@ -299,84 +270,11 @@ describe("客户端浏览器工具", () => {
 		expect(() => readAgentBrowserUploadFiles(cwd, [])).toThrow("请至少提供一个要上传的文件路径");
 	});
 
-	it("易快报点击策略默认阻止提交和删除，仅精确放行草稿与附件移除", () => {
-		const decide = (label: string, attributeSignal = "", inputType = "button", contextSignal = "") =>
-			classifyBrowserClick({
-				hostname: "app.ekuaibao.com",
-				label,
-				attributeSignal,
-				contextSignal,
-				tagName: "BUTTON",
-				inputType,
-			});
-		for (const label of ["提交", "提交报销单", "送审", "确定并提交", "删除单据", "作废单据", "撤销申请"]) {
-			expect(decide(label)).toMatchObject({ allowed: false, kind: "blocked" });
-		}
-		expect(decide("存为草稿", "flexable-button-submit 草稿")).toMatchObject({ allowed: false });
-		expect(decide("存为草稿", "flexable-button-edit", "submit")).toEqual({ allowed: true, kind: "draft" });
-		expect(decide("存为草稿", "flexable-button-edit")).toEqual({ allowed: true, kind: "draft" });
-		expect(decide("保存", "ant-button flexable-button-edit primary", "submit")).toEqual({
-			allowed: true,
-			kind: "draft",
-		});
-		for (const attributes of [
-			"flexable-button-edit-submit",
-			"flexable-button-edit-delete",
-			"flexable-button-edit-destroy",
-			"flexable-button-edit_preview",
-		]) {
-			expect(decide("保存", attributes, "submit")).toMatchObject({ allowed: false, kind: "blocked" });
-		}
-		expect(decide("保存草稿", "", "submit")).toEqual({ allowed: true, kind: "draft" });
-		for (const label of ["确认", "下一步", "完成", "保存"]) {
-			expect(decide(label, "", "submit")).toMatchObject({ allowed: false, kind: "blocked" });
-		}
-		for (const [label, attributes, context] of [
-			["删除附件", "trash-icon", ""],
-			["移除发票", "remove-icon", ""],
-			["删除", "attachment-remove trash-icon", ""],
-			["清除", "trash-icon", "upload-list-item ticket.pdf"],
-			["删除", "OutlinedEditDeleteTrash", "车票.pdf"],
-			["删除", "OutlinedEditDeleteTrash", "attachmentUploadList"],
-		] as const) {
-			expect(decide(label, attributes, "button", context)).toEqual({ allowed: true, kind: "neutral" });
-		}
-		for (const [label, attributes, context] of [
-			["删除", "trash-icon", ""],
-			["移除", "remove-icon", "expense-detail-row"],
-			["清空", "clear-button", "报销单"],
-			["删除费用明细", "delete-row", "已有发票 1 张"],
-			["删除", "profile-remove", "用户资料"],
-			["删除", "OutlinedEditDeleteTrash", "费用明细 已有发票*1"],
-			["删除", "OutlinedEditDeleteRowTrash", "附件列表 车票.pdf"],
-		] as const) {
-			expect(decide(label, attributes, "button", context)).toMatchObject({ allowed: false, kind: "blocked" });
-		}
-		for (const label of [
-			"提交人：[已移除]",
-			"选择提交人：[已移除]",
-			"关联申请 提交人：[已移除] 常州业务拓展",
-			"本单据由提交人[已移除]创建",
-		]) {
-			expect(decide(label)).toEqual({ allowed: true, kind: "neutral" });
-		}
-		expect(decide("删除单据（提交人：[已移除]）")).toMatchObject({ allowed: false, kind: "blocked" });
-		expect(decide("删除单据", "trash-icon", "button", "attachment-list 发票")).toMatchObject({
-			allowed: false,
-			kind: "blocked",
-		});
-		expect(classifyBrowserClick({ hostname: "example.com", label: "提交", attributeSignal: "submit" })).toEqual({
-			allowed: true,
-			kind: "external",
-		});
-	});
-
 	it("Electron 控制器使用可信鼠标事件实现点击和悬浮", () => {
 		const controller = readFileSync(
 			join(import.meta.dirname, "..", "installer", "electron", "browser-controller.js"),
 			"utf8",
 		);
-		expect(controller).toContain("只允许保存草稿");
 		expect(controller).toContain('sendInputEvent({ type: "mouseMove"');
 		expect(controller).toContain('sendInputEvent({ type: "mouseDown"');
 		expect(controller).toContain('sendInputEvent({ type: "mouseUp"');
@@ -398,7 +296,7 @@ describe("客户端浏览器工具", () => {
 		expect(controller).not.toContain("requestSubmit");
 	});
 
-	it("页面快照只折叠同一几何行的包装层与克隆，并保留独立控件和往返两行", () => {
+	it("页面快照只折叠同一几何行的包装层与克隆，并保留独立控件和相似两行", () => {
 		const candidate = (
 			id: string,
 			text: string,
@@ -418,8 +316,8 @@ describe("客户端浏览器工具", () => {
 			dedupeDepth: depth,
 			dedupeActivationKey: activationKey,
 		});
-		const outbound = "出发城市：中国 / 江苏省 / 南京 到达城市：中国 / 江苏省 / 常州";
-		const inbound = "出发城市：中国 / 江苏省 / 常州 到达城市：中国 / 江苏省 / 南京";
+		const outbound = "寄件地址：中国 / 江苏省 / 南京 收件地址：中国 / 浙江省 / 杭州";
+		const inbound = "寄件地址：中国 / 浙江省 / 杭州 收件地址：中国 / 江苏省 / 南京";
 		const nested = Array.from({ length: 7 }, (_value, index) =>
 			candidate(`nested-${index}`, outbound, 20 + index, 100 + index, 900 - index * 2, 64 - index * 2, index),
 		);
@@ -484,9 +382,6 @@ describe("客户端浏览器工具", () => {
 		expect(controller).not.toContain("const nearby = [...container.querySelectorAll?.('input[type=file]') || []]");
 		expect(controller).not.toContain("const overlayWithInputs = overlays.find");
 		expect(controller).toContain("已拒绝默认选择第一个");
-		expect(controller).toContain("同一最近边界内的唯一 file input");
-		expect(controller).toContain("data-pi-trusted-upload-token");
-		expect(controller).toContain("await revalidateTrustedUpload()");
 		expect(controller).toContain("const UPLOAD_ISOLATED_WORLD_ID = 1001");
 		expect(controller).toContain("executeJavaScriptInIsolatedWorld(");
 		expect(controller).toContain("startOrigin !== lockedOrigin");
@@ -503,7 +398,7 @@ describe("客户端浏览器工具", () => {
 		expect(controller).not.toContain("depth < 16");
 	});
 
-	it("Electron 快照暴露复选框状态，点击层对提交与删除采用默认拒绝", () => {
+	it("Electron 快照暴露复选框状态", () => {
 		const controller = readFileSync(
 			join(import.meta.dirname, "..", "installer", "electron", "browser-controller.js"),
 			"utf8",
@@ -512,23 +407,15 @@ describe("客户端浏览器工具", () => {
 		expect(controller).toContain('ariaChecked: element.getAttribute("aria-checked")');
 		expect(controller).toContain("checked=" + "$" + "{element.checked}");
 		expect(controller).toContain("aria-checked=" + "$" + "{element.ariaChecked}");
-		expect(controller).toContain("submitControl && !isDraft");
-		expect(controller).toContain("const destructive = new RegExp(safetyPatterns.destructiveAttribute");
-		expect(controller).toContain("const attachmentRemoval = explicitAttachmentAction || Boolean(contextSignal)");
-		expect(controller).toContain("depth <= 2 && fullNodeText.length <= 240 ? fullNodeText : ''");
-		expect(controller).toContain("没有明确附件上下文的删除或移除操作");
-		expect(controller).toContain(".replace(/([a-z0-9])([A-Z])/g, '$1 $2')");
 		expect(controller).toContain("目标元素位于内嵌框架");
-		expect(controller).toContain("const locatorSignal = [target.selector || '', target.text || '']");
-		expect(controller).toContain("new RegExp(safetyPatterns.draftAttribute, 'i').test(' ' + attributeSignal + ' ')");
-		expect(controller).toContain("action.kind === 'type' && action.pressEnter && isEkuaibao");
+		expect(controller).not.toContain("clickable.click()");
+		expect(controller).not.toContain("requestSubmit");
 	});
 
-	it("浏览器公开接口、工具、安全策略和 pack 清单与安装版镜像完全一致", () => {
+	it("浏览器公开接口、工具和 pack 清单与安装版镜像完全一致", () => {
 		for (const relativePath of [
 			"src/agent-browser-runtime.ts",
 			"src/agent-browser-tools.ts",
-			"src/agent-browser-safety.ts",
 			"packs/agent-browser/pack.json",
 		]) {
 			const source = readFileSync(join(import.meta.dirname, "..", relativePath), "utf8");

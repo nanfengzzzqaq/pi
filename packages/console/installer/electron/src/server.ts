@@ -11,7 +11,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -26,14 +26,6 @@ import {
 	vaultSensitiveUrlsInText,
 } from "./agent-browser-runtime.ts";
 import { extractFileReferences } from "./artifacts.ts";
-import {
-	hasTravelDraftSaveConfirmation,
-	isTravelDraftSaveClick,
-	isTravelDraftWorkflowCompletion,
-	isTravelWorkflowCancellation,
-	routeTravelCapabilityMatches,
-	travelWorkflowPromptToolChoice,
-} from "./capability-workflow.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
@@ -59,7 +51,6 @@ import {
 	loadPacks,
 	mountedPacks,
 	mountPack,
-	type PackTurnContext,
 	packSummaries,
 	selectCapabilities,
 	toolDisplayName,
@@ -72,7 +63,7 @@ import {
 	disposeSessionBeforeDelete,
 	type TrackedSessionPrompt,
 } from "./session-lifecycle.ts";
-import { appendAttachmentAnnotation, extractEkuaibaoTravelUrl, parseUserMessage } from "./session-messages.ts";
+import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -108,27 +99,8 @@ process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
 const OFFICECLI_PACK_NAME = "office-assistant";
 const AGENT_BROWSER_PACK_NAME = "agent-browser";
-const TRAVEL_EXPENSE_PACK_NAME = "travel-expense";
 const CODE_DEVELOPMENT_PACK_NAME = "code-development";
 
-/** 差旅报销技能：安装包内置 → 数据目录（幂等，内容变化时覆盖更新）。 */
-function seedTravelExpenseSkill(): boolean {
-	const source = join(PACKAGE_ROOT, "skills", "travel-expense", "SKILL.md");
-	if (!existsSync(source)) return false;
-	const destination = join(DATA_DIR, "agent", "skills", "travel-expense", "SKILL.md");
-	try {
-		const content = readFileSync(source, "utf8");
-		if (existsSync(destination) && readFileSync(destination, "utf8") === content) {
-			return true;
-		}
-		mkdirSync(dirname(destination), { recursive: true });
-		writeFileSync(destination, content, "utf8");
-		return true;
-	} catch (error) {
-		console.warn(`差旅报销技能安装失败：${error instanceof Error ? error.message : String(error)}`);
-		return false;
-	}
-}
 const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
 	sevenzip: "archive-files",
 	ocr: "image-ocr",
@@ -175,14 +147,6 @@ interface ConsoleSession {
 	enabledPacks: Set<string>;
 	/** 本轮临时激活的最小工具组；agent_settled 后清空。 */
 	activePackTools: Map<string, Set<string>>;
-	/** 进行中的差旅填报跨轮保留，直到草稿保存成功或用户明确取消。 */
-	pinnedPackTools: Map<string, Set<string>>;
-	/** 控制台直接绑定的本轮输入；能力工具读取它，避免弱模型转抄 URL 或附件路径。 */
-	packTurnContextState: { current: PackTurnContext };
-	/** 已点击草稿按钮、等待工具成功结果的调用 ID。 */
-	pendingDraftSaveCalls: Set<string>;
-	/** DOM 点击成功后仍需等待页面明确显示草稿保存成功。 */
-	awaitingDraftSaveConfirmation: boolean;
 	lastCapabilityTrace: CapabilityTrace | null;
 	lastUsage: unknown;
 	/** DELETE 已开始后禁止再提交消息。 */
@@ -220,15 +184,10 @@ function redactToolValue(value: unknown, seen = new WeakMap<object, unknown>()):
 	return copy;
 }
 
-/** 会话当前应生效的工具名单。确定性差旅工作流运行时只暴露它自身，降低弱模型选错工具和 schema token。 */
-function effectiveToolNames(
-	enabledPacks: Set<string>,
-	activePackTools: Map<string, Set<string>>,
-	pinnedPackTools: Map<string, Set<string>> = new Map(),
-): string[] {
-	if (pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft")) return ["travel_fill_draft"];
+/** 会话当前应生效的工具名单。 */
+function effectiveToolNames(enabledPacks: Set<string>, activePackTools: Map<string, Set<string>>): string[] {
 	const names = baseToolNames(enabledPacks);
-	for (const toolNames of [...activePackTools.values(), ...pinnedPackTools.values()]) {
+	for (const toolNames of activePackTools.values()) {
 		for (const toolName of toolNames) {
 			if (!names.includes(toolName)) names.push(toolName);
 		}
@@ -261,8 +220,6 @@ interface SessionIndexEntry {
 	sessionFile?: string;
 	/** 会话绑定的助手。旧索引没有该字段时，在恢复时迁移一次。 */
 	enabledPacks?: string[];
-	/** 跨客户端重启保留尚未完成的确定性工作流；完成或取消时立即清除。 */
-	pinnedPackTools?: Record<string, string[]>;
 	title: string;
 	createdAt: number;
 	updatedAt: number;
@@ -288,7 +245,6 @@ function touchSessionIndex(
 	cwd: string,
 	sessionFile: string | undefined,
 	enabledPacks: Iterable<string>,
-	pinnedPackTools?: Map<string, Set<string>>,
 ): void {
 	const index = readSessionIndex();
 	const existing = index[sessionId];
@@ -296,22 +252,10 @@ function touchSessionIndex(
 		cwd,
 		sessionFile: sessionFile ?? existing?.sessionFile,
 		enabledPacks: [...enabledPacks],
-		pinnedPackTools: pinnedPackTools
-			? Object.fromEntries([...pinnedPackTools].map(([pack, tools]) => [pack, [...tools]]))
-			: existing?.pinnedPackTools,
 		title: existing?.title ?? "",
 		createdAt: existing?.createdAt ?? Date.now(),
 		updatedAt: Date.now(),
 	};
-	writeSessionIndex(index);
-}
-
-function persistPinnedPackTools(cs: ConsoleSession): void {
-	const index = readSessionIndex();
-	const entry = index[cs.sessionId];
-	if (!entry) return;
-	entry.pinnedPackTools = Object.fromEntries([...cs.pinnedPackTools].map(([pack, tools]) => [pack, [...tools]]));
-	entry.updatedAt = Date.now();
 	writeSessionIndex(index);
 }
 
@@ -323,7 +267,7 @@ function activatePackForAllSessions(packName: string): void {
 	mountPack(packName);
 	for (const cs of sessions.values()) {
 		cs.enabledPacks.add(packName);
-		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	}
 	const enabled = mountedPacks();
 	const index = readSessionIndex();
@@ -343,13 +287,11 @@ function deactivatePackForAllSessions(packName: string): boolean {
 	for (const cs of sessions.values()) {
 		cs.enabledPacks.delete(packName);
 		cs.activePackTools.delete(packName);
-		cs.pinnedPackTools.delete(packName);
-		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	}
 	const index = readSessionIndex();
 	for (const entry of Object.values(index)) {
 		entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
-		if (entry.pinnedPackTools) delete entry.pinnedPackTools[packName];
 	}
 	writeSessionIndex(index);
 	return changed;
@@ -421,12 +363,8 @@ else deactivatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
 // 桌面版主进程注册运行时后才挂载；纯网页模式不向模型暴露不可执行的浏览器工具。
 if (isAgentBrowserRuntimeAvailable()) {
 	activatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
-	// 差旅报销依赖内置浏览器；把技能种到数据目录，会话即可发现。
-	if (seedTravelExpenseSkill()) console.log("差旅报销：技能已就绪");
-	activatePackForAllSessions(TRAVEL_EXPENSE_PACK_NAME);
 } else {
 	deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
-	deactivatePackForAllSessions(TRAVEL_EXPENSE_PACK_NAME);
 }
 for (const [id, packName] of Object.entries(MANAGED_TOOL_PACKS) as Array<[managedFileTools.ManagedToolId, string]>) {
 	if (managedFileTools.getManagedToolStatus(id).installed) activatePackForAllSessions(packName);
@@ -594,7 +532,7 @@ function historicalCapabilityTrace(
 	timestamp: number,
 	enabledPacks: Set<string>,
 ): CapabilityTrace {
-	const selectedCapabilities = routeTravelCapabilities(selectCapabilities(text, enabledPacks), text);
+	const selectedCapabilities = selectCapabilities(text, enabledPacks);
 	const selectedTools = new Map<string, Set<string>>();
 	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
 	const names = effectiveToolNames(enabledPacks, selectedTools);
@@ -608,29 +546,13 @@ function historicalCapabilityTrace(
 	};
 }
 
-/** 差旅填报只暴露单个确定性业务工具，避免弱模型退回通用网页自由点击。 */
-function routeTravelCapabilities(matches: CapabilityMatch[], text: string, forceWorkflow = false): CapabilityMatch[] {
-	return routeTravelCapabilityMatches(matches, text, forceWorkflow);
-}
-
 function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTrace {
 	cs.activePackTools.clear();
-	const cancelledTravelWorkflow = isTravelWorkflowCancellation(text);
-	if (cancelledTravelWorkflow) releaseTravelWorkflow(cs);
-	const workflowPinned = cs.pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft") === true;
-	const selectedCapabilities = cancelledTravelWorkflow
-		? []
-		: routeTravelCapabilities(selectCapabilities(text, cs.enabledPacks), text, workflowPinned);
+	const selectedCapabilities = selectCapabilities(text, cs.enabledPacks);
 	for (const match of selectedCapabilities) {
 		cs.activePackTools.set(match.packName, new Set(match.toolNames));
 	}
-	const travelMatch = selectedCapabilities.find((match) => match.packName === TRAVEL_EXPENSE_PACK_NAME);
-	if (travelMatch?.toolNames.includes("travel_fill_draft")) {
-		cs.pinnedPackTools.set(TRAVEL_EXPENSE_PACK_NAME, new Set(travelMatch.toolNames));
-		cs.pinnedPackTools.delete(AGENT_BROWSER_PACK_NAME);
-		persistPinnedPackTools(cs);
-	}
-	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	const trace: CapabilityTrace = {
 		stepId: `capability-${randomUUID()}`,
 		stepName: "capability_search",
@@ -643,41 +565,10 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 	return trace;
 }
 
-/**
- * 差旅工具直接消费控制台收到的 URL 与附件，模型只负责触发工具。跨轮补充附件时
- * 采用有序去重合并；完成或取消后 releaseTravelWorkflow 会立即清空绑定。
- */
-function bindTravelTurnContext(cs: ConsoleSession, text: string, attachments: string[]): void {
-	const previous = cs.packTurnContextState.current;
-	const ekuaibaoTravelUrl = extractEkuaibaoTravelUrl(text) ?? previous.ekuaibaoTravelUrl;
-	const mergedAttachments = [...new Set([...previous.attachments, ...attachments])].slice(0, 32);
-	const accumulatedText = [previous.text, text]
-		.filter((part) => part.trim().length > 0)
-		.join("\n")
-		.slice(-8_000);
-	cs.packTurnContextState.current = {
-		text: accumulatedText,
-		attachments: mergedAttachments,
-		ekuaibaoTravelUrl,
-	};
-}
-
 function releaseTurnCapabilities(cs: ConsoleSession): void {
 	if (cs.activePackTools.size === 0) return;
 	cs.activePackTools.clear();
-	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
-}
-
-function releaseTravelWorkflow(cs: ConsoleSession): void {
-	cs.pinnedPackTools.delete(TRAVEL_EXPENSE_PACK_NAME);
-	cs.pinnedPackTools.delete(AGENT_BROWSER_PACK_NAME);
-	cs.activePackTools.delete(TRAVEL_EXPENSE_PACK_NAME);
-	cs.activePackTools.delete(AGENT_BROWSER_PACK_NAME);
-	cs.pendingDraftSaveCalls.clear();
-	cs.awaitingDraftSaveConfirmation = false;
-	cs.packTurnContextState.current = { text: "", attachments: [] };
-	persistPinnedPackTools(cs);
-	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools, cs.pinnedPackTools));
+	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 }
 
 /** 只对在线连接广播、不写入重放缓冲的瞬时事件类型（终值由后续事件补全）。 */
@@ -707,15 +598,12 @@ async function buildSession(
 	enabledPackNames: Iterable<string>,
 	modelOverride?: SessionModel,
 	sessionFile?: string,
-	restoredPinnedPackTools?: Record<string, string[]>,
 ): Promise<{
 	session: AgentSession;
 	sessionFile: string | undefined;
 	modelFallbackMessage?: string;
 	enabledPacks: Set<string>;
 	activePackTools: Map<string, Set<string>>;
-	pinnedPackTools: Map<string, Set<string>>;
-	packTurnContextState: { current: PackTurnContext };
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -725,18 +613,6 @@ async function buildSession(
 		: SessionManager.create(cwd, SESSION_DIR);
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
-	const pinnedPackTools = new Map<string, Set<string>>();
-	const packTurnContextState: { current: PackTurnContext } = {
-		current: { text: "", attachments: [] },
-	};
-	for (const [packName, names] of Object.entries(restoredPinnedPackTools ?? {})) {
-		// 当前唯一允许跨重启续作的是确定性差旅状态机。不要相信旧/损坏索引里
-		// 任意包名和工具名，否则可能永久恢复通用 browser 写操作。
-		if (packName !== TRAVEL_EXPENSE_PACK_NAME || !enabledPacks.has(packName) || !Array.isArray(names)) continue;
-		if (names.includes("travel_fill_draft") && fullPackToolNames(packName).includes("travel_fill_draft")) {
-			pinnedPackTools.set(packName, new Set(["travel_fill_draft"]));
-		}
-	}
 	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
@@ -757,11 +633,10 @@ async function buildSession(
 			...instantiateWindowsTools({ getWorkspaceRoot: () => cwd }),
 			...instantiatePackTools({
 				getWorkspaceRoot: () => cwd,
-				getTurnContext: () => structuredClone(packTurnContextState.current),
 				activatePack: (packName) => {
 					if (!enabledPacks.has(packName)) return;
 					activePackTools.set(packName, new Set(fullPackToolNames(packName)));
-					sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools, pinnedPackTools));
+					sessionRef?.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
 				},
 			}),
 		],
@@ -789,33 +664,19 @@ async function buildSession(
 	sessionRef = session;
 
 	// 新会话只带原生工具；声明了通用激活规则的能力包等到本轮确实命中才注入。
-	session.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools, pinnedPackTools));
+	session.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
 	return {
 		session,
 		sessionFile: session.sessionFile,
 		modelFallbackMessage,
 		enabledPacks,
 		activePackTools,
-		pinnedPackTools,
-		packTurnContextState,
 	};
 }
 
 function subscribeConsoleSession(cs: ConsoleSession): void {
 	cs.session.subscribe((ev) => {
 		if (ev.type === "turn_end") cs.lastUsage = (ev.message as { usage?: unknown }).usage ?? null;
-		if (ev.type === "tool_execution_start" && isTravelDraftSaveClick(ev.toolName, ev.args)) {
-			cs.pendingDraftSaveCalls.add(ev.toolCallId);
-		}
-		if (ev.type === "tool_execution_end") {
-			const wasDraftClick = cs.pendingDraftSaveCalls.delete(ev.toolCallId);
-			if (wasDraftClick) cs.awaitingDraftSaveConfirmation = !ev.isError;
-			else if (!ev.isError && isTravelDraftWorkflowCompletion(ev.toolName, ev.result)) {
-				releaseTravelWorkflow(cs);
-			} else if (cs.awaitingDraftSaveConfirmation && !ev.isError && hasTravelDraftSaveConfirmation(ev.result)) {
-				releaseTravelWorkflow(cs);
-			}
-		}
 		if (ev.type === "agent_settled") releaseTurnCapabilities(cs);
 		const clientEvent = toClientEvent(ev);
 		if (clientEvent) bufferAndBroadcast(cs, clientEvent);
@@ -835,8 +696,6 @@ async function createConsoleSession(
 		modelFallbackMessage,
 		enabledPacks,
 		activePackTools,
-		pinnedPackTools,
-		packTurnContextState,
 	} = await buildSession(cwd, enabledPackNames);
 
 	const cs: ConsoleSession = {
@@ -847,17 +706,13 @@ async function createConsoleSession(
 		sseClients: new Set(),
 		enabledPacks,
 		activePackTools,
-		pinnedPackTools,
-		packTurnContextState,
-		pendingDraftSaveCalls: new Set(),
-		awaitingDraftSaveConfirmation: false,
 		lastCapabilityTrace: null,
 		lastUsage: null,
 		deleting: false,
 		activePrompt: null,
 	};
 	sessions.set(sessionId, cs);
-	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks, pinnedPackTools);
+	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
 	subscribeConsoleSession(cs);
 
 	// 默认模型解析失败时（如未配置任何 Key），通过 SSE 告知前端
@@ -882,9 +737,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			modelFallbackMessage,
 			enabledPacks,
 			activePackTools,
-			pinnedPackTools,
-			packTurnContextState,
-		} = await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile, entry.pinnedPackTools);
+		} = await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -893,17 +746,13 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			sseClients: new Set(),
 			enabledPacks,
 			activePackTools,
-			pinnedPackTools,
-			packTurnContextState,
-			pendingDraftSaveCalls: new Set(),
-			awaitingDraftSaveConfirmation: false,
 			lastCapabilityTrace: null,
 			lastUsage: null,
 			deleting: false,
 			activePrompt: null,
 		};
 		sessions.set(sessionId, cs);
-		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks, pinnedPackTools);
+		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
 		subscribeConsoleSession(cs);
 		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
 		return cs;
@@ -1019,7 +868,6 @@ async function buildCapabilityCatalog() {
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
 	const browserPack = listPacks().find((item) => item.name === AGENT_BROWSER_PACK_NAME);
-	const travelExpensePack = listPacks().find((item) => item.name === TRAVEL_EXPENSE_PACK_NAME);
 	const codeDevelopmentStatus = codeDevelopment.getCodeDevelopmentStatus();
 	const codeDevelopmentPack = listPacks().find((item) => item.name === CODE_DEVELOPMENT_PACK_NAME);
 	const codeDevelopmentCwd = workspace.getWorkspacePath() ?? DATA_DIR;
@@ -1078,27 +926,6 @@ async function buildCapabilityCatalog() {
 				capabilities: browserPack?.tools ?? [],
 				skillCount: 0,
 				installedSkillCount: 0,
-				removable: false,
-			},
-			{
-				id: "travel-expense",
-				internalName: "travel-expense",
-				displayName: "差旅报销",
-				description:
-					"在客户端内置浏览器中自动填报易快报（合思）差旅费用报销单：关联出差申请、按规则填写字段与费用明细、上传票据附件，最后保存草稿；绝不提交送审。",
-				category: "效率工具",
-				formats: ["差旅报销", "易快报", "合思", "火车票", "住宿费", "出差补贴"],
-				installed: isAgentBrowserRuntimeAvailable(),
-				version: travelExpensePack?.version ?? "1.0.0",
-				installPath: "Pi 控制台内置",
-				platform: `${process.platform}-${process.arch}`,
-				iconText: "报",
-				sourceName: "Pi 控制台内置能力",
-				sourceUrl: "https://ekuaibao.com/",
-				activation: "识别到报销 / 差旅任务时按本轮加载",
-				capabilities: travelExpensePack?.tools ?? [],
-				skillCount: 1,
-				installedSkillCount: seedTravelExpenseSkill() ? 1 : 0,
 				removable: false,
 			},
 			{
@@ -2192,13 +2019,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
-			if (cs.pinnedPackTools.get(TRAVEL_EXPENSE_PACK_NAME)?.has("travel_fill_draft")) {
-				bindTravelTurnContext(cs, safeText, attachments);
-			}
-			const promptToolChoice = travelWorkflowPromptToolChoice(
-				cs.session.model?.api,
-				cs.session.getActiveToolNames(),
-			);
 			if (cs.enabledPacks.size > 0) {
 				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			}
@@ -2214,7 +2034,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			});
 			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve() };
 			activePrompt.done = cs.session
-				.prompt(promptText, { images, preflightResult: resolvePreflight, ...promptToolChoice })
+				.prompt(promptText, { images, preflightResult: resolvePreflight })
 				.catch((error) => {
 					releaseTurnCapabilities(cs);
 					bufferAndBroadcast(cs, {

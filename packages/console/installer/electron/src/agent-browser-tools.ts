@@ -116,7 +116,7 @@ const targetParameters = {
 		Type.Array(Type.String(), {
 			minItems: 1,
 			maxItems: 8,
-			description: "目标附近同一容器内必须同时出现的文字，例如出发城市、到达城市和金额",
+			description: "目标附近同一容器内必须同时出现的文字，例如收件人、邮箱和金额",
 		}),
 	),
 	within: Type.Optional(
@@ -201,37 +201,24 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 		defineTool({
 			name: "browser_hover",
 			label: "悬浮页面元素",
-			description: "把真实鼠标移动到页面元素上，用于显示悬浮菜单（如“添加发票”下的“智能识票”）。",
+			description: "把真实鼠标移动到页面元素上，用于显示悬浮菜单。",
 			parameters: Type.Object(targetParameters),
 			execute: async (_id, params) => result(await browser().hover(target(params))),
 		}),
 		defineTool({
 			name: "browser_type",
 			label: "输入页面内容",
-			description:
-				"向输入框、文本框或可编辑元素写入内容，可在普通网页输入后按回车确认；易快报页面强制禁止按回车，避免意外提交整张表单。",
+			description: "向输入框、文本框或可编辑元素写入内容，可在普通网页输入后按回车确认。",
 			parameters: Type.Object({
 				...targetParameters,
 				value: Type.String({ description: "要输入的内容" }),
-				submit: Type.Optional(
-					Type.Boolean({ description: "输入后是否按回车确认，默认否；易快报页面不允许设为 true" }),
-				),
+				submit: Type.Optional(Type.Boolean({ description: "输入后是否按回车确认，默认否" })),
 				commit: Type.Optional(
 					Type.Boolean({ description: "输入后是否失焦以持久化字段，默认是；搜索下拉候选时设为否" }),
 				),
 			}),
 			execute: async (_id, params) => {
 				const runtime = browser();
-				if (params.submit === true) {
-					try {
-						const hostname = new URL(runtime.state().url).hostname;
-						if (/(^|\.)ekuaibao\.com$/i.test(hostname)) {
-							throw new Error("安全策略已禁止在易快报页面通过回车确认，以免触发表单提交；请点击明确的候选项");
-						}
-					} catch (error) {
-						if (error instanceof Error && error.message.startsWith("安全策略已禁止")) throw error;
-					}
-				}
 				return result(
 					await runtime.type(target(params), params.value, params.submit === true, params.commit !== false),
 				);
@@ -297,7 +284,7 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			parameters: Type.Object({
 				paths: Type.Array(Type.String(), {
 					minItems: 1,
-					description: '要上传的本地文件路径列表，如 ["tickets/去程票.png", "tickets/查验.png"]',
+					description: '要上传的本地文件路径列表，如 ["uploads/report.pdf", "uploads/photo.png"]',
 				}),
 				...targetParameters,
 			}),

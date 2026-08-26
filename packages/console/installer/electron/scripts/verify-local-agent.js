@@ -22,18 +22,9 @@ export const CONSOLE_CRITICAL_FILES = [
 	"src/server.ts",
 	"src/packs.ts",
 	"src/session-messages.ts",
-	"src/capability-workflow.ts",
 	"src/agent-browser-runtime.ts",
-	"src/agent-browser-safety.ts",
 	"src/agent-browser-tools.ts",
 	"packs/agent-browser/pack.json",
-	"packs/travel-expense/index.ts",
-	"packs/travel-expense/pack.json",
-	"packs/travel-expense/pdf-embedded.ts",
-	"packs/travel-expense/pdf-ocr.ps1",
-	"packs/travel-expense/workflow.ts",
-	"packs/travel-expense/workflow-browser-driver.ts",
-	"skills/travel-expense/SKILL.md",
 ];
 
 export const ELECTRON_ASAR_CRITICAL_FILES = ["browser-controller.js"];
