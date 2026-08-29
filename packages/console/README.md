@@ -35,7 +35,7 @@ npx tsx packages/console/src/server.ts
 - **模型/思考等级选择器**移到输入框右下角；右栏「上下文」面板展示已启用能力，MCP 服务为占位设计（后续版本开放）
 - 模型 Key 与自定义 OpenAI 兼容模型管理（设置 → 模型服务）、应用内更新、Edge App 独立窗口、拖拽/粘贴附件（见下）
 
-- **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量。也可添加 vLLM、Ollama、LM Studio 等 OpenAI 兼容地址，自动读取模型列表，并配置上下文、最大输出和图片能力。
+- **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量。也可添加 vLLM、Ollama、LM Studio 等 OpenAI 兼容地址，自动读取模型列表，并配置上下文、最大输出、图片能力和可选的 `low / medium / xhigh` 推理等级。
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
 - **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup，校验 SHA256 后静默重装，并从用户实际安装位置自动重启；私有仓库需在设置里填写 GitHub Token）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式

@@ -55,6 +55,7 @@ const customModelOptionsEl = $("custom-model-options");
 const customModelDiscoverBtnEl = $("custom-model-discover-btn");
 const customModelContextEl = $("custom-model-context");
 const customModelMaxTokensEl = $("custom-model-max-tokens");
+const customModelReasoningEl = $("custom-model-reasoning");
 const customModelVisionEl = $("custom-model-vision");
 const customModelSaveBtnEl = $("custom-model-save-btn");
 const customModelCancelBtnEl = $("custom-model-cancel-btn");
@@ -4658,6 +4659,7 @@ function resetCustomModelForm() {
 	customModelOptionsEl.innerHTML = "";
 	customModelContextEl.value = "128000";
 	customModelMaxTokensEl.value = "16384";
+	customModelReasoningEl.checked = false;
 	customModelVisionEl.checked = false;
 	customModelSaveBtnEl.textContent = "添加模型";
 	customModelCancelBtnEl.hidden = true;
@@ -4671,6 +4673,7 @@ function editCustomModel(entry) {
 	customModelIdEl.value = entry.modelId;
 	customModelContextEl.value = String(entry.contextWindow);
 	customModelMaxTokensEl.value = String(entry.maxTokens);
+	customModelReasoningEl.checked = entry.reasoning === true;
 	customModelVisionEl.checked = entry.vision;
 	customModelSaveBtnEl.textContent = "保存修改";
 	customModelCancelBtnEl.hidden = false;
@@ -4692,7 +4695,7 @@ function renderCustomModelList(entries) {
 		name.title = entry.baseUrl;
 		const detail = document.createElement("span");
 		detail.className = "key-masked";
-		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.hasKey ? "" : " · 缺少 Key"}`;
+		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.reasoning ? " · 推理等级" : ""}${entry.hasKey ? "" : " · 缺少 Key"}`;
 		const edit = document.createElement("button");
 		edit.className = "secondary-btn small";
 		edit.type = "button";
@@ -4779,6 +4782,7 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 				modelId: customModelIdEl.value,
 				contextWindow: customModelContextEl.value,
 				maxTokens: customModelMaxTokensEl.value,
+				reasoning: customModelReasoningEl.checked,
 				vision: customModelVisionEl.checked,
 			}),
 		});

@@ -1,7 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-const FILE_VERSION = 1;
+const FILE_VERSION = 2;
+const LEGACY_FILE_VERSION = 1;
 const PROVIDER_PREFIX = "pi-console-custom-";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
@@ -14,6 +15,7 @@ export interface CustomModelDefinition {
 	contextWindow: number;
 	maxTokens: number;
 	vision: boolean;
+	reasoning: boolean;
 }
 
 interface CustomModelsFile {
@@ -28,6 +30,7 @@ export interface CustomModelInput {
 	contextWindow?: unknown;
 	maxTokens?: unknown;
 	vision?: unknown;
+	reasoning?: unknown;
 }
 
 function requiredText(value: unknown, label: string, maxLength: number): string {
@@ -87,10 +90,13 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 		contextWindow,
 		maxTokens,
 		vision: input.vision === true,
+		reasoning: input.reasoning === true,
 	};
 }
 
-function isDefinition(value: unknown): value is CustomModelDefinition {
+type LegacyCustomModelDefinition = Omit<CustomModelDefinition, "reasoning">;
+
+function isLegacyDefinition(value: unknown): value is LegacyCustomModelDefinition {
 	if (typeof value !== "object" || value === null) return false;
 	const entry = value as Record<string, unknown>;
 	return (
@@ -107,6 +113,10 @@ function isDefinition(value: unknown): value is CustomModelDefinition {
 	);
 }
 
+function isDefinition(value: unknown): value is CustomModelDefinition {
+	return isLegacyDefinition(value) && typeof (value as Record<string, unknown>).reasoning === "boolean";
+}
+
 export function loadCustomModels(filePath: string): CustomModelDefinition[] {
 	let raw: unknown;
 	try {
@@ -117,10 +127,12 @@ export function loadCustomModels(filePath: string): CustomModelDefinition[] {
 	}
 	if (typeof raw !== "object" || raw === null) throw new Error("自定义模型配置格式无效");
 	const file = raw as Partial<CustomModelsFile>;
-	if (file.version !== FILE_VERSION || !Array.isArray(file.models) || !file.models.every(isDefinition)) {
-		throw new Error("自定义模型配置格式无效");
+	if (!Array.isArray(file.models)) throw new Error("自定义模型配置格式无效");
+	if (file.version === FILE_VERSION && file.models.every(isDefinition)) return structuredClone(file.models);
+	if (file.version === LEGACY_FILE_VERSION && file.models.every(isLegacyDefinition)) {
+		return file.models.map((definition) => ({ ...structuredClone(definition), reasoning: false }));
 	}
-	return structuredClone(file.models);
+	throw new Error("自定义模型配置格式无效");
 }
 
 function writeCustomModels(filePath: string, models: CustomModelDefinition[]): void {
@@ -155,7 +167,7 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 		compat: {
 			supportsStore: false,
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: false,
+			supportsReasoningEffort: definition.reasoning,
 			supportsStrictMode: false,
 			supportsOpenAIGrammarTools: false,
 			maxTokensField: "max_tokens" as const,
@@ -164,7 +176,18 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 			{
 				id: definition.modelId,
 				name: definition.modelId,
-				reasoning: false,
+				reasoning: definition.reasoning,
+				thinkingLevelMap: definition.reasoning
+					? {
+							off: null,
+							minimal: null,
+							low: "low",
+							medium: "medium",
+							high: null,
+							xhigh: "xhigh",
+							max: null,
+						}
+					: undefined,
 				input,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: definition.contextWindow,

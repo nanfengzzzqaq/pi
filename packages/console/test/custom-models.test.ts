@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -37,6 +37,7 @@ describe("custom model configuration", () => {
 			contextWindow: "131072",
 			maxTokens: 16384,
 			vision: true,
+			reasoning: true,
 		});
 
 		saveCustomModel(file, definition);
@@ -50,27 +51,70 @@ describe("custom model configuration", () => {
 				contextWindow: 131072,
 				maxTokens: 16384,
 				vision: true,
+				reasoning: true,
 			},
 		]);
 		expect(readFileSync(file, "utf8")).not.toContain("apiKey");
 	});
 
-	it("builds a conservative Chat Completions provider with normal function tools", () => {
+	it("builds a Chat Completions provider with the enabled Qwen reasoning levels", () => {
 		const definition = normalizeCustomModel(createCustomProviderId("model-1"), {
 			name: "Local",
 			baseUrl: "http://127.0.0.1:8000/v1",
 			modelId: "qwen",
+			reasoning: true,
 		});
 
 		expect(toProviderConfig(definition)).toMatchObject({
 			api: "openai-completions",
 			compat: {
 				supportsDeveloperRole: false,
-				supportsReasoningEffort: false,
+				supportsReasoningEffort: true,
 				supportsOpenAIGrammarTools: false,
 			},
-			models: [{ id: "qwen", input: ["text"], contextWindow: 128000, maxTokens: 16384 }],
+			models: [
+				{
+					id: "qwen",
+					reasoning: true,
+					thinkingLevelMap: {
+						off: null,
+						minimal: null,
+						low: "low",
+						medium: "medium",
+						high: null,
+						xhigh: "xhigh",
+						max: null,
+					},
+					input: ["text"],
+					contextWindow: 128000,
+					maxTokens: 16384,
+				},
+			],
 		});
+	});
+
+	it("loads version 1 definitions with reasoning disabled until the user opts in", () => {
+		const file = temporaryFile();
+		writeFileSync(
+			file,
+			JSON.stringify({
+				version: 1,
+				models: [
+					{
+						providerId: createCustomProviderId("legacy"),
+						name: "Legacy",
+						baseUrl: "http://localhost:8000/v1",
+						modelId: "qwen",
+						contextWindow: 128000,
+						maxTokens: 16384,
+						vision: false,
+					},
+				],
+			}),
+			"utf8",
+		);
+
+		expect(loadCustomModels(file)[0]?.reasoning).toBe(false);
 	});
 
 	it("updates and removes only the selected custom provider", () => {
