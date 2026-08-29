@@ -372,6 +372,26 @@
 					<button id="key-add-btn">添加</button>
 				</div>
 				<div id="key-list" class="key-list"></div>
+				<p class="modal-hint"><strong>自定义 OpenAI 兼容模型</strong><br>适用于 vLLM、Ollama、LM Studio 和兼容代理；使用 Chat Completions，支持 Pi 的工具调用。</p>
+				<input type="hidden" id="custom-model-provider-id">
+				<div class="key-add-row">
+					<input type="text" id="custom-model-name" placeholder="服务名称，例如 本地 Qwen" autocomplete="off">
+					<input type="url" id="custom-model-base-url" placeholder="API 地址，例如 https://ai.example.com/v1" autocomplete="off">
+				</div>
+				<div class="key-add-row">
+					<input type="password" id="custom-model-api-key" placeholder="API Key（编辑时留空则不变）" autocomplete="off">
+					<input type="text" id="custom-model-id" list="custom-model-options" placeholder="模型 ID" autocomplete="off">
+					<datalist id="custom-model-options"></datalist>
+					<button id="custom-model-discover-btn" class="secondary-btn" type="button">读取模型</button>
+				</div>
+				<div class="key-add-row">
+					<input type="number" id="custom-model-context" min="1" step="1" value="128000" placeholder="上下文长度">
+					<input type="number" id="custom-model-max-tokens" min="1" step="1" value="16384" placeholder="最大输出长度">
+					<label class="modal-hint"><input type="checkbox" id="custom-model-vision"> 支持图片</label>
+					<button id="custom-model-save-btn" type="button">添加模型</button>
+					<button id="custom-model-cancel-btn" class="secondary-btn" type="button" hidden>取消编辑</button>
+				</div>
+				<div id="custom-model-list" class="key-list"></div>
 			</section>
 
 			<section class="modal-section">

@@ -33,9 +33,9 @@ npx tsx packages/console/src/server.ts
 - **Claude 风格渲染**：Markdown（标题/列表/表格/引用/链接）、代码块语法高亮、思考过程折叠滚动显示、工具调用块折叠、消息/代码块一键复制（⧉）
 - **历史消息折叠**：消息区顶部常驻「折叠历史消息」按钮（不随滚动消失），一键收起较早对话，避免长对话撑满页面
 - **模型/思考等级选择器**移到输入框右下角；右栏「上下文」面板展示已启用能力，MCP 服务为占位设计（后续版本开放）
-- 模型 Key 管理（设置 → 模型服务）、应用内更新、Edge App 独立窗口、拖拽/粘贴附件（见下）
+- 模型 Key 与自定义 OpenAI 兼容模型管理（设置 → 模型服务）、应用内更新、Edge App 独立窗口、拖拽/粘贴附件（见下）
 
-- **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量
+- **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量。也可添加 vLLM、Ollama、LM Studio 等 OpenAI 兼容地址，自动读取模型列表，并配置上下文、最大输出和图片能力。
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
 - **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup，校验 SHA256 后静默重装，并从用户实际安装位置自动重启；私有仓库需在设置里填写 GitHub Token）
 - **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
@@ -94,6 +94,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/sessions/:id/model` | body `{"provider","modelId"}` → `session.setModel`，SSE 发 `model_changed` |
 | `POST /api/sessions/:id/thinking` | body `{"level"}`（off/minimal/low/medium/high/xhigh/max），返回实际生效值 |
 | `GET /api/models` | 全部 provider 的模型（`{provider,modelId,label,hasAuth}`） |
+| `GET` / `POST /api/custom-models` | 列出或保存自定义 OpenAI 兼容模型；API Key 单独存入 `auth.json` |
+| `POST /api/custom-models/discover` | 从兼容服务的 `/models` 读取可用模型 ID |
+| `DELETE /api/custom-models/:providerId` | 删除自定义模型及其保存的 API Key |
 | `GET /api/packs` | 已安装能力包 `[{name,displayName,description,version,tools,mounted}]` |
 | `POST /api/packs/:name/mount` / `unmount` | 挂载/卸载（全局共享，持久化到 `data/mounted-packs.json`，对所有存活会话立即生效，下一轮起用） |
 | `GET /api/officecli/status` | OfficeCLI 安装状态 `{installed,version,latestVersion,latestTag,updateAvailable,path}`（查 latest 失败优雅降级为 null） |

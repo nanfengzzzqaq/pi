@@ -46,6 +46,19 @@ const keyProviderEl = $("key-provider");
 const keyInputEl = $("key-input");
 const keyAddBtnEl = $("key-add-btn");
 const keyListEl = $("key-list");
+const customModelProviderIdEl = $("custom-model-provider-id");
+const customModelNameEl = $("custom-model-name");
+const customModelBaseUrlEl = $("custom-model-base-url");
+const customModelApiKeyEl = $("custom-model-api-key");
+const customModelIdEl = $("custom-model-id");
+const customModelOptionsEl = $("custom-model-options");
+const customModelDiscoverBtnEl = $("custom-model-discover-btn");
+const customModelContextEl = $("custom-model-context");
+const customModelMaxTokensEl = $("custom-model-max-tokens");
+const customModelVisionEl = $("custom-model-vision");
+const customModelSaveBtnEl = $("custom-model-save-btn");
+const customModelCancelBtnEl = $("custom-model-cancel-btn");
+const customModelListEl = $("custom-model-list");
 const codexOAuthStatusEl = $("codex-oauth-status");
 const codexOAuthLoginBtnEl = $("codex-oauth-login-btn");
 const codexOAuthLogoutBtnEl = $("codex-oauth-logout-btn");
@@ -4456,6 +4469,7 @@ settingsBtnEl.addEventListener("click", () => {
 	settingsBtnEl.classList.remove("update-available");
 	settingsModalEl.hidden = false;
 	loadKeysSection();
+	loadCustomModelsSection();
 	loadCodexOAuthSection();
 	loadVersionSection();
 	loadWorkspaceState();
@@ -4634,6 +4648,151 @@ keyAddBtnEl.addEventListener("click", async () => {
 		keyAddBtnEl.disabled = false;
 	}
 });
+
+function resetCustomModelForm() {
+	customModelProviderIdEl.value = "";
+	customModelNameEl.value = "";
+	customModelBaseUrlEl.value = "";
+	customModelApiKeyEl.value = "";
+	customModelIdEl.value = "";
+	customModelOptionsEl.innerHTML = "";
+	customModelContextEl.value = "128000";
+	customModelMaxTokensEl.value = "16384";
+	customModelVisionEl.checked = false;
+	customModelSaveBtnEl.textContent = "添加模型";
+	customModelCancelBtnEl.hidden = true;
+}
+
+function editCustomModel(entry) {
+	customModelProviderIdEl.value = entry.providerId;
+	customModelNameEl.value = entry.name;
+	customModelBaseUrlEl.value = entry.baseUrl;
+	customModelApiKeyEl.value = "";
+	customModelIdEl.value = entry.modelId;
+	customModelContextEl.value = String(entry.contextWindow);
+	customModelMaxTokensEl.value = String(entry.maxTokens);
+	customModelVisionEl.checked = entry.vision;
+	customModelSaveBtnEl.textContent = "保存修改";
+	customModelCancelBtnEl.hidden = false;
+	customModelNameEl.focus();
+}
+
+function renderCustomModelList(entries) {
+	customModelListEl.innerHTML = "";
+	if (entries.length === 0) {
+		customModelListEl.innerHTML = '<div class="key-empty">尚未添加自定义模型</div>';
+		return;
+	}
+	for (const entry of entries) {
+		const row = document.createElement("div");
+		row.className = "key-row";
+		const name = document.createElement("span");
+		name.className = "key-name";
+		name.textContent = `${entry.name} · ${entry.modelId}`;
+		name.title = entry.baseUrl;
+		const detail = document.createElement("span");
+		detail.className = "key-masked";
+		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.hasKey ? "" : " · 缺少 Key"}`;
+		const edit = document.createElement("button");
+		edit.className = "secondary-btn small";
+		edit.type = "button";
+		edit.textContent = "编辑";
+		edit.addEventListener("click", () => editCustomModel(entry));
+		const remove = document.createElement("button");
+		remove.className = "key-delete";
+		remove.type = "button";
+		remove.textContent = "删除";
+		remove.addEventListener("click", async () => {
+			if (!window.confirm(`删除自定义模型“${entry.name}”？\n正在使用它的对话需要切换到其他模型。`)) return;
+			remove.disabled = true;
+			try {
+				await api(`/api/custom-models/${encodeURIComponent(entry.providerId)}`, { method: "DELETE" });
+				if (customModelProviderIdEl.value === entry.providerId) resetCustomModelForm();
+				await Promise.all([loadCustomModelsSection(), loadKeysSection(), loadModels()]);
+				showInfo(`已删除自定义模型 ${entry.name}`);
+			} catch (error) {
+				showError(`删除失败：${error.message}`);
+			} finally {
+				remove.disabled = false;
+			}
+		});
+		row.appendChild(name);
+		row.appendChild(detail);
+		row.appendChild(edit);
+		row.appendChild(remove);
+		customModelListEl.appendChild(row);
+	}
+}
+
+async function loadCustomModelsSection() {
+	try {
+		renderCustomModelList(await api("/api/custom-models"));
+	} catch (error) {
+		customModelListEl.textContent = `加载失败：${error.message}`;
+	}
+}
+
+customModelDiscoverBtnEl.addEventListener("click", async () => {
+	const baseUrl = customModelBaseUrlEl.value.trim();
+	if (!baseUrl) {
+		showError("请先填写 API 地址");
+		return;
+	}
+	customModelDiscoverBtnEl.disabled = true;
+	customModelDiscoverBtnEl.textContent = "读取中…";
+	try {
+		const result = await api("/api/custom-models/discover", {
+			method: "POST",
+			body: JSON.stringify({
+				baseUrl,
+				apiKey: customModelApiKeyEl.value.trim(),
+				providerId: customModelProviderIdEl.value,
+			}),
+		});
+		customModelOptionsEl.innerHTML = "";
+		for (const modelId of result.models) {
+			const option = document.createElement("option");
+			option.value = modelId;
+			customModelOptionsEl.appendChild(option);
+		}
+		if (result.models.length === 1) customModelIdEl.value = result.models[0];
+		showInfo(`已读取 ${result.models.length} 个模型${result.models.length ? "，可在模型 ID 中选择" : ""}`);
+	} catch (error) {
+		showError(`读取模型失败：${error.message}`);
+	} finally {
+		customModelDiscoverBtnEl.disabled = false;
+		customModelDiscoverBtnEl.textContent = "读取模型";
+	}
+});
+
+customModelSaveBtnEl.addEventListener("click", async () => {
+	const editing = Boolean(customModelProviderIdEl.value);
+	customModelSaveBtnEl.disabled = true;
+	try {
+		await api("/api/custom-models", {
+			method: "POST",
+			body: JSON.stringify({
+				providerId: customModelProviderIdEl.value || undefined,
+				name: customModelNameEl.value,
+				baseUrl: customModelBaseUrlEl.value,
+				apiKey: customModelApiKeyEl.value,
+				modelId: customModelIdEl.value,
+				contextWindow: customModelContextEl.value,
+				maxTokens: customModelMaxTokensEl.value,
+				vision: customModelVisionEl.checked,
+			}),
+		});
+		resetCustomModelForm();
+		await Promise.all([loadCustomModelsSection(), loadKeysSection(), loadModels()]);
+		showInfo(editing ? "自定义模型已更新" : "自定义模型已添加，可在聊天区模型列表中选择");
+	} catch (error) {
+		showError(`保存失败：${error.message}`);
+	} finally {
+		customModelSaveBtnEl.disabled = false;
+	}
+});
+
+customModelCancelBtnEl.addEventListener("click", resetCustomModelForm);
 
 async function loadVersionSection() {
 	try {

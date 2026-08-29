@@ -29,6 +29,7 @@ import { extractFileReferences } from "./artifacts.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
+import * as customModels from "./custom-models.ts";
 import * as fsExplorer from "./fs.ts";
 import { isAllowedLoopbackHost } from "./http-security.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
@@ -94,6 +95,8 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
+/** 控制台界面管理的自定义 OpenAI 兼容模型；Key 仍单独保存在 auth.json。 */
+const CUSTOM_MODELS_FILE = join(CONSOLE_AGENT_DIR, "custom-models.json");
 // Pi 官方 grep/find 会从 agent/bin 读取私有 rg/fd；网页开发模式与 Electron 安装版保持一致。
 process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
@@ -338,6 +341,13 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+try {
+	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
+		modelRuntime.registerProvider(definition.providerId, customModels.toProviderConfig(definition));
+	}
+} catch (error) {
+	console.warn(`自定义模型配置加载失败：${error instanceof Error ? error.message : String(error)}`);
+}
 const codexOAuth = new CodexOAuthCoordinator({
 	isConnected: () => modelRuntime.isUsingOAuth("openai-codex"),
 	login: async (interaction) => {
@@ -1131,6 +1141,19 @@ function deleteAuthEntry(provider: string): boolean {
 	return true;
 }
 
+function savedApiKey(provider: string): string | undefined {
+	const entry = readAuthFile()[provider];
+	return entry?.type === "api_key" ? entry.key : undefined;
+}
+
+function listCustomModels() {
+	const authFile = readAuthFile();
+	return customModels.loadCustomModels(CUSTOM_MODELS_FILE).map((definition) => ({
+		...definition,
+		hasKey: authFile[definition.providerId]?.type === "api_key",
+	}));
+}
+
 /** Key 列表：文件里已存的 + 环境变量配置的（标注来源），脱敏显示 */
 function listKeys(): Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> {
 	const entries: Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> = [];
@@ -1691,6 +1714,73 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// 模型枚举
 	if (pathname === "/api/models" && req.method === "GET") {
 		sendJson(res, 200, listModels());
+		return;
+	}
+
+	// 自定义 OpenAI 兼容模型：独立保存服务配置，Key 复用 auth.json。
+	if (pathname === "/api/custom-models" && req.method === "GET") {
+		sendJson(res, 200, listCustomModels());
+		return;
+	}
+	if (pathname === "/api/custom-models/discover" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { baseUrl?: unknown; apiKey?: unknown; providerId?: unknown };
+		const providerId = typeof body.providerId === "string" ? body.providerId : "";
+		const apiKey =
+			typeof body.apiKey === "string" && body.apiKey.trim()
+				? body.apiKey.trim()
+				: providerId
+					? savedApiKey(providerId)
+					: undefined;
+		try {
+			sendJson(res, 200, { models: await customModels.discoverOpenAIModels(body.baseUrl, apiKey) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/custom-models" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as customModels.CustomModelInput & {
+			providerId?: unknown;
+			apiKey?: unknown;
+		};
+		const requestedProviderId = typeof body.providerId === "string" ? body.providerId : "";
+		const providerId = requestedProviderId || customModels.createCustomProviderId(randomUUID());
+		if (requestedProviderId && !customModels.isCustomProviderId(requestedProviderId)) {
+			sendJson(res, 400, { error: "自定义模型服务标识无效" });
+			return;
+		}
+		const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+		if (!apiKey && !savedApiKey(providerId)) {
+			sendJson(res, 400, { error: "首次添加时请填写 API Key；无鉴权服务可填写任意占位值" });
+			return;
+		}
+		try {
+			const definition = customModels.normalizeCustomModel(providerId, body);
+			customModels.saveCustomModel(CUSTOM_MODELS_FILE, definition);
+			if (apiKey) writeAuthEntry(providerId, apiKey);
+			modelRuntime.registerProvider(providerId, customModels.toProviderConfig(definition));
+			await modelRuntime.refresh();
+			sendJson(res, 200, { ok: true, ...definition });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	const customModelMatch = pathname.match(/^\/api\/custom-models\/([^/]+)$/u);
+	if (customModelMatch && req.method === "DELETE") {
+		const providerId = decodeURIComponent(customModelMatch[1]);
+		try {
+			if (!customModels.removeCustomModel(CUSTOM_MODELS_FILE, providerId)) {
+				sendJson(res, 404, { error: "自定义模型不存在" });
+				return;
+			}
+			modelRuntime.unregisterProvider(providerId);
+			deleteAuthEntry(providerId);
+			await modelRuntime.refresh();
+			sendJson(res, 200, { ok: true });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
 		return;
 	}
 
