@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	createCustomProviderId,
@@ -67,11 +68,6 @@ describe("custom model configuration", () => {
 
 		expect(toProviderConfig(definition)).toMatchObject({
 			api: "openai-completions",
-			compat: {
-				supportsDeveloperRole: false,
-				supportsReasoningEffort: true,
-				supportsOpenAIGrammarTools: false,
-			},
 			models: [
 				{
 					id: "qwen",
@@ -88,8 +84,32 @@ describe("custom model configuration", () => {
 					input: ["text"],
 					contextWindow: 128000,
 					maxTokens: 16384,
+					compat: {
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: true,
+						supportsOpenAIGrammarTools: false,
+					},
 				},
 			],
+		});
+	});
+
+	it("preserves custom compatibility flags after runtime registration", async () => {
+		const authPath = temporaryFile();
+		const providerId = createCustomProviderId("runtime-model");
+		const definition = normalizeCustomModel(providerId, {
+			name: "Runtime Qwen",
+			baseUrl: "https://ai.example.com/v1",
+			modelId: "qwen",
+			reasoning: true,
+		});
+		const runtime = await ModelRuntime.create({ authPath });
+
+		runtime.registerProvider(providerId, toProviderConfig(definition));
+
+		expect(runtime.getModel(providerId, "qwen")?.compat).toMatchObject({
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
 		});
 	});
 

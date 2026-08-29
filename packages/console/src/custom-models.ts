@@ -164,14 +164,6 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 		name: definition.name,
 		baseUrl: definition.baseUrl,
 		api: "openai-completions" as const,
-		compat: {
-			supportsStore: false,
-			supportsDeveloperRole: false,
-			supportsReasoningEffort: definition.reasoning,
-			supportsStrictMode: false,
-			supportsOpenAIGrammarTools: false,
-			maxTokensField: "max_tokens" as const,
-		},
 		models: [
 			{
 				id: definition.modelId,
@@ -192,6 +184,14 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: definition.contextWindow,
 				maxTokens: definition.maxTokens,
+				compat: {
+					supportsStore: false,
+					supportsDeveloperRole: false,
+					supportsReasoningEffort: definition.reasoning,
+					supportsStrictMode: false,
+					supportsOpenAIGrammarTools: false,
+					maxTokensField: "max_tokens" as const,
+				},
 			},
 		],
 	};
