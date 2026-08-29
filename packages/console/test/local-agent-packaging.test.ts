@@ -33,6 +33,7 @@ describe("Windows Electron local agent packaging", () => {
 		expect(buildScript).toContain("--source-ai-dist $LocalAiDist --asar $PackagedAsar");
 		expect(buildScript).not.toContain("npm.cmd install --prefix");
 		expect(buildScript).not.toContain("Copy-Item -LiteralPath $ResolvedExtractedAiRoot");
+		expect(buildScript).toContain("$env:RUNNER_TEMP");
 		expect(buildScript).toContain("[IO.Path]::GetPathRoot($ShortTempRoot), $InstalledVolumeRoot");
 		expect(buildScript).toContain("for ($Attempt = 0; $Attempt -lt 16 -and -not $ReplacementAiRoot; $Attempt++)");
 		expect(buildScript).toContain("New-Item -ItemType Directory -Path $CandidateAiRoot -ErrorAction Stop");

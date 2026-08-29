@@ -258,8 +258,17 @@ try {
 
 	$InstalledVolumeRoot = [IO.Path]::GetPathRoot($ResolvedInstalledAgentRoot)
 	$ShortTempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+	if ($env:RUNNER_TEMP) {
+		$RunnerTempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+		if (
+			(Test-Path -LiteralPath $RunnerTempRoot -PathType Container) -and
+			[String]::Equals([IO.Path]::GetPathRoot($RunnerTempRoot), $InstalledVolumeRoot, [StringComparison]::OrdinalIgnoreCase)
+		) {
+			$ShortTempRoot = $RunnerTempRoot
+		}
+	}
 	if (-not [String]::Equals([IO.Path]::GetPathRoot($ShortTempRoot), $InstalledVolumeRoot, [StringComparison]::OrdinalIgnoreCase)) {
-		throw "系统临时目录与 Electron 暂存目录不在同一卷，无法安全原子替换本地 pi-ai"
+		throw "系统与 Runner 临时目录均不在 Electron 暂存卷，无法安全原子替换本地 pi-ai"
 	}
 	$ResolvedShortTempRoot = (Resolve-Path -LiteralPath $ShortTempRoot).Path
 	Assert-PathWithin $InstalledVolumeRoot $ResolvedShortTempRoot "pi-ai 同盘短暂存根目录" | Out-Null
