@@ -87,6 +87,7 @@ describe("custom model configuration", () => {
 					compat: {
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: true,
+						thinkingFormat: "qwen-chat-template",
 						supportsOpenAIGrammarTools: false,
 					},
 				},
@@ -110,7 +111,20 @@ describe("custom model configuration", () => {
 		expect(runtime.getModel(providerId, "qwen")?.compat).toMatchObject({
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: true,
+			thinkingFormat: "qwen-chat-template",
 		});
+	});
+
+	it("keeps non-Qwen reasoning models on generic OpenAI reasoning parameters", () => {
+		const definition = normalizeCustomModel(createCustomProviderId("generic-reasoning"), {
+			name: "Generic reasoning",
+			baseUrl: "http://127.0.0.1:8000/v1",
+			modelId: "deepseek-reasoner",
+			reasoning: true,
+		});
+
+		const config = toProviderConfig(definition);
+		expect(config.models[0]?.compat).not.toHaveProperty("thinkingFormat");
 	});
 
 	it("loads version 1 definitions with reasoning disabled until the user opts in", () => {

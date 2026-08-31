@@ -512,9 +512,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						const delta = deltaFields[foundReasoningField];
 						if (typeof delta === "string" && delta.length > 0) {
 							const thinkingSignature =
-								model.provider === "opencode-go" && foundReasoningField === "reasoning"
-									? "reasoning_content"
-									: foundReasoningField;
+								compat.thinkingFormat === "qwen-chat-template"
+									? "reasoning"
+									: model.provider === "opencode-go" && foundReasoningField === "reasoning"
+										? "reasoning_content"
+										: foundReasoningField;
 							const block = ensureThinkingBlock(thinkingSignature);
 							block.thinking += delta;
 							stream.push({
@@ -792,10 +794,20 @@ function buildParams(
 			}
 		}
 	} else if (compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
-		(params as any).chat_template_kwargs = {
+		const qwenParams = params as Omit<typeof params, "reasoning_effort"> & {
+			chat_template_kwargs?: { enable_thinking: boolean; preserve_thinking: boolean };
+			reasoning_effort?: string;
+		};
+		qwenParams.chat_template_kwargs = {
 			enable_thinking: !!options?.reasoningEffort,
 			preserve_thinking: true,
 		};
+		if (options?.reasoningEffort && compat.supportsReasoningEffort) {
+			const effort = model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort;
+			if (typeof effort === "string") {
+				qwenParams.reasoning_effort = effort;
+			}
+		}
 	} else if (compat.thinkingFormat === "chat-template" && model.reasoning) {
 		const chatTemplateKwargs = buildChatTemplateValues(model, options, compat.chatTemplateKwargs);
 		if (chatTemplateKwargs) {

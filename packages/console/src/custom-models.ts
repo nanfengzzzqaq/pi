@@ -158,6 +158,10 @@ export function removeCustomModel(filePath: string, providerId: string): boolean
 	return true;
 }
 
+function usesQwenChatTemplate(modelId: string): boolean {
+	return /(^|[/_.-])qwen(?=$|[/_.-]|\d)/iu.test(modelId);
+}
+
 export function toProviderConfig(definition: CustomModelDefinition) {
 	const input: ("text" | "image")[] = definition.vision ? ["text", "image"] : ["text"];
 	return {
@@ -188,6 +192,9 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 					supportsStore: false,
 					supportsDeveloperRole: false,
 					supportsReasoningEffort: definition.reasoning,
+					...(definition.reasoning && usesQwenChatTemplate(definition.modelId)
+						? { thinkingFormat: "qwen-chat-template" as const }
+						: {}),
 					supportsStrictMode: false,
 					supportsOpenAIGrammarTools: false,
 					maxTokensField: "max_tokens" as const,

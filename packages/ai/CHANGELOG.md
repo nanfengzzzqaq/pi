@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Fixed local Qwen Chat Completions replay to preserve historical reasoning and send the selected reasoning effort alongside Qwen chat-template controls.
 - Added `deepseek-v4-pro-0813` to the Qwen Token Plan Individual catalog ([#8194](https://github.com/earendil-works/pi/issues/8194)).
 - Fixed Amazon Bedrock `after_provider_response`/`onResponse` to forward the raw response headers instead of only the synthesized request id header ([#8234](https://github.com/earendil-works/pi/issues/8234)).
 - Fixed Kimi OpenAI-compatible usage reporting so top-level `cached_tokens` count as cache reads instead of normal input tokens ([#8075](https://github.com/earendil-works/pi/issues/8075)).

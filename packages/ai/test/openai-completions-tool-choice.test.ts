@@ -1249,6 +1249,75 @@ describe("openai-completions tool_choice", () => {
 		]);
 	});
 
+	it("normalizes local Qwen reasoning_content to reasoning for multi-turn replay", async () => {
+		mockState.chunks = [
+			{
+				id: "chatcmpl-qwen-reasoning",
+				choices: [
+					{
+						delta: { content: "answer", reasoning_content: "prior reasoning" },
+						finish_reason: "stop",
+					},
+				],
+			},
+		];
+
+		const model = {
+			...localOpenAICompletionsModel,
+			id: "Qwen/Qwen3.8-27B-FP8",
+			name: "Qwen3.8 via vLLM",
+			thinkingLevelMap: { low: "low", medium: "medium", xhigh: "xhigh" },
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				supportsReasoningEffort: true,
+			},
+		} satisfies Model<"openai-completions">;
+		const userMessage = { role: "user" as const, content: "First", timestamp: Date.now() };
+		const response = await streamSimple(
+			model,
+			{ messages: [userMessage] },
+			{ apiKey: "test", reasoning: "low" },
+		).result();
+
+		expect(response.content).toContainEqual({
+			type: "thinking",
+			thinking: "prior reasoning",
+			thinkingSignature: "reasoning",
+		});
+
+		mockState.chunks = [
+			{
+				id: "chatcmpl-qwen-follow-up",
+				choices: [{ delta: {}, finish_reason: "stop" }],
+			},
+		];
+		let payload: unknown;
+		await streamSimple(
+			model,
+			{
+				messages: [userMessage, response, { role: "user", content: "Continue", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "test",
+				reasoning: "low",
+				onPayload: (params: unknown) => {
+					payload = params;
+				},
+			},
+		).result();
+
+		const params = (payload ?? mockState.lastParams) as {
+			messages?: Array<Record<string, unknown>>;
+			chat_template_kwargs?: Record<string, unknown>;
+			reasoning_effort?: string;
+		};
+		const replayedAssistant = params.messages?.find((message) => message.role === "assistant");
+		expect(replayedAssistant).toMatchObject({ content: "answer", reasoning: "prior reasoning" });
+		expect(replayedAssistant).not.toHaveProperty("reasoning_content");
+		expect(params.chat_template_kwargs).toEqual({ enable_thinking: true, preserve_thinking: true });
+		expect(params.reasoning_effort).toBe("low");
+	});
+
 	it("replays OpenCode Go reasoning thinking blocks as reasoning_content", () => {
 		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
 		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
@@ -1724,6 +1793,29 @@ describe("openai-completions tool_choice", () => {
 				preserve_thinking: true,
 			});
 			expect(params.reasoning_effort).toBeUndefined();
+		}
+	});
+
+	it("sends mapped reasoning effort with Qwen chat template kwargs", async () => {
+		const model = {
+			...localOpenAICompletionsModel,
+			id: "Qwen/Qwen3.8-27B-FP8",
+			name: "Qwen3.8 via vLLM",
+			thinkingLevelMap: { low: "low", medium: "medium", xhigh: "xhigh" },
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				supportsReasoningEffort: true,
+			},
+		} satisfies Model<"openai-completions">;
+
+		for (const reasoning of ["low", "medium", "xhigh"] as const) {
+			const params = await captureSimpleParams(model, reasoning);
+
+			expect(params.chat_template_kwargs).toEqual({
+				enable_thinking: true,
+				preserve_thinking: true,
+			});
+			expect(params.reasoning_effort).toBe(reasoning);
 		}
 	});
 
