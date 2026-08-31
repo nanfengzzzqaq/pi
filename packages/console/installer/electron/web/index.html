@@ -82,11 +82,12 @@
 			<section id="catalog-view" class="catalog-view" hidden>
 				<div class="catalog-shell">
 					<div class="catalog-heading-row">
-						<div>
+						<div class="catalog-heading-copy">
+							<span class="catalog-eyebrow">Capability library</span>
 							<h1 id="catalog-title">工具</h1>
 							<p id="catalog-subtitle">按需安装本地能力，未命中任务时不会把工具定义放入模型上下文。</p>
 						</div>
-						<button id="catalog-close-btn" class="secondary-btn" type="button">返回对话</button>
+						<button id="catalog-close-btn" class="secondary-btn" type="button"><span aria-hidden="true">←</span> 返回对话</button>
 					</div>
 					<div class="catalog-toolbar">
 						<div class="catalog-tabs" role="tablist">
@@ -312,16 +313,16 @@
 
 					<nav class="workbench-tabs" aria-label="侧栏视图">
 						<button id="side-tab-activity" class="workbench-tab" type="button" title="查看智能体执行活动">
-							<span class="workbench-tab-icon">◉</span><span>活动</span>
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M10 6.5v3.8l2.6 1.6"></path></svg></span><span>活动</span>
 						</button>
 						<button id="side-tab-review" class="workbench-tab" type="button" title="审查工作区代码差异">
-							<span class="workbench-tab-icon">☰</span><span>变更</span>
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 4.5h10M5 10h6M5 15.5h8"></path><circle cx="15" cy="10" r="1.5"></circle></svg></span><span>变更</span>
 						</button>
 						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
-							<span class="workbench-tab-icon">&gt;_</span><span>终端</span>
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 6 3.5 4-3.5 4M10.5 14h5"></path></svg></span><span>终端</span>
 						</button>
 						<button id="side-tab-browser" class="workbench-tab" type="button" title="打开客户端独立浏览器">
-							<span class="workbench-tab-icon">◎</span><span>浏览器</span>
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg></span><span>浏览器</span>
 						</button>
 					</nav>
 				</section>
@@ -368,15 +369,19 @@
 	<div id="settings-modal" class="modal" hidden>
 		<div class="modal-body settings-body">
 			<div class="modal-header">
-				<span class="modal-title">设置</span>
+				<div class="settings-title-group">
+					<span class="modal-title">设置</span>
+					<span class="settings-title-hint">工作环境与模型服务</span>
+				</div>
 				<button id="settings-close" class="icon-btn" title="关闭">×</button>
 			</div>
 			<div class="settings-layout">
 				<nav class="settings-nav" aria-label="设置分类">
-					<button class="settings-nav-btn active" type="button" data-settings-target="general">常规</button>
-					<button class="settings-nav-btn" type="button" data-settings-target="models">模型服务</button>
-					<button class="settings-nav-btn" type="button" data-settings-target="updates">更新</button>
-					<button class="settings-nav-btn" type="button" data-settings-target="advanced">高级</button>
+					<div class="settings-nav-label">偏好设置</div>
+					<button class="settings-nav-btn active" type="button" data-settings-target="general"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4h4v4H4zM12 4h4v4h-4zM4 12h4v4H4zM12 12h4v4h-4z"></path></svg><span>常规</span></button>
+					<button class="settings-nav-btn" type="button" data-settings-target="models"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="10" r="2"></circle><circle cx="15" cy="5" r="2"></circle><circle cx="15" cy="15" r="2"></circle><path d="m7 9 6-3M7 11l6 3"></path></svg><span>模型服务</span></button>
+					<button class="settings-nav-btn" type="button" data-settings-target="updates"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.5v9M6.5 9l3.5 3.5L13.5 9M4 16h12"></path></svg><span>更新</span></button>
+					<button class="settings-nav-btn" type="button" data-settings-target="advanced"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M4 10h12M4 15h12"></path><circle cx="8" cy="5" r="1.5"></circle><circle cx="13" cy="10" r="1.5"></circle><circle cx="7" cy="15" r="1.5"></circle></svg><span>高级</span></button>
 				</nav>
 				<div class="settings-content">
 			<section class="modal-section settings-page" data-settings-page="general">
