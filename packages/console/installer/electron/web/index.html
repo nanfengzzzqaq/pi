@@ -149,6 +149,7 @@
 								<option value="xhigh">xhigh</option>
 								<option value="max">max</option>
 							</select>
+							<button id="model-manage-btn" class="composer-mini-btn" type="button" title="管理模型服务">管理模型</button>
 							<button id="context-btn" class="context-ring-btn" title="上下文使用量">
 								<svg viewBox="0 0 36 36" class="context-ring">
 									<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
@@ -157,7 +158,10 @@
 								<span id="context-ring-text" class="context-ring-text">–</span>
 							</button>
 							<span class="composer-spacer"></span>
-							<span id="context-info" class="context-info" title="已启用能力"></span>
+							<div class="capability-menu">
+								<button id="context-info" class="context-info" type="button" title="查看本轮可用能力">能力加载中…</button>
+								<div id="capabilities-popover" class="capabilities-popover" hidden></div>
+							</div>
 						</div>
 					</footer>
 				</section>
@@ -192,6 +196,8 @@
 						</div>
 						<div class="office-preview-actions">
 							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异（git_diff）">查看差异</button>
+							<button id="code-editor-preview" class="secondary-btn small" type="button" title="预览 Markdown" hidden>预览</button>
+							<button id="code-editor-focus" class="secondary-btn small" type="button" title="进入专注模式">专注</button>
 							<button id="code-editor-save" class="primary-btn small" type="button" title="保存当前文件（code_save）" disabled>保存</button>
 							<button id="code-editor-close" class="icon-btn small" type="button" title="关闭代码编辑器">×</button>
 						</div>
@@ -200,11 +206,35 @@
 					<div id="code-editor-stage" class="code-editor-stage">
 						<div class="code-editor-placeholder">安装“代码开发”插件后，可在这里直接编辑工作区代码。</div>
 					</div>
+					<div id="code-editor-markdown-preview" class="code-editor-markdown-preview text" hidden></div>
 				</section>
 
 				<!-- 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换，原生浏览器只在浏览器标签激活时显示） -->
 				<div id="workbench-side-resizer" class="office-preview-resizer" title="拖动调整侧栏宽度" hidden></div>
 				<section id="workbench-side" class="workbench-side" hidden>
+					<div id="activity-pane" class="workbench-pane" hidden>
+						<header class="workbench-pane-header">
+							<div class="workbench-pane-heading">
+								<span class="office-preview-kicker">执行面板</span>
+								<strong class="office-preview-title">智能体活动</strong>
+								<span id="activity-status" class="office-preview-status">空闲</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="activity-clear" class="icon-btn small" type="button" title="清空活动记录">⌫</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台（Ctrl+Alt+B）">×</button>
+							</div>
+						</header>
+						<div class="activity-overview">
+							<div class="activity-stat"><span>状态</span><strong id="activity-state-value">空闲</strong></div>
+							<div class="activity-stat"><span>步骤</span><strong id="activity-step-value">0</strong></div>
+							<div class="activity-stat"><span>产物</span><strong id="activity-artifact-value">0</strong></div>
+						</div>
+						<div id="activity-timeline" class="activity-timeline">
+							<div class="activity-empty">智能体开始工作后，这里会按时间显示工具调用、结果、错误和生成文件。</div>
+						</div>
+					</div>
+
 					<div id="review-pane" class="workbench-pane" hidden>
 						<header class="workbench-pane-header">
 							<div class="workbench-pane-heading">
@@ -264,20 +294,28 @@
 							<input id="side-browser-address" type="text" aria-label="浏览器地址" placeholder="输入网址或搜索内容" autocomplete="off">
 							<button id="side-browser-go" class="secondary-btn small" type="button">打开</button>
 						</div>
+						<div id="side-browser-loading" class="agent-browser-loading" hidden></div>
 						<div class="agent-browser-contextbar">
 							<button id="side-browser-pick" class="secondary-btn small" type="button" title="在网页中点选元素，并把元素信息加入当前输入框">选取元素</button>
 							<button id="side-browser-screenshot" class="secondary-btn small" type="button" title="保存当前网页截图">保存截图</button>
-							<button id="side-browser-devtools" class="secondary-btn small" type="button" title="打开浏览器开发者工具">开发者工具</button>
+							<details class="browser-tools-menu">
+								<summary>更多</summary>
+								<button id="side-browser-devtools" type="button" title="打开浏览器开发者工具">开发者工具</button>
+							</details>
 							<span id="side-browser-hint" class="agent-browser-hint">智能体只操作此独立浏览器，不影响你的系统浏览器。</span>
 						</div>
+						<div id="side-browser-capture" class="browser-capture" hidden></div>
 						<div id="side-browser-stage" class="agent-browser-stage">
 							<div class="agent-browser-placeholder">浏览器画面将在这里显示；关闭侧栏或最小化客户端不会中断智能体任务。</div>
 						</div>
 					</div>
 
 					<nav class="workbench-tabs" aria-label="侧栏视图">
+						<button id="side-tab-activity" class="workbench-tab" type="button" title="查看智能体执行活动">
+							<span class="workbench-tab-icon">◉</span><span>活动</span>
+						</button>
 						<button id="side-tab-review" class="workbench-tab" type="button" title="审查工作区代码差异">
-							<span class="workbench-tab-icon">☰</span><span>审查</span>
+							<span class="workbench-tab-icon">☰</span><span>变更</span>
 						</button>
 						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
 							<span class="workbench-tab-icon">&gt;_</span><span>终端</span>
@@ -328,13 +366,20 @@
 	</div>
 
 	<div id="settings-modal" class="modal" hidden>
-		<div class="modal-body">
+		<div class="modal-body settings-body">
 			<div class="modal-header">
 				<span class="modal-title">设置</span>
 				<button id="settings-close" class="icon-btn" title="关闭">×</button>
 			</div>
-
-			<section class="modal-section">
+			<div class="settings-layout">
+				<nav class="settings-nav" aria-label="设置分类">
+					<button class="settings-nav-btn active" type="button" data-settings-target="general">常规</button>
+					<button class="settings-nav-btn" type="button" data-settings-target="models">模型服务</button>
+					<button class="settings-nav-btn" type="button" data-settings-target="updates">更新</button>
+					<button class="settings-nav-btn" type="button" data-settings-target="advanced">高级</button>
+				</nav>
+				<div class="settings-content">
+			<section class="modal-section settings-page" data-settings-page="general">
 				<h3>工作区</h3>
 				<p class="modal-hint">会话的工作目录：Pi 读写文件、运行命令都在这里进行。设置后新会话直接在此目录工作；留空则使用默认工作区。也可在左侧「文件」面板浏览到目标目录后点「设为工作区」。</p>
 				<div class="key-add-row">
@@ -345,7 +390,7 @@
 				<div class="workspace-current" id="workspace-current">当前：未设置（默认工作区）</div>
 			</section>
 
-			<section class="modal-section">
+			<section class="modal-section settings-page" data-settings-page="advanced" hidden>
 				<h3>Agent 数据位置</h3>
 				<p class="modal-hint">保存对话、模型设置、能力包、技能和已安装工具。迁移会完整复制到新目录并重启客户端；旧目录保留作备份，不影响你单独设置的工作区。</p>
 				<div class="key-add-row">
@@ -356,9 +401,9 @@
 				<div class="workspace-current" id="storage-current">当前：读取中…</div>
 			</section>
 
-			<section class="modal-section">
+			<section class="modal-section settings-page" data-settings-page="models" hidden>
 				<h3>模型服务</h3>
-				<p class="modal-hint">可以使用 Codex 订阅登录，也可以添加模型厂商的 API Key；凭据只保存在当前 Pi 客户端的数据目录。</p>
+				<p class="modal-hint">先连接服务，再读取模型并确认能力。凭据只保存在当前 Pi 客户端的数据目录。</p>
 				<div class="key-row" id="codex-oauth-row">
 					<span class="key-name">Codex 订阅登录（openai-codex-oauth）</span>
 					<span class="key-masked" id="codex-oauth-status">读取中…</span>
@@ -372,15 +417,40 @@
 					<button id="key-add-btn">添加</button>
 				</div>
 				<div id="key-list" class="key-list"></div>
+				<div class="settings-subheading">自定义 OpenAI 兼容模型</div>
+				<p class="modal-hint">适用于 vLLM、Ollama、LM Studio 和兼容代理。建议按“连接地址 → 读取模型 → 设置能力 → 保存”的顺序完成。</p>
+				<input type="hidden" id="custom-model-provider-id">
+				<div class="key-add-row model-form-row model-form-two">
+					<input type="text" id="custom-model-name" placeholder="服务名称，例如 本地 Qwen" autocomplete="off">
+					<input type="url" id="custom-model-base-url" placeholder="API 地址，例如 https://ai.example.com/v1" autocomplete="off">
+				</div>
+				<div class="key-add-row model-form-row model-form-three">
+					<input type="password" id="custom-model-api-key" placeholder="API Key（编辑时留空则不变）" autocomplete="off">
+					<input type="text" id="custom-model-id" list="custom-model-options" placeholder="模型 ID" autocomplete="off">
+					<datalist id="custom-model-options"></datalist>
+					<button id="custom-model-discover-btn" class="secondary-btn" type="button">测试并读取模型</button>
+				</div>
+				<div id="custom-model-connection-state" class="model-connection-state">尚未测试连接</div>
+				<div class="key-add-row model-capabilities-row">
+					<input type="number" id="custom-model-context" min="1" step="1" value="128000" placeholder="上下文长度">
+					<input type="number" id="custom-model-max-tokens" min="1" step="1" value="16384" placeholder="最大输出长度">
+					<label class="modal-hint"><input type="checkbox" id="custom-model-reasoning"> 支持推理等级（low / medium / xhigh）</label>
+					<label class="modal-hint"><input type="checkbox" id="custom-model-vision"> 支持图片</label>
+				</div>
+				<div class="model-form-actions">
+					<button id="custom-model-save-btn" type="button">添加模型</button>
+					<button id="custom-model-cancel-btn" class="secondary-btn" type="button" hidden>取消编辑</button>
+				</div>
+				<div id="custom-model-list" class="key-list"></div>
 			</section>
 
-			<section class="modal-section">
+			<section class="modal-section settings-page" data-settings-page="advanced" hidden>
 				<h3>MCP 服务</h3>
-				<p class="modal-hint">MCP（Model Context Protocol）服务将在后续版本开放配置。当前为占位设计，能力上下文面板已预留入口。</p>
-				<div class="context-empty">暂无 MCP 服务可配置</div>
+				<p class="modal-hint">MCP（Model Context Protocol）服务配置仍在开发中。</p>
+				<div class="context-empty">实验功能尚未开放</div>
 			</section>
 
-			<section class="modal-section">
+			<section class="modal-section settings-page" data-settings-page="updates" hidden>
 				<h3>关于与更新</h3>
 				<div class="update-row">
 					<span id="app-version">版本 …</span>
@@ -392,6 +462,11 @@
 				<div class="download-bar-wrap" id="update-progress" hidden>
 					<div class="download-bar" id="update-progress-bar"></div>
 				</div>
+				<p class="modal-hint">更新包下载完成后会校验并自动重启客户端。</p>
+			</section>
+
+			<section class="modal-section settings-page" data-settings-page="advanced" hidden>
+				<h3>更新凭据</h3>
 				<p class="modal-hint" id="github-token-hint">会自动使用本机已有的 GitHub 登录；只有尚未登录时才需要填写有仓库读取权限的 Token。</p>
 				<div class="key-add-row">
 					<input type="password" id="github-token-input" placeholder="GitHub Token（备用，可选）" autocomplete="off">
@@ -399,6 +474,8 @@
 					<button id="github-token-clear-btn" hidden>清除</button>
 				</div>
 			</section>
+				</div>
+			</div>
 		</div>
 	</div>
 

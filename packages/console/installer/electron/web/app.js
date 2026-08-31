@@ -53,6 +53,7 @@ const customModelApiKeyEl = $("custom-model-api-key");
 const customModelIdEl = $("custom-model-id");
 const customModelOptionsEl = $("custom-model-options");
 const customModelDiscoverBtnEl = $("custom-model-discover-btn");
+const customModelConnectionStateEl = $("custom-model-connection-state");
 const customModelContextEl = $("custom-model-context");
 const customModelMaxTokensEl = $("custom-model-max-tokens");
 const customModelReasoningEl = $("custom-model-reasoning");
@@ -107,6 +108,8 @@ const previewContentEl = $("preview-content");
 const previewCloseEl = $("preview-close");
 const previewAttachBtnEl = $("preview-attach");
 const contextInfoEl = $("context-info");
+const capabilitiesPopoverEl = $("capabilities-popover");
+const modelManageBtnEl = $("model-manage-btn");
 const toolsNavBtnEl = $("tools-nav-btn");
 const skillsNavBtnEl = $("skills-nav-btn");
 const catalogViewEl = $("catalog-view");
@@ -146,10 +149,13 @@ const agentBrowserPickEl = $("side-browser-pick");
 const agentBrowserScreenshotEl = $("side-browser-screenshot");
 const agentBrowserDevtoolsEl = $("side-browser-devtools");
 const agentBrowserHintEl = $("side-browser-hint");
+const agentBrowserLoadingEl = $("side-browser-loading");
+const agentBrowserCaptureEl = $("side-browser-capture");
 const workbenchSideEl = $("workbench-side");
 const workbenchSideResizerEl = $("workbench-side-resizer");
 const workbenchCloseButtons = document.querySelectorAll("[data-workbench-close]");
 const workbenchMaximizeButtons = document.querySelectorAll("[data-workbench-maximize]");
+const sideTabActivityEl = $("side-tab-activity");
 const sideTabReviewEl = $("side-tab-review");
 const sideTabTerminalEl = $("side-tab-terminal");
 const sideTabBrowserEl = $("side-tab-browser");
@@ -165,6 +171,13 @@ const terminalStatusEl = $("terminal-status");
 const terminalOutputEl = $("terminal-output");
 const terminalCopyEl = $("terminal-copy");
 const terminalClearEl = $("terminal-clear");
+const activityPaneEl = $("activity-pane");
+const activityStatusEl = $("activity-status");
+const activityStateValueEl = $("activity-state-value");
+const activityStepValueEl = $("activity-step-value");
+const activityArtifactValueEl = $("activity-artifact-value");
+const activityTimelineEl = $("activity-timeline");
+const activityClearEl = $("activity-clear");
 const updateOverlayEl = $("update-overlay");
 const codeEditorPaneEl = $("code-editor-pane");
 const codeEditorResizerEl = $("code-editor-resizer");
@@ -173,8 +186,13 @@ const codeEditorStatusEl = $("code-editor-status");
 const codeEditorPathEl = $("code-editor-path");
 const codeEditorStageEl = $("code-editor-stage");
 const codeEditorDiffEl = $("code-editor-diff");
+const codeEditorPreviewEl = $("code-editor-preview");
+const codeEditorFocusEl = $("code-editor-focus");
+const codeEditorMarkdownPreviewEl = $("code-editor-markdown-preview");
 const codeEditorSaveEl = $("code-editor-save");
 const codeEditorCloseEl = $("code-editor-close");
+const settingsNavButtons = document.querySelectorAll("[data-settings-target]");
+const settingsPages = document.querySelectorAll("[data-settings-page]");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
@@ -203,6 +221,7 @@ let monacoLoading = null;
 let codeEditor = null;
 let codeEditorFile = null;
 let codeEditorDirty = false;
+let codeEditorPreviewing = false;
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
 const CODE_EDITOR_WIDTH_KEY = "pi-console-code-editor-width";
@@ -439,15 +458,25 @@ const WORKBENCH_SIDE_WIDTH_KEY = "pi-console-workbench-side-width";
 /** 用户手动关闭浏览器后，智能体导航新页面在此时长内不自动重开（毫秒）。 */
 const SIDE_BROWSER_AUTO_REOPEN_MS = 60_000;
 
-let activeSideTab = null; // "review" | "terminal" | "browser" | null（面板关闭）
+let activeSideTab = null; // "activity" | "review" | "terminal" | "browser" | null（面板关闭）
 let browserIntent = false; // 用户或智能体希望浏览器保持可用
 let browserUserClosedAt = 0;
 let sideBrowserLastUrl = "";
 /** office 预览 / 代码编辑器打开时侧栏暂时收起，关闭后恢复。 */
 let sidePanelSuppressed = false;
 
-const sideTabButtons = { review: sideTabReviewEl, terminal: sideTabTerminalEl, browser: sideTabBrowserEl };
-const sideTabPanes = { review: reviewPaneEl, terminal: terminalPaneEl, browser: agentBrowserPaneEl };
+const sideTabButtons = {
+	activity: sideTabActivityEl,
+	review: sideTabReviewEl,
+	terminal: sideTabTerminalEl,
+	browser: sideTabBrowserEl,
+};
+const sideTabPanes = {
+	activity: activityPaneEl,
+	review: reviewPaneEl,
+	terminal: terminalPaneEl,
+	browser: agentBrowserPaneEl,
+};
 
 /** 右侧工作台此刻是否展开显示。 */
 function sidePanelVisible() {
@@ -557,6 +586,10 @@ function restoreSidePanel() {
 	syncBrowserNativeVisibility();
 }
 
+sideTabActivityEl.addEventListener("click", () => {
+	if (activeSideTab === "activity" && sidePanelVisible()) closeSidePanel();
+	else showSidePanel("activity");
+});
 sideTabReviewEl.addEventListener("click", () => {
 	if (activeSideTab === "review" && sidePanelVisible()) closeSidePanel();
 	else showSidePanel("review");
@@ -578,7 +611,7 @@ for (const button of workbenchCloseButtons) button.addEventListener("click", () 
 for (const button of workbenchMaximizeButtons) button.addEventListener("click", toggleSidePanelMaximized);
 workbenchBtnEl.addEventListener("click", () => {
 	if (sidePanelVisible()) closeSidePanel();
-	else showSidePanel(activeSideTab || "terminal");
+	else showSidePanel(activeSideTab || "activity");
 });
 
 workbenchSideResizerEl.addEventListener("pointerdown", (event) => {
@@ -622,6 +655,8 @@ function renderAgentBrowserState(state) {
 	agentBrowserTitleEl.textContent = state.title || "独立浏览器";
 	agentBrowserTitleEl.title = state.url || "";
 	agentBrowserStatusEl.textContent = state.status || (state.loading ? "正在加载网页" : "网页已加载");
+	agentBrowserLoadingEl.hidden = !state.loading;
+	agentBrowserStageEl.classList.toggle("loading", state.loading === true);
 	agentBrowserBackEl.disabled = !state.canGoBack;
 	agentBrowserForwardEl.disabled = !state.canGoForward;
 	if (document.activeElement !== agentBrowserAddressEl) agentBrowserAddressEl.value = state.url || "";
@@ -738,6 +773,12 @@ agentBrowserScreenshotEl.addEventListener("click", async () => {
 		const saved = await window.piDesktop.browserScreenshot();
 		if (saved?.path) {
 			showInfo(`网页截图已保存：${saved.path}`);
+			agentBrowserCaptureEl.hidden = false;
+			agentBrowserCaptureEl.innerHTML = '<span class="browser-capture-label">最新截图</span><button type="button"></button>';
+			const captureButton = agentBrowserCaptureEl.querySelector("button");
+			captureButton.textContent = saved.path;
+			captureButton.title = "点击复制截图路径";
+			captureButton.addEventListener("click", () => copyTextToClipboard(saved.path));
 			if (currentFsPath) void loadFsDir(currentFsPath);
 		}
 	} catch (error) {
@@ -785,7 +826,7 @@ document.addEventListener("keydown", (event) => {
 	if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase("en-US") === "b") {
 		event.preventDefault();
 		if (sidePanelVisible()) closeSidePanel();
-		else showSidePanel(activeSideTab || "terminal");
+		else showSidePanel(activeSideTab || "activity");
 		return;
 	}
 	if (event.key === "Escape" && sidePanelVisible()) {
@@ -873,6 +914,24 @@ function setCodeEditorDirty(dirty) {
 	codeEditorStatusEl.textContent = dirty ? "有未保存修改" : "已保存";
 }
 
+function setCodeEditorPreview(visible) {
+	if (!codeEditor || !codeEditorFile) return;
+	codeEditorPreviewing = visible && /\.mdx?$/i.test(codeEditorFile.path);
+	codeEditorStageEl.hidden = codeEditorPreviewing;
+	codeEditorMarkdownPreviewEl.hidden = !codeEditorPreviewing;
+	codeEditorPreviewEl.classList.toggle("active", codeEditorPreviewing);
+	codeEditorPreviewEl.textContent = codeEditorPreviewing ? "编辑" : "预览";
+	if (codeEditorPreviewing) renderMarkdownInto(codeEditorMarkdownPreviewEl, codeEditor.getValue());
+	else requestAnimationFrame(() => codeEditor.layout());
+}
+
+function setCodeEditorFocus(focused) {
+	codeEditorPaneEl.classList.toggle("focus-mode", focused);
+	codeEditorFocusEl.classList.toggle("active", focused);
+	codeEditorFocusEl.textContent = focused ? "退出专注" : "专注";
+	requestAnimationFrame(() => codeEditor?.layout());
+}
+
 async function openCodeEditor(path, name) {
 	if (!catalogCache) catalogCache = await api("/api/catalog");
 	const installed = catalogCache.tools?.some((tool) => tool.id === "code-development" && tool.installed);
@@ -890,6 +949,12 @@ async function openCodeEditor(path, name) {
 	codeEditorPathEl.textContent = path;
 	codeEditorPathEl.title = path;
 	codeEditorStatusEl.textContent = "正在读取…";
+	codeEditorPreviewing = false;
+	codeEditorStageEl.hidden = false;
+	codeEditorMarkdownPreviewEl.hidden = true;
+	codeEditorPreviewEl.hidden = !/\.mdx?$/i.test(path);
+	codeEditorPreviewEl.textContent = "预览";
+	codeEditorPreviewEl.classList.remove("active");
 	try {
 		const [monaco, file] = await Promise.all([ensureMonaco(), api(`/api/fs/text?path=${encodeURIComponent(path)}`)]);
 		codeEditor?.getModel()?.dispose();
@@ -908,7 +973,10 @@ async function openCodeEditor(path, name) {
 		codeEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveCodeEditor());
 		codeEditorFile = { path, name: name || path.split(/[\\/]/).pop(), sha256: file.sha256, encoding: file.encoding };
 		setCodeEditorDirty(false);
-		model.onDidChangeContent(() => setCodeEditorDirty(true));
+		model.onDidChangeContent(() => {
+			setCodeEditorDirty(true);
+			if (codeEditorPreviewing) renderMarkdownInto(codeEditorMarkdownPreviewEl, codeEditor.getValue());
+		});
 		codeEditor.focus();
 		return true;
 	} catch (error) {
@@ -949,6 +1017,8 @@ function closeCodeEditor() {
 	codeEditor = null;
 	codeEditorFile = null;
 	codeEditorDirty = false;
+	codeEditorPreviewing = false;
+	setCodeEditorFocus(false);
 	codeEditorPaneEl.hidden = true;
 	codeEditorResizerEl.hidden = true;
 	codeEditorStageEl.innerHTML = '<div class="code-editor-placeholder">选择代码文件开始编辑</div>';
@@ -964,6 +1034,8 @@ async function showRepositoryDiff() {
 codeEditorSaveEl.addEventListener("click", () => void saveCodeEditor());
 codeEditorCloseEl.addEventListener("click", closeCodeEditor);
 codeEditorDiffEl.addEventListener("click", () => void showRepositoryDiff());
+codeEditorPreviewEl.addEventListener("click", () => setCodeEditorPreview(!codeEditorPreviewing));
+codeEditorFocusEl.addEventListener("click", () => setCodeEditorFocus(!codeEditorPaneEl.classList.contains("focus-mode")));
 codeEditorResizerEl.addEventListener("pointerdown", (event) => {
 	event.preventDefault();
 	codeEditorResizerEl.setPointerCapture(event.pointerId);
@@ -984,6 +1056,99 @@ if (window.ResizeObserver) new ResizeObserver(syncAgentBrowserBounds).observe(ag
 window.addEventListener("resize", syncAgentBrowserBounds);
 if (window.piDesktop?.onBrowserState) window.piDesktop.onBrowserState(renderAgentBrowserState);
 if (window.piDesktop?.browserState) void window.piDesktop.browserState().then(renderAgentBrowserState);
+
+// ---------------------------------------------------------------------------
+// 执行活动面板：展示可验证的工具事件、结果状态与生成文件，不展示隐藏思维。
+// ---------------------------------------------------------------------------
+
+const activityEntries = new Map();
+const activityArtifacts = new Set();
+
+function activityIcon(toolName) {
+	const name = String(toolName || "").toLocaleLowerCase("zh-CN");
+	if (/powershell|bash|terminal|命令/.test(name)) return ">_";
+	if (/browser|网页|浏览器/.test(name)) return "◎";
+	if (/file|office|文档|文件|code|代码/.test(name)) return "□";
+	if (/search|查找|搜索/.test(name)) return "⌕";
+	return "·";
+}
+
+function activityDetail(args) {
+	const text = terminalCommandText(args) || summarizeArgs(args).replace(/\s+/g, " ").trim();
+	return text.length > 140 ? `${text.slice(0, 140)}…` : text;
+}
+
+function updateActivityOverview(state) {
+	const runningCount = [...activityEntries.values()].filter((entry) => entry.item.classList.contains("running")).length;
+	const label = state || (runningCount > 0 ? "执行中" : activityEntries.size > 0 ? "已完成" : "空闲");
+	activityStatusEl.textContent = runningCount > 0 ? `${label} · ${runningCount} 项进行中` : label;
+	activityStateValueEl.textContent = label;
+	activityStepValueEl.textContent = String(activityEntries.size);
+	activityArtifactValueEl.textContent = String(activityArtifacts.size);
+	activityStateValueEl.dataset.state = runningCount > 0 ? "running" : label === "已完成" ? "done" : "idle";
+}
+
+function clearActivity() {
+	activityEntries.clear();
+	activityArtifacts.clear();
+	activityTimelineEl.innerHTML =
+		'<div class="activity-empty">智能体开始工作后，这里会按时间显示工具调用、结果、错误和生成文件。</div>';
+	updateActivityOverview("空闲");
+}
+
+function appendActivityEntry(toolCallId, toolName, args, status, { restored = false } = {}) {
+	if (!toolCallId || activityEntries.has(toolCallId)) return;
+	activityTimelineEl.querySelector(".activity-empty")?.remove();
+	const item = document.createElement("article");
+	item.className = `activity-item ${status === "running" ? "running" : "done"}`;
+	const marker = document.createElement("span");
+	marker.className = "activity-marker";
+	marker.textContent = activityIcon(toolName);
+	const main = document.createElement("div");
+	main.className = "activity-item-main";
+	const title = document.createElement("div");
+	title.className = "activity-item-title";
+	title.textContent = toolName;
+	const detail = document.createElement("div");
+	detail.className = "activity-item-detail";
+	detail.textContent = activityDetail(args) || (restored ? "历史执行记录" : "等待执行结果");
+	main.append(title, detail);
+	const state = document.createElement("span");
+	state.className = "activity-item-state";
+	state.textContent = status === "running" ? "运行中" : "成功";
+	item.append(marker, main, state);
+	activityTimelineEl.appendChild(item);
+	activityEntries.set(toolCallId, { item, state, startedAt: restored ? 0 : Date.now() });
+	updateActivityOverview(status === "running" ? "执行中" : undefined);
+}
+
+function updateActivityEntry(toolCallId, isError) {
+	const entry = activityEntries.get(toolCallId);
+	if (!entry) return;
+	entry.item.classList.remove("running", "done", "error");
+	entry.item.classList.add(isError ? "error" : "done");
+	const seconds = entry.startedAt > 0 ? Math.max(1, Math.round((Date.now() - entry.startedAt) / 1000)) : 0;
+	entry.state.textContent = `${isError ? "失败" : "成功"}${seconds ? ` · ${seconds}s` : ""}`;
+	updateActivityOverview();
+}
+
+function appendActivityArtifact(file) {
+	if (!file?.path || activityArtifacts.has(file.path)) return;
+	activityArtifacts.add(file.path);
+	activityTimelineEl.querySelector(".activity-empty")?.remove();
+	const item = document.createElement("button");
+	item.type = "button";
+	item.className = "activity-item artifact";
+	item.innerHTML =
+		'<span class="activity-marker">↗</span><span class="activity-item-main"><span class="activity-item-title"></span><span class="activity-item-detail"></span></span><span class="activity-item-state">打开</span>';
+	item.querySelector(".activity-item-title").textContent = file.name || file.path.split(/[\\/]/).pop();
+	item.querySelector(".activity-item-detail").textContent = file.path;
+	item.addEventListener("click", () => void openFilePreview(file.path, file.name, "artifact"));
+	activityTimelineEl.appendChild(item);
+	updateActivityOverview();
+}
+
+activityClearEl.addEventListener("click", clearActivity);
 
 // ---------------------------------------------------------------------------
 // 终端面板：实时显示智能体的本地命令执行（bash / powershell）
@@ -1094,16 +1259,16 @@ function clearTerminal() {
 /** 终端工具开始执行：记录条目并展示终端标签（不打断用户正在查看的其他标签）。 */
 function handleTerminalToolStart(event) {
 	appendTerminalEntry(event.toolCallId, event.toolName, event.args, "running");
-	if (!sidePanelVisible() && Date.now() - terminalAutoShowSuppressedAt >= 8000) showSidePanel("terminal");
-	else if (activeSideTab !== "terminal") {
-		if (Date.now() - terminalAutoShowSuppressedAt < 8000) sideTabTerminalEl.classList.add("activity");
-		else showSidePanel("terminal");
+	if (!sidePanelVisible() && Date.now() - terminalAutoShowSuppressedAt >= 8000) showSidePanel("activity");
+	else if (activeSideTab !== "activity") {
+		sideTabActivityEl.classList.add("activity");
+		sideTabTerminalEl.classList.add("activity");
 	}
 	updateTerminalStatus();
 }
 
 // 用户手动点击侧栏标签视为“我在看这里”：短期内终端工具不再自动切换标签
-for (const button of [sideTabReviewEl, sideTabTerminalEl, sideTabBrowserEl]) {
+for (const button of [sideTabActivityEl, sideTabReviewEl, sideTabTerminalEl, sideTabBrowserEl]) {
 	button.addEventListener("click", () => {
 		terminalAutoShowSuppressedAt = Date.now();
 	});
@@ -1280,6 +1445,7 @@ function syncThinkingOptions(availableLevels) {
 	for (const opt of thinkingSelectEl.options) {
 		const ok = !supported || supported.includes(opt.value);
 		opt.disabled = !ok;
+		opt.hidden = !ok;
 		opt.title = ok ? "" : "当前模型不支持此等级";
 	}
 	if (supported && !supported.includes(thinkingSelectEl.value)) {
@@ -1299,6 +1465,7 @@ function clearMessages() {
 function renderHistory(history) {
 	clearMessages();
 	clearTerminal();
+	clearActivity();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
 	let latestAssistant = null;
 	let pendingCapabilityTrace = null;
@@ -1326,6 +1493,7 @@ function renderHistory(history) {
 				for (const call of item.toolCalls) {
 					const block = appendToolBlock(call.id, call.displayName || call.name, call.args, "done");
 					container.addTool(block);
+					appendActivityEntry(call.id, call.displayName || call.name, call.args, "done", { restored: true });
 					const path = findDeliverableToolPath(call.args, ["output", "file", "path", "target", "destination"]);
 					if (path) container.addArtifactPath(path);
 					if (isTerminalToolName(call.name)) appendTerminalEntry(call.id, call.name, call.args, "done", { restored: true });
@@ -1356,6 +1524,13 @@ function renderHistory(history) {
 }
 
 function addCapabilitySelectionStep(container, event) {
+	appendActivityEntry(
+		event.stepId,
+		event.stepDisplayName || "查找可用能力（capability_search）",
+		{ 检查范围: (event.enabledCapabilities || []).map((item) => item.displayName) },
+		"done",
+		{ restored: true },
+	);
 	const block = appendToolBlock(
 		event.stepId,
 		event.stepDisplayName || "查找可用能力（capability_search）",
@@ -1369,15 +1544,8 @@ function addCapabilitySelectionStep(container, event) {
 	container.addTool(block);
 }
 
-function addModelUsageStep(container, usage, id) {
-	const block = appendToolBlock(
-		id,
-		"模型用量（model_usage）",
-		{ 统计来源: "模型服务商返回的本轮实际用量" },
-		"done",
-	);
-	updateToolBlock(block, false, formatModelUsage(usage));
-	container.addTool(block);
+function addModelUsageStep(container, usage) {
+	container.addUsage(usage);
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1906,7 @@ function handleEvent(event) {
 			const block = appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running");
 			block.dataset.startedAt = String(Date.now());
 			ensureAssistant().addTool(block);
+			appendActivityEntry(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running");
 			if (isTerminalToolName(event.toolName)) handleTerminalToolStart(event);
 			break;
 		}
@@ -1750,6 +1919,7 @@ function handleEvent(event) {
 		case "tool_execution_end": {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(event.toolCallId)}"]`);
 			if (block) updateToolBlock(block, event.isError, event.result);
+			updateActivityEntry(event.toolCallId, event.isError);
 			const toolCall = officeToolCalls.get(event.toolCallId);
 			officeToolCalls.delete(event.toolCallId);
 			if (!event.isError) {
@@ -1784,6 +1954,7 @@ function handleEvent(event) {
 				void currentAssistant.finalizeArtifacts();
 			}
 			setRunning(false);
+			updateActivityOverview("已完成");
 			setIndicator(false);
 			// 智能体本轮可能改动了工作区文件：审查标签可见时自动刷新差异
 			if (activeSideTab === "review" && sidePanelVisible()) void loadReview();
@@ -2049,6 +2220,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 				});
 				if (request !== this._artifactRequest) return;
 				renderArtifactCards(this.artifactsEl, result.files);
+				for (const file of result.files || []) appendActivityArtifact(file);
 				scrollToBottom();
 			} catch {
 				// 文件可能已被移动或会话正在切换；不影响正文显示。
@@ -2068,10 +2240,13 @@ function appendMessage(role, text, attachmentPaths = []) {
 				chevron.textContent = "▾";
 				const label = document.createElement("span");
 				label.className = "process-label";
-				label.textContent = "⚙ 执行过程";
+				label.textContent = "执行活动";
 				const countEl = document.createElement("span");
 				countEl.className = "process-count";
 				countEl.textContent = "1 步";
+				const stateEl = document.createElement("span");
+				stateEl.className = "process-state running";
+				stateEl.textContent = "运行中";
 				const copyAll = document.createElement("button");
 				copyAll.className = "copy-btn";
 				copyAll.textContent = "⧉";
@@ -2080,12 +2255,14 @@ function appendMessage(role, text, attachmentPaths = []) {
 				head.appendChild(chevron);
 				head.appendChild(label);
 				head.appendChild(countEl);
+				head.appendChild(stateEl);
 				head.appendChild(copyAll);
 				head.addEventListener("click", () => {
 					processBody.hidden = !processBody.hidden;
 					chevron.textContent = processBody.hidden ? "▸" : "▾";
 				});
 				processWrap.appendChild(head);
+				processWrap.dataset.startedAt = String(Date.now());
 				processBody = document.createElement("div");
 				processBody.className = "process-body";
 				processWrap.appendChild(processBody);
@@ -2097,6 +2274,17 @@ function appendMessage(role, text, attachmentPaths = []) {
 			processBody.appendChild(toolBlock);
 			scrollToBottom();
 		},
+		addUsage(usage) {
+			if (!processWrap || processWrap.hidden) return;
+			let usageEl = processWrap.querySelector(".process-usage");
+			if (!usageEl) {
+				usageEl = document.createElement("span");
+				usageEl.className = "process-usage";
+				processWrap.querySelector(".process-head")?.insertBefore(usageEl, processWrap.querySelector(".process-state"));
+			}
+			usageEl.textContent = typeof usage.totalTokens === "number" ? `${usage.totalTokens.toLocaleString("zh-CN")} token` : "用量已记录";
+			usageEl.title = formatModelUsage(usage);
+		},
 		/** 一轮结束：执行过程默认折叠（用户可点开），思考块从"思考中"落定 */
 		foldProcess() {
 			thinking.classList.remove("active");
@@ -2105,6 +2293,13 @@ function appendMessage(role, text, attachmentPaths = []) {
 			if (!processWrap || processWrap.hidden) return;
 			const body = processWrap.querySelector(".process-body");
 			const chevron = processWrap.querySelector(".tool-chevron");
+			const stateEl = processWrap.querySelector(".process-state");
+			if (stateEl) {
+				const startedAt = Number(processWrap.dataset.startedAt);
+				const elapsed = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
+				stateEl.classList.remove("running");
+				stateEl.textContent = `完成${elapsed ? ` · ${elapsed}s` : ""}`;
+			}
 			if (body && !body.hidden) {
 				body.hidden = true;
 				if (chevron) chevron.textContent = "▸";
@@ -2394,9 +2589,12 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 	const chevron = document.createElement("span");
 	chevron.className = "tool-chevron";
 	chevron.textContent = "▸";
+	const kind = document.createElement("span");
+	kind.className = "tool-kind-icon";
+	kind.textContent = activityIcon(toolName);
 	const nameEl = document.createElement("span");
 	nameEl.className = "tool-name";
-	nameEl.textContent = `⚙ ${toolName}`;
+	nameEl.textContent = toolName;
 	const statusEl = document.createElement("span");
 	statusEl.className = "tool-status";
 	statusEl.textContent = status === "running" ? "运行中…" : "已结束";
@@ -2406,6 +2604,7 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 	copyBtn.title = "复制该执行步骤（命令与结果）";
 	copyBtn.dataset.copy = "tool";
 	header.appendChild(chevron);
+	header.appendChild(kind);
 	header.appendChild(nameEl);
 	header.appendChild(statusEl);
 	header.appendChild(copyBtn);
@@ -2887,6 +3086,8 @@ async function sendMessage() {
 	inputEl.value = "";
 	resizeComposerInput();
 	errorBarEl.hidden = true;
+	clearActivity();
+	updateActivityOverview("准备中");
 	setRunning(true);
 	setIndicator(true, "思考中…");
 	let userBubble = null;
@@ -2981,16 +3182,9 @@ async function loadModels() {
 		const models = await api("/api/models");
 		modelSelectEl.innerHTML = "";
 		const authed = models.filter((m) => m.hasAuth);
-		const others = models.filter((m) => !m.hasAuth);
-		const byProvider = new Map();
-		for (const m of others) {
-			const list = byProvider.get(m.provider) ?? [];
-			list.push(m);
-			byProvider.set(m.provider, list);
-		}
 		if (authed.length > 0) {
 			const group = document.createElement("optgroup");
-			group.label = "已配置 Key";
+			group.label = "已连接模型";
 			for (const m of authed) {
 				const option = document.createElement("option");
 				option.value = `${m.provider}/${m.modelId}`;
@@ -2998,20 +3192,13 @@ async function loadModels() {
 				group.appendChild(option);
 			}
 			modelSelectEl.appendChild(group);
+		} else {
+			const option = document.createElement("option");
+			option.value = "";
+			option.textContent = "尚未连接模型";
+			modelSelectEl.appendChild(option);
 		}
-		if (byProvider.size > 0) {
-			const group = document.createElement("optgroup");
-			group.label = "未配置 Key";
-			for (const [provider, list] of byProvider) {
-				const option = document.createElement("option");
-				option.value = `${provider}/__none__`;
-				option.disabled = true;
-				option.textContent = `${provider}（${list.length} 个模型，未配置 Key）`;
-				group.appendChild(option);
-			}
-			modelSelectEl.appendChild(group);
-		}
-		modelSelectEl.disabled = models.length === 0;
+		modelSelectEl.disabled = authed.length === 0;
 		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	} catch (error) {
@@ -3154,26 +3341,23 @@ function catalogMatches(item, query) {
 		.includes(query);
 }
 
-function createCatalogIcon(kind, icon, iconText) {
+function createCatalogIcon(kind, _icon, iconText, id = "") {
 	const wrap = document.createElement("div");
 	wrap.className = `catalog-card-icon ${String(kind || "").toLocaleLowerCase("en-US")}`;
-	if (icon) {
-		const image = document.createElement("img");
-		image.src = icon;
-		image.alt = "";
-		wrap.appendChild(image);
-	} else if (iconText) {
-		wrap.textContent = iconText;
-	} else {
-		wrap.textContent = kind === "PowerPoint" ? "P" : kind === "Excel" ? "X" : "W";
-	}
+	const key = `${id} ${kind} ${iconText}`.toLocaleLowerCase("en-US");
+	let body = '<path d="M6 3h9l3 3v15H6z"/><path d="M15 3v4h4"/><path d="M9 12h6M9 16h6"/>';
+	if (/browser|网页/.test(key)) body = '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>';
+	else if (/code|开发/.test(key)) body = '<path d="m8 9-3 3 3 3M16 9l3 3-3 3M14 5l-4 14"/>';
+	else if (/red|安全|shield/.test(key)) body = '<path d="M12 3 4.5 6v5.5c0 4.6 3.2 8 7.5 9.5 4.3-1.5 7.5-4.9 7.5-9.5V6z"/><path d="m9 12 2 2 4-4"/>';
+	else if (/skill|技能/.test(key)) body = '<path d="m12 3 1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6z"/><path d="m18.5 15 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/>';
+	wrap.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${body}</svg>`;
 	return wrap;
 }
 
 function createCard(item, options) {
 	const card = document.createElement("article");
 	card.className = "catalog-card";
-	card.appendChild(createCatalogIcon(options.kind, options.icon, options.iconText));
+	card.appendChild(createCatalogIcon(options.kind, options.icon, options.iconText, item.id));
 	const main = document.createElement("div");
 	main.className = "catalog-card-main";
 	const titleRow = document.createElement("div");
@@ -3181,10 +3365,8 @@ function createCard(item, options) {
 	const title = document.createElement("span");
 	title.className = "catalog-card-title";
 	title.textContent = item.displayName;
-	const code = document.createElement("span");
-	code.className = "catalog-card-code";
-	code.textContent = `（${item.internalName}）`;
-	titleRow.append(title, code);
+	title.title = item.internalName || item.id;
+	titleRow.appendChild(title);
 	const desc = document.createElement("div");
 	desc.className = "catalog-card-desc";
 	desc.textContent = item.description;
@@ -3193,7 +3375,13 @@ function createCard(item, options) {
 	actions.className = "catalog-card-actions";
 	const status = document.createElement("span");
 	status.className = `catalog-status${item.installed ? " installed" : options.installing ? " installing" : ""}`;
-	status.textContent = item.installed ? "已安装" : options.installing ? "安装中" : "未安装";
+	status.textContent = item.updateAvailable
+		? "可更新"
+		: item.installed
+			? `已安装${item.version ? ` · ${item.version}` : ""}`
+			: options.installing
+				? "安装中"
+				: "未安装";
 	actions.appendChild(status);
 	if (!item.installed) {
 		const install = document.createElement("button");
@@ -3209,16 +3397,16 @@ function createCard(item, options) {
 			await options.onInstall(install);
 		});
 		actions.appendChild(install);
-	} else if (options.onUninstall) {
-		const uninstall = document.createElement("button");
-		uninstall.type = "button";
-		uninstall.className = "secondary-btn small danger";
-		uninstall.textContent = "卸载";
-		uninstall.addEventListener("click", async (event) => {
+	} else {
+		const manage = document.createElement("button");
+		manage.type = "button";
+		manage.className = "secondary-btn small";
+		manage.textContent = "管理";
+		manage.addEventListener("click", (event) => {
 			event.stopPropagation();
-			await options.onUninstall(uninstall);
+			options.onOpen();
 		});
-		actions.appendChild(uninstall);
+		actions.appendChild(manage);
 	}
 	card.append(main, actions);
 	card.addEventListener("click", options.onOpen);
@@ -3311,7 +3499,6 @@ function renderTools(query) {
 				iconText: tool.iconText,
 				onOpen: () => openToolDetail(tool),
 				onInstall: installDispatcher(tool),
-				onUninstall: tool.removable === false ? undefined : (button) => uninstallTool(tool, button),
 				...installState,
 			}),
 		);
@@ -3333,12 +3520,11 @@ function renderSkills(query) {
 		section.className = "catalog-group";
 		const header = document.createElement("div");
 		header.className = "catalog-group-header";
-		const image = group.icon
-			? Object.assign(document.createElement("img"), { src: group.icon, alt: "" })
-			: createCatalogIcon("tool", "", group.iconText || "技");
+		const image = createCatalogIcon("技能", "", group.iconText || "技", group.toolInternalName);
 		const heading = document.createElement("div");
 		const installedCount = group.skills.filter((skill) => skill.installed).length;
-		heading.innerHTML = `<div class="catalog-group-title">${group.toolDisplayName}（${group.toolInternalName}）</div><div class="catalog-group-meta">${installedCount}/${group.skills.length} 个技能已安装</div>`;
+		heading.innerHTML = `<div class="catalog-group-title">${group.toolDisplayName}</div><div class="catalog-group-meta">${installedCount}/${group.skills.length} 个技能已安装</div>`;
+		heading.querySelector(".catalog-group-title").title = group.toolInternalName;
 		const spacer = document.createElement("div");
 		spacer.className = "catalog-group-spacer";
 		header.append(image, heading, spacer);
@@ -3593,7 +3779,7 @@ async function installAllOfficeCliSkills(button) {
 	}
 }
 
-function appendDrawerDetails(rows) {
+function appendDrawerDetails(rows, parent = drawerContentEl) {
 	const list = document.createElement("dl");
 	list.className = "drawer-detail-list";
 	for (const [label, value] of rows) {
@@ -3604,7 +3790,17 @@ function appendDrawerDetails(rows) {
 		else detail.textContent = value || "—";
 		list.append(term, detail);
 	}
-	drawerContentEl.appendChild(list);
+	parent.appendChild(list);
+}
+
+function appendDrawerTechnicalDetails(rows) {
+	const details = document.createElement("details");
+	details.className = "drawer-technical";
+	const summary = document.createElement("summary");
+	summary.textContent = "技术信息";
+	details.appendChild(summary);
+	appendDrawerDetails(rows, details);
+	drawerContentEl.appendChild(details);
 }
 
 function currentDevelopmentTool() {
@@ -3806,7 +4002,7 @@ function appendCodeDevelopmentDetails(tool) {
 }
 
 function openToolDetail(tool) {
-	drawerTitleEl.textContent = `${tool.displayName}（${tool.internalName}）`;
+	drawerTitleEl.textContent = tool.displayName;
 	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
 	meta.className = "drawer-meta";
@@ -3824,8 +4020,11 @@ function openToolDetail(tool) {
 	appendDrawerDetails([
 		[tool.category === "安全测试" ? "覆盖能力" : "文件类型", tool.formats.join("、")],
 		["运行环境", tool.platform],
-		["安装位置", tool.installPath],
 		...(tool.skillCount > 0 ? [["技能", `${tool.installedSkillCount}/${tool.skillCount} 个已安装`]] : []),
+	]);
+	appendDrawerTechnicalDetails([
+		["内部标识", tool.internalName],
+		["安装位置", tool.installPath],
 		["来源", source],
 	]);
 	if (tool.id === "code-development" && tool.installed) appendCodeDevelopmentDetails(tool);
@@ -3860,21 +4059,38 @@ function openToolDetail(tool) {
 		install.addEventListener("click", () => installDispatcher(tool)(install));
 		actions.appendChild(install);
 		drawerContentEl.appendChild(actions);
-	} else if (tool.removable !== false) {
+	} else {
 		const actions = document.createElement("div");
 		actions.className = "drawer-actions";
-		const uninstall = document.createElement("button");
-		uninstall.className = "secondary-btn danger";
-		uninstall.textContent = "卸载工具";
-		uninstall.addEventListener("click", () => uninstallTool(tool, uninstall));
-		actions.appendChild(uninstall);
+		const use = document.createElement("button");
+		use.className = "primary-btn";
+		use.textContent = "开始使用";
+		use.addEventListener("click", () => {
+			closeCatalog();
+			inputEl.value = `请使用「${tool.displayName}」处理这个任务：`;
+			resizeComposerInput();
+			inputEl.focus();
+		});
+		actions.appendChild(use);
+		if (tool.removable !== false) {
+			const more = document.createElement("details");
+			more.className = "danger-menu";
+			more.innerHTML = "<summary>更多操作</summary>";
+			const uninstall = document.createElement("button");
+			uninstall.className = "danger-action";
+			uninstall.type = "button";
+			uninstall.textContent = "卸载工具";
+			uninstall.addEventListener("click", () => uninstallTool(tool, uninstall));
+			more.appendChild(uninstall);
+			actions.appendChild(more);
+		}
 		drawerContentEl.appendChild(actions);
 	}
 	drawerEl.hidden = false;
 }
 
 function openSkillDetail(skill, group) {
-	drawerTitleEl.textContent = `${skill.displayName}（${skill.internalName}）`;
+	drawerTitleEl.textContent = skill.displayName;
 	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
 	meta.className = "drawer-meta";
@@ -3883,14 +4099,25 @@ function openSkillDetail(skill, group) {
 	desc.className = "drawer-desc";
 	desc.textContent = skill.description;
 	drawerContentEl.append(meta, desc);
-	const skillNames = new Map(group.skills.map((item) => [item.id, `${item.displayName}（${item.internalName}）`]));
+	const skillNames = new Map(group.skills.map((item) => [item.id, item.displayName]));
 	appendDrawerDetails([
-		["所属工具", `${group.toolDisplayName}（${group.toolInternalName}）`],
+		["所属工具", group.toolDisplayName],
 		["文件类型", skill.formats.join("、")],
 		["基础技能", skill.requires.length ? skill.requires.map((id) => skillNames.get(id) || id).join("、") : "无"],
+	]);
+	appendDrawerTechnicalDetails([
+		["内部标识", skill.internalName],
+		["工具标识", group.toolInternalName],
 		["安装位置", skill.installPath],
 		["来源", "OfficeCLI 二进制内置官方技能"],
 	]);
+	const exampleTitle = document.createElement("div");
+	exampleTitle.className = "drawer-block-title";
+	exampleTitle.textContent = "示例任务";
+	const example = document.createElement("div");
+	example.className = "skill-example";
+	example.textContent = `使用「${skill.displayName}」完成任务，并把结果保存到当前工作区。`;
+	drawerContentEl.append(exampleTitle, example);
 	if (!skill.installed) {
 		const actions = document.createElement("div");
 		actions.className = "drawer-actions";
@@ -3900,6 +4127,20 @@ function openSkillDetail(skill, group) {
 		install.disabled = !group.toolInstalled;
 		install.addEventListener("click", () => installOfficeCliSkill(skill, install));
 		actions.appendChild(install);
+		drawerContentEl.appendChild(actions);
+	} else {
+		const actions = document.createElement("div");
+		actions.className = "drawer-actions";
+		const use = document.createElement("button");
+		use.className = "primary-btn";
+		use.textContent = "用此技能开始任务";
+		use.addEventListener("click", () => {
+			closeCatalog();
+			inputEl.value = `请使用「${skill.displayName}」技能，帮我完成：`;
+			resizeComposerInput();
+			inputEl.focus();
+		});
+		actions.appendChild(use);
 		drawerContentEl.appendChild(actions);
 	}
 	drawerEl.hidden = false;
@@ -3935,9 +4176,37 @@ async function loadContextPanel() {
 }
 
 function renderSessionCapabilities(capabilities) {
-	const names = Array.isArray(capabilities) ? capabilities.map((item) => item.displayName) : [];
-	contextInfoEl.textContent = names.length > 0 ? `${names.join("、")} · 按本轮加载` : "原生 Pi 工具";
+	const items = Array.isArray(capabilities) ? capabilities : [];
+	contextInfoEl.textContent = items.length > 0 ? `已启用 ${items.length} 项能力` : "原生 Pi 工具";
+	capabilitiesPopoverEl.innerHTML = "";
+	const title = document.createElement("div");
+	title.className = "capabilities-popover-title";
+	title.textContent = items.length > 0 ? "本轮按需加载" : "当前能力";
+	capabilitiesPopoverEl.appendChild(title);
+	if (items.length === 0) {
+		const empty = document.createElement("div");
+		empty.className = "capabilities-popover-empty";
+		empty.textContent = "使用 Pi 原生工具，不额外加载能力包。";
+		capabilitiesPopoverEl.appendChild(empty);
+		return;
+	}
+	for (const item of items) {
+		const row = document.createElement("div");
+		row.className = "capability-popover-row";
+		row.innerHTML = '<span class="capability-dot"></span><span></span>';
+		row.lastElementChild.textContent = item.displayName;
+		row.title = item.name || item.displayName;
+		capabilitiesPopoverEl.appendChild(row);
+	}
 }
+
+contextInfoEl.addEventListener("click", (event) => {
+	event.stopPropagation();
+	capabilitiesPopoverEl.hidden = !capabilitiesPopoverEl.hidden;
+});
+document.addEventListener("click", (event) => {
+	if (!capabilitiesPopoverEl.hidden && !event.target.closest(".capability-menu")) capabilitiesPopoverEl.hidden = true;
+});
 
 // ---------------------------------------------------------------------------
 // 左栏：本地资源管理器
@@ -4466,8 +4735,14 @@ themeBtnEl.addEventListener("click", () => {
 
 applyTheme(localStorage.getItem("pi-console-theme") || "dark");
 
-settingsBtnEl.addEventListener("click", () => {
+function setSettingsPage(page) {
+	for (const button of settingsNavButtons) button.classList.toggle("active", button.dataset.settingsTarget === page);
+	for (const section of settingsPages) section.hidden = section.dataset.settingsPage !== page;
+}
+
+function openSettings(page = "general") {
 	settingsBtnEl.classList.remove("update-available");
+	setSettingsPage(page);
 	settingsModalEl.hidden = false;
 	loadKeysSection();
 	loadCustomModelsSection();
@@ -4475,7 +4750,11 @@ settingsBtnEl.addEventListener("click", () => {
 	loadVersionSection();
 	loadWorkspaceState();
 	loadStorageState();
-});
+}
+
+settingsBtnEl.addEventListener("click", () => openSettings("general"));
+modelManageBtnEl.addEventListener("click", () => openSettings("models"));
+for (const button of settingsNavButtons) button.addEventListener("click", () => setSettingsPage(button.dataset.settingsTarget));
 settingsCloseEl.addEventListener("click", () => {
 	settingsModalEl.hidden = true;
 });
@@ -4663,6 +4942,8 @@ function resetCustomModelForm() {
 	customModelVisionEl.checked = false;
 	customModelSaveBtnEl.textContent = "添加模型";
 	customModelCancelBtnEl.hidden = true;
+	customModelConnectionStateEl.textContent = "尚未测试连接";
+	customModelConnectionStateEl.dataset.state = "idle";
 }
 
 function editCustomModel(entry) {
@@ -4742,7 +5023,9 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 		return;
 	}
 	customModelDiscoverBtnEl.disabled = true;
-	customModelDiscoverBtnEl.textContent = "读取中…";
+	customModelDiscoverBtnEl.textContent = "正在测试…";
+	customModelConnectionStateEl.textContent = "正在连接服务并读取模型…";
+	customModelConnectionStateEl.dataset.state = "running";
 	try {
 		const result = await api("/api/custom-models/discover", {
 			method: "POST",
@@ -4759,12 +5042,16 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 			customModelOptionsEl.appendChild(option);
 		}
 		if (result.models.length === 1) customModelIdEl.value = result.models[0];
+		customModelConnectionStateEl.textContent = `连接正常 · 发现 ${result.models.length} 个模型`;
+		customModelConnectionStateEl.dataset.state = "ok";
 		showInfo(`已读取 ${result.models.length} 个模型${result.models.length ? "，可在模型 ID 中选择" : ""}`);
 	} catch (error) {
+		customModelConnectionStateEl.textContent = `连接失败 · ${error.message}`;
+		customModelConnectionStateEl.dataset.state = "error";
 		showError(`读取模型失败：${error.message}`);
 	} finally {
 		customModelDiscoverBtnEl.disabled = false;
-		customModelDiscoverBtnEl.textContent = "读取模型";
+		customModelDiscoverBtnEl.textContent = "测试并读取模型";
 	}
 });
 
@@ -4998,7 +5285,7 @@ async function autoCheckUpdate() {
 		connectSSE();
 		inputEl.disabled = false;
 		sendBtn.disabled = false;
-		modelSelectEl.disabled = false;
+		modelSelectEl.disabled = !modelSelectEl.value;
 		thinkingSelectEl.disabled = false;
 		pollContext();
 		inputEl.focus();
