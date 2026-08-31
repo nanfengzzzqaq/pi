@@ -13,11 +13,17 @@
 </head>
 <body>
 	<header class="topbar">
-		<span class="logo">Pi 控制台</span>
+		<div class="brand-lockup" aria-label="Pi 控制台">
+			<span class="brand-mark" aria-hidden="true">
+				<svg viewBox="0 0 32 32"><path d="M7.5 10.5h17M10 10.5v11M22 10.5v11M10 16h12"></path><circle cx="16" cy="16" r="13"></circle></svg>
+			</span>
+			<span class="brand-copy"><strong class="logo">Pi</strong><small>Agent Console</small></span>
+		</div>
+		<span class="topbar-divider" aria-hidden="true"></span>
 		<span id="conn-state" class="conn-state">连接中…</span>
 		<div class="topbar-right">
-			<button id="workbench-btn" class="secondary-btn small" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）">工作台</button>
-			<button id="agent-browser-btn" class="secondary-btn small" type="button" title="打开客户端独立浏览器（agent_browser）">浏览器</button>
+			<button id="workbench-btn" class="secondary-btn small topbar-action" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 4.5h13v11h-13zM11.5 4.5v11M4 8h7"></path></svg><span>工作台</span></button>
+			<button id="agent-browser-btn" class="secondary-btn small topbar-action" type="button" title="打开客户端独立浏览器（agent_browser）"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg><span>浏览器</span></button>
 			<button id="theme-btn" class="icon-btn" title="切换主题">🌙</button>
 			<button id="settings-btn" class="icon-btn" title="设置（模型服务 / 更新 / MCP）">⚙</button>
 		</div>
@@ -28,26 +34,26 @@
 		<aside class="sidebar">
 			<nav class="sidebar-primary-nav" aria-label="能力目录">
 				<button id="tools-nav-btn" class="catalog-nav-btn" type="button">
-					<span class="catalog-nav-icon">▦</span>
-					<span>工具</span>
+					<span class="catalog-nav-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3.5" y="3.5" width="5" height="5" rx="1"></rect><rect x="11.5" y="3.5" width="5" height="5" rx="1"></rect><rect x="3.5" y="11.5" width="5" height="5" rx="1"></rect><path d="M11.5 14h5M14 11.5v5"></path></svg></span>
+					<span class="catalog-nav-copy"><strong>工具</strong><small>扩展能力</small></span>
 				</button>
 				<button id="skills-nav-btn" class="catalog-nav-btn" type="button">
-					<span class="catalog-nav-icon">◇</span>
-					<span>技能</span>
+					<span class="catalog-nav-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2.8 2 4.1 4.5.7-3.2 3.2.8 4.5-4.1-2.1-4.1 2.1.8-4.5-3.2-3.2 4.5-.7z"></path></svg></span>
+					<span class="catalog-nav-copy"><strong>技能</strong><small>工作流</small></span>
 				</button>
 			</nav>
 			<section class="side-section">
-				<div class="side-header" data-panel="sessions-panel">对话 <span class="chevron">▾</span></div>
+				<div class="side-header" data-panel="sessions-panel"><span class="side-header-title"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12v8.5H9l-3.5 3v-3H4z"></path></svg>对话</span><span class="chevron">▾</span></div>
 				<div id="sessions-panel" class="side-body">
 					<div class="sessions-toolbar">
-						<span class="sessions-label">历史对话</span>
+						<span class="sessions-label">最近使用</span>
 						<button id="session-new-btn" class="secondary-btn small" title="新建对话">＋ 新对话</button>
 					</div>
 					<div id="sessions-list" class="sessions-list">加载中…</div>
 				</div>
 			</section>
 				<section class="side-section side-section-grow">
-					<div class="side-header" data-panel="files-panel">文件 <span class="chevron">▾</span></div>
+					<div class="side-header" data-panel="files-panel"><span class="side-header-title"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 5.5h5l1.5 2h6.5v8.5h-13z"></path></svg>文件</span><span class="chevron">▾</span></div>
 					<div id="files-panel" class="side-body side-body-grow">
 						<div class="files-toolbar">
 							<button id="fs-up" class="icon-btn small" title="返回上一级" disabled>↑</button>
@@ -114,9 +120,15 @@
 							<span id="collapse-hint" class="collapse-hint"></span>
 						</div>
 						<div id="messages-empty" class="messages-empty">
-							<div class="messages-empty-mark">π</div>
-							<div class="messages-empty-title">有什么需要处理？</div>
-							<div class="messages-empty-hint">直接开始对话，或从左侧选择文件、工具和技能。</div>
+							<div class="messages-empty-visual" aria-hidden="true"><span class="messages-empty-orbit orbit-one"></span><span class="messages-empty-orbit orbit-two"></span><div class="messages-empty-mark">π</div></div>
+							<div class="messages-empty-eyebrow">PI AGENT WORKSPACE</div>
+							<div class="messages-empty-title">今天想一起完成什么？</div>
+							<div class="messages-empty-hint">从一个目标开始。Pi 会规划步骤、调用工具并把执行过程呈现在工作台。</div>
+							<div class="messages-empty-prompts" aria-label="能力示例">
+								<div class="empty-prompt"><span>01</span><strong>分析与规划</strong><small>梳理问题，形成可执行方案</small></div>
+								<div class="empty-prompt"><span>02</span><strong>创建与修改</strong><small>处理代码、文档和本地文件</small></div>
+								<div class="empty-prompt"><span>03</span><strong>验证与交付</strong><small>查看过程、结果和生成产物</small></div>
+							</div>
 						</div>
 					</main>
 
@@ -126,13 +138,13 @@
 						<div class="attachments" id="attachments" hidden></div>
 						<div class="composer-row">
 							<div class="composer-input-box">
-								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）">＋</button>
+								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 10.5 11 6a3 3 0 0 1 4.2 4.2l-5.8 5.8a4.3 4.3 0 0 1-6.1-6.1l6-6"></path></svg></button>
 								<input type="file" id="file-input" multiple hidden>
 								<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
 							</div>
 							<div class="composer-buttons">
-								<button id="send-btn" disabled>发送</button>
-								<button id="stop-btn" hidden>停止</button>
+								<button id="send-btn" disabled><span>发送</span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 11-5-3.8 10-2.1-3.7zM9.1 11.3 15 5"></path></svg></button>
+								<button id="stop-btn" hidden><span>停止</span><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg></button>
 							</div>
 						</div>
 						<div class="composer-bottom">
