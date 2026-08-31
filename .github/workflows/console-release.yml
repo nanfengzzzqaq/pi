@@ -6,6 +6,32 @@ on:
       - downstream
     paths-ignore:
       - .github/workflows/console-release.yml
+  workflow_dispatch:
+    inputs:
+      recovery_run_id:
+        description: 'Failed release run containing the verified installer artifact'
+        required: true
+        type: string
+      recovery_source_sha:
+        description: 'Exact commit referenced by the release tag and ownership marker'
+        required: true
+        type: string
+      recovery_version:
+        description: 'Console version without the v prefix'
+        required: true
+        type: string
+      recovery_release_id:
+        description: 'Workflow-owned draft release ID'
+        required: true
+        type: string
+      recovery_expected_size:
+        description: 'Verified installer size in bytes'
+        required: true
+        type: string
+      recovery_expected_sha256:
+        description: 'Verified installer SHA-256 digest'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +43,7 @@ concurrency:
 jobs:
   prepare:
     name: Check Console release version
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     outputs:
       release_mode: ${{ steps.release.outputs.release_mode }}
@@ -1212,3 +1239,169 @@ jobs:
           failure_guard_enabled=false
           trap - ERR
           echo "Published ${RELEASE_TAG} from ${SOURCE_SHA} with $(basename "${asset}")."
+
+  recover-publish:
+    name: Recover verified Pi Console release
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RECOVERY_RUN_ID: ${{ inputs.recovery_run_id }}
+      SOURCE_SHA: ${{ inputs.recovery_source_sha }}
+      VERSION: ${{ inputs.recovery_version }}
+      RELEASE_ID: ${{ inputs.recovery_release_id }}
+      EXPECTED_SIZE: ${{ inputs.recovery_expected_size }}
+      EXPECTED_SHA256: ${{ inputs.recovery_expected_sha256 }}
+    steps:
+      - name: Download previously verified installer
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pi-console-${{ inputs.recovery_source_sha }}
+          path: release-assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.recovery_run_id }}
+
+      - name: Validate ownership and publish recovered release
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "${RECOVERY_RUN_ID}" =~ ^[1-9][0-9]*$ \
+            || ! "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ \
+            || ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ \
+            || ! "${RELEASE_ID}" =~ ^[1-9][0-9]*$ \
+            || ! "${EXPECTED_SIZE}" =~ ^[1-9][0-9]*$ \
+            || ! "${EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Recovery inputs are malformed."
+            exit 1
+          fi
+
+          release_tag="v${VERSION}"
+          release_title="Pi Console ${release_tag}"
+          release_marker="<!-- pi-console-release-workflow-owned:v1 tag=${release_tag} source=${SOURCE_SHA} -->"
+          asset_marker="pi-console-release-workflow-owned:v1:${release_tag}:${SOURCE_SHA}"
+          target_name="PiConsole-Setup-${VERSION}.exe"
+          asset="release-assets/${target_name}"
+
+          if [[ ! -s "${asset}" ]]; then
+            echo "::error::The verified recovery installer is missing or empty."
+            exit 1
+          fi
+          asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          local_size="$(stat -c '%s' "${asset}")"
+          local_sha256="$(sha256sum "${asset}" | awk '{print $1}')"
+          if [[ "${asset_count}" != "1" \
+            || "${local_size}" != "${EXPECTED_SIZE}" \
+            || "${local_sha256}" != "${EXPECTED_SHA256}" ]]; then
+            echo "::error::The recovery artifact does not match the verified installer fingerprint."
+            exit 1
+          fi
+
+          tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}")"
+          if [[ "$(jq -r '.object.type' <<< "${tag_json}")" != "commit" \
+            || "$(jq -r '.object.sha' <<< "${tag_json}")" != "${SOURCE_SHA}" ]]; then
+            echo "::error::${release_tag} does not point directly to the verified source commit."
+            exit 1
+          fi
+
+          load_draft() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"
+          }
+          assert_owned_draft() {
+            jq -e \
+              --argjson id "${RELEASE_ID}" \
+              --arg tag "${release_tag}" \
+              --arg title "${release_title}" \
+              --arg marker "${release_marker}" \
+              --arg source "${SOURCE_SHA}" '
+                def marker_count($marker):
+                  ((.body // "") | split("\n") | map(rtrimstr("\r")) | map(select(. == $marker)) | length);
+                .id == $id
+                and .draft == true
+                and .prerelease == false
+                and .tag_name == $tag
+                and .name == $title
+                and .target_commitish == $source
+                and .author.login == "github-actions[bot]"
+                and marker_count($marker) == 1
+              ' >/dev/null
+          }
+          assert_owned_asset() {
+            jq -e \
+              --arg name "${target_name}" \
+              --arg marker "${asset_marker}" \
+              --argjson size "${EXPECTED_SIZE}" \
+              --arg digest "sha256:${EXPECTED_SHA256}" '
+                .name == $name
+                and .label == $marker
+                and .state == "uploaded"
+                and .size == $size
+                and (.digest // "") == $digest
+              ' >/dev/null
+          }
+
+          draft_json="$(load_draft)"
+          if ! assert_owned_draft <<< "${draft_json}"; then
+            echo "::error::Release ${RELEASE_ID} is not the exact workflow-owned recovery draft."
+            exit 1
+          fi
+
+          existing_count="$(jq '.assets | length' <<< "${draft_json}")"
+          if [[ "${existing_count}" == "0" ]]; then
+            upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<< "${draft_json}")"
+            encoded_name="$(jq -nr --arg value "${target_name}" '$value | @uri')"
+            encoded_label="$(jq -nr --arg value "${asset_marker}" '$value | @uri')"
+            upload_response="$(mktemp)"
+            upload_status="$(curl --fail --silent --show-error \
+              --output "${upload_response}" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary @"${asset}" \
+              "${upload_url}?name=${encoded_name}&label=${encoded_label}")"
+            if [[ "${upload_status}" != "201" ]] || ! assert_owned_asset < "${upload_response}"; then
+              echo "::error::GitHub did not confirm the exact recovered installer upload."
+              exit 1
+            fi
+          elif [[ "${existing_count}" == "1" ]]; then
+            if ! jq -e '.assets[0]' <<< "${draft_json}" | assert_owned_asset; then
+              echo "::error::The existing draft asset is not the exact verified installer."
+              exit 1
+            fi
+          else
+            echo "::error::The recovery draft contains an unexpected asset set."
+            exit 1
+          fi
+
+          draft_json="$(load_draft)"
+          if ! assert_owned_draft <<< "${draft_json}" \
+            || [[ "$(jq '.assets | length' <<< "${draft_json}")" != "1" ]] \
+            || ! jq -e '.assets[0]' <<< "${draft_json}" | assert_owned_asset; then
+            echo "::error::The recovered draft failed final pre-publication validation."
+            exit 1
+          fi
+
+          publish_response="$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            --field draft=false \
+            --field prerelease=false \
+            --raw-field make_latest=true)"
+          canonical_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}")"
+          if [[ "$(jq -r '.id' <<< "${publish_response}")" != "${RELEASE_ID}" \
+            || "$(jq -r '.draft' <<< "${publish_response}")" != "false" \
+            || "$(jq -r '.prerelease' <<< "${publish_response}")" != "false" \
+            || "$(jq -r '.id' <<< "${canonical_release}")" != "${RELEASE_ID}" \
+            || "$(jq -r '.draft' <<< "${canonical_release}")" != "false" \
+            || "$(jq '.assets | length' <<< "${canonical_release}")" != "1" ]] \
+            || ! jq -e '.assets[0]' <<< "${canonical_release}" | assert_owned_asset; then
+            echo "::error::The recovered release failed final publication validation."
+            exit 1
+          fi
+
+          echo "Recovered and published ${release_tag} from ${SOURCE_SHA} with ${target_name}."
