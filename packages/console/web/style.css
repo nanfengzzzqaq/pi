@@ -1685,6 +1685,29 @@ body {
 	color: var(--ok);
 }
 
+.process-narration .tool-name {
+	font-family: inherit;
+}
+
+.process-narration .tool-status {
+	color: var(--muted);
+}
+
+.process-narration-text {
+	padding: 10px 12px;
+	color: var(--text);
+	font-size: 13px;
+	line-height: 1.65;
+}
+
+.process-narration-text > :first-child {
+	margin-top: 0;
+}
+
+.process-narration-text > :last-child {
+	margin-bottom: 0;
+}
+
 .tool-body {
 	border-top: 1px solid var(--border);
 }

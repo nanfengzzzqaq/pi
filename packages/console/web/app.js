@@ -1469,9 +1469,15 @@ function renderHistory(history) {
 				addCapabilitySelectionStep(container, pendingCapabilityTrace);
 				pendingCapabilityTrace = null;
 			}
-			if (item.text) container.appendHistoryText(item.text);
-			if (Array.isArray(item.toolCalls)) {
-				for (const call of item.toolCalls) {
+			const toolCalls = Array.isArray(item.toolCalls) ? item.toolCalls : [];
+			if (item.text) {
+				// 带工具调用的 assistant 文本是执行过程说明，不是最终答复。
+				// 归入可折叠执行活动，刷新后也不会重新堆到正文顶部。
+				if (toolCalls.length > 0) container.appendProgressText(item.text);
+				else container.appendHistoryText(item.text);
+			}
+			if (toolCalls.length > 0) {
+				for (const call of toolCalls) {
 					const block = appendToolBlock(call.id, call.displayName || call.name, call.args, "done");
 					container.addTool(block);
 					appendActivityEntry(call.id, call.displayName || call.name, call.args, "done", { restored: true });
@@ -1883,10 +1889,14 @@ function handleEvent(event) {
 		case "tool_execution_start": {
 			setIndicator(false);
 			officeToolCalls.set(event.toolCallId, { toolName: event.toolName, args: event.args });
+			const assistant = ensureAssistant();
+			// 模型在调用工具前输出的“我先检查……”属于过程播报。保留原文，
+			// 但移入执行活动；没有后续工具调用的最后一段仍作为正式答复显示。
+			assistant.archiveCurrentTextAsProgress();
 			// 工具块挂到当前轮次的"执行过程"容器（运行中展开）
 			const block = appendToolBlock(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running");
 			block.dataset.startedAt = String(Date.now());
-			ensureAssistant().addTool(block);
+			assistant.addTool(block);
 			appendActivityEntry(event.toolCallId, event.toolDisplayName || event.toolName, event.args, "running");
 			if (isTerminalToolName(event.toolName)) handleTerminalToolStart(event);
 			break;
@@ -2191,6 +2201,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 		textEl,
 		artifactsEl,
 		_textBuffer: text || "",
+		_allTextBuffer: text || "",
 		_artifactPaths: new Set(),
 		_artifactRequest: 0,
 		addArtifactPath(path) {
@@ -2202,7 +2213,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 			try {
 				const result = await api(`/api/sessions/${messageSessionId}/artifacts`, {
 					method: "POST",
-					body: JSON.stringify({ text: this._textBuffer || "", paths: [...this._artifactPaths] }),
+					body: JSON.stringify({ text: this._allTextBuffer || "", paths: [...this._artifactPaths] }),
 				});
 				if (request !== this._artifactRequest) return;
 				renderArtifactCards(this.artifactsEl, result.files);
@@ -2213,11 +2224,11 @@ function appendMessage(role, text, attachmentPaths = []) {
 			}
 		},
 		/** 挂载工具块到执行过程区 */
-		addTool(toolBlock) {
+		addTool(toolBlock, { countStep = true } = {}) {
 			if (!processWrap) return;
-			processCount++;
+			if (countStep) processCount++;
 			// 首个工具：构建容器头（运行中展开）
-			if (processCount === 1) {
+			if (!processBody) {
 				processWrap.innerHTML = "";
 				const head = document.createElement("div");
 				head.className = "process-head";
@@ -2229,7 +2240,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 				label.textContent = "执行活动";
 				const countEl = document.createElement("span");
 				countEl.className = "process-count";
-				countEl.textContent = "1 步";
+				countEl.textContent = `${processCount} 步`;
 				const stateEl = document.createElement("span");
 				stateEl.className = "process-state running";
 				stateEl.textContent = "运行中";
@@ -2253,7 +2264,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 				processBody.className = "process-body";
 				processWrap.appendChild(processBody);
 				processWrap.hidden = false;
-			} else {
+			} else if (countStep) {
 				const countEl = processWrap.querySelector(".process-count");
 				if (countEl) countEl.textContent = `${processCount} 步`;
 			}
@@ -2324,6 +2335,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 		},
 		appendText(delta) {
 			this._textBuffer = (this._textBuffer ?? "") + delta;
+			this._allTextBuffer = (this._allTextBuffer ?? "") + delta;
 			clearTimeout(this._renderTimer);
 			this._renderTimer = setTimeout(() => {
 				// 流式渲染：避免每 token 全量重排
@@ -2338,7 +2350,24 @@ function appendMessage(role, text, attachmentPaths = []) {
 		appendHistoryText(value) {
 			const separator = this._textBuffer && value ? "\n\n" : "";
 			this._textBuffer = `${this._textBuffer ?? ""}${separator}${value}`;
+			const allSeparator = this._allTextBuffer && value ? "\n\n" : "";
+			this._allTextBuffer = `${this._allTextBuffer ?? ""}${allSeparator}${value}`;
 			renderMarkdownInto(this.textEl, this._textBuffer);
+		},
+		appendProgressText(value) {
+			if (!String(value ?? "").trim()) return;
+			const allSeparator = this._allTextBuffer ? "\n\n" : "";
+			this._allTextBuffer = `${this._allTextBuffer ?? ""}${allSeparator}${value}`;
+			this.addTool(appendProcessNarration(value), { countStep: false });
+		},
+		archiveCurrentTextAsProgress() {
+			const value = String(this._textBuffer ?? "");
+			if (!value.trim()) return;
+			clearTimeout(this._renderTimer);
+			this._renderTimer = null;
+			this._textBuffer = "";
+			this.textEl.replaceChildren();
+			this.addTool(appendProcessNarration(value), { countStep: false });
 		},
 		appendThinking(delta) {
 			this._appendThinking(delta);
@@ -2564,6 +2593,50 @@ function renderMarkdownInto(el, text, options = {}) {
 // ---------------------------------------------------------------------------
 // 工具调用块（可折叠）
 // ---------------------------------------------------------------------------
+
+/** 把工具调用前的自然语言过程播报保留在执行活动中，避免与最终答复混排。 */
+function appendProcessNarration(text) {
+	const block = document.createElement("div");
+	block.className = "tool-block done process-narration";
+
+	const header = document.createElement("div");
+	header.className = "tool-header";
+	const chevron = document.createElement("span");
+	chevron.className = "tool-chevron";
+	chevron.textContent = "▸";
+	const kind = document.createElement("span");
+	kind.className = "tool-kind-icon";
+	kind.textContent = "…";
+	const nameEl = document.createElement("span");
+	nameEl.className = "tool-name";
+	nameEl.textContent = "过程说明";
+	const statusEl = document.createElement("span");
+	statusEl.className = "tool-status";
+	statusEl.textContent = "已归档";
+	const copyBtn = document.createElement("button");
+	copyBtn.className = "copy-btn";
+	copyBtn.textContent = "⧉";
+	copyBtn.title = "复制这段过程说明";
+	copyBtn.dataset.copy = "tool";
+	header.append(chevron, kind, nameEl, statusEl, copyBtn);
+	block.appendChild(header);
+
+	const body = document.createElement("div");
+	body.className = "tool-body";
+	body.hidden = true;
+	const content = document.createElement("div");
+	content.className = "process-narration-text text";
+	renderMarkdownInto(content, text);
+	body.appendChild(content);
+	block.appendChild(body);
+
+	header.addEventListener("click", (event) => {
+		if (event.target.closest(".copy-btn")) return;
+		body.hidden = !body.hidden;
+		chevron.textContent = body.hidden ? "▸" : "▾";
+	});
+	return block;
+}
 
 function appendToolBlock(toolCallId, toolName, args, status) {
 	const block = document.createElement("div");
