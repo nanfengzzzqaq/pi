@@ -365,14 +365,7 @@ function createPrivateBashOperations(runtime: PrivateBashRuntime): BashOperation
 }
 
 function createPrivateBashTool(cwd: string, runtime: PrivateBashRuntime): AnyToolDefinition {
-	const definition = createBashToolDefinition(cwd, { operations: createPrivateBashOperations(runtime) });
-	return defineTool({
-		...definition,
-		label: "运行 Bash 命令",
-		description:
-			"在 Pi 私有的 Bash 兼容环境中运行命令，包含 Git 和常用 Unix 命令。该环境不修改系统 PATH，也不会替换电脑已有的 Git。适合代码、仓库和跨平台脚本任务。",
-		promptSnippet: "使用 Pi 私有 Bash 环境运行 Git、代码和常用 Unix 命令",
-	});
+	return createBashToolDefinition(cwd, { operations: createPrivateBashOperations(runtime) });
 }
 
 /** Windows 客户端的常驻核心工具；非 Windows 或系统组件缺失时不注册。 */

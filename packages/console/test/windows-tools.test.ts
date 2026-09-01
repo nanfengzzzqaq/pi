@@ -1,8 +1,10 @@
+import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
 	bundledWindowsRuntimeCandidates,
 	getWindowsPowerShellPath,
 	instantiateWindowsTools,
+	isPrivateBashAvailable,
 } from "../src/windows-tools.ts";
 
 describe("Windows 原生命令工具", () => {
@@ -17,6 +19,22 @@ describe("Windows 原生命令工具", () => {
 		const path = getWindowsPowerShellPath();
 		expect(path).toMatch(/^[A-Za-z]:\\.*\\powershell\.exe$/i);
 		expect(path?.toLocaleLowerCase("en-US")).toContain("\\windows\\");
+	});
+
+	it.runIf(process.platform === "win32" && isPrivateBashAvailable())("私有 Bash 保持 Pi 原生模型接口", () => {
+		const cwd = process.cwd();
+		const privateBash = instantiateWindowsTools({ getWorkspaceRoot: () => cwd }).find(
+			(candidate) => candidate.name === "bash",
+		);
+		const nativeBash = createBashToolDefinition(cwd);
+		expect(privateBash).toMatchObject({
+			name: nativeBash.name,
+			label: nativeBash.label,
+			description: nativeBash.description,
+			promptSnippet: nativeBash.promptSnippet,
+			promptGuidelines: nativeBash.promptGuidelines,
+			parameters: nativeBash.parameters,
+		});
 	});
 
 	it.runIf(process.platform === "win32")(

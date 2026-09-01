@@ -35,11 +35,20 @@ export interface PackToolGroup {
 	keywords: string[];
 }
 
+export interface PackSkillGroup {
+	name: string;
+	displayName: string;
+	skillNames: string[];
+	extensions: string[];
+	keywords: string[];
+}
+
 export interface PackActivation {
 	extensions: string[];
 	keywords: string[];
 	minimumScore: number;
 	defaultGroups: string[];
+	defaultSkillGroups: string[];
 }
 
 export interface PackInfo {
@@ -53,6 +62,7 @@ export interface PackInfo {
 	/** 通用的按本轮激活规则；不存在时沿用常驻/旧 deferred 行为。 */
 	activation: PackActivation | null;
 	toolGroups: PackToolGroup[];
+	skillGroups: PackSkillGroup[];
 	/** 兼容旧包：挂载后默认只启用元工具。 */
 	deferred: boolean;
 	metaToolName: string | null;
@@ -64,6 +74,7 @@ export interface CapabilityMatch {
 	groupNames: string[];
 	groupDisplayNames: string[];
 	toolNames: string[];
+	skillNames: string[];
 	reasons: string[];
 }
 
@@ -84,16 +95,7 @@ function hasUsableBash(): boolean {
 
 /** 只把当前电脑上确实可执行的命令工具交给模型，避免“看得到但调用必失败”。 */
 function availableBuiltinToolNames(): string[] {
-	return [
-		"read",
-		...(hasUsableBash() ? ["bash"] : []),
-		"edit",
-		"write",
-		"grep",
-		"find",
-		"ls",
-		...(isWindowsPowerShellAvailable() ? ["powershell"] : []),
-	];
+	return ["read", ...(hasUsableBash() ? ["bash"] : []), "edit", "write"];
 }
 
 const BUILTIN_TOOL_LABELS: Record<string, string> = {
@@ -163,6 +165,7 @@ function readActivation(manifest: Record<string, unknown>): PackActivation | nul
 		keywords,
 		minimumScore,
 		defaultGroups: stringArray(manifest.activation.defaultGroups),
+		defaultSkillGroups: stringArray(manifest.activation.defaultSkillGroups),
 	};
 }
 
@@ -178,6 +181,27 @@ function readToolGroups(manifest: Record<string, unknown>, toolNames: string[]):
 			displayName: typeof rawGroup.displayName === "string" ? rawGroup.displayName : rawGroup.name,
 			description: typeof rawGroup.description === "string" ? rawGroup.description : "",
 			toolNames: names,
+			keywords: stringArray(rawGroup.keywords),
+		});
+	}
+	return groups;
+}
+
+function readSkillGroups(manifest: Record<string, unknown>): PackSkillGroup[] {
+	if (!Array.isArray(manifest.skillGroups)) return [];
+	const groups: PackSkillGroup[] = [];
+	for (const rawGroup of manifest.skillGroups) {
+		if (!isRecord(rawGroup) || typeof rawGroup.name !== "string") continue;
+		const skillNames = stringArray(rawGroup.skills);
+		if (skillNames.length === 0) continue;
+		groups.push({
+			name: rawGroup.name,
+			displayName: typeof rawGroup.displayName === "string" ? rawGroup.displayName : rawGroup.name,
+			skillNames,
+			extensions: stringArray(rawGroup.extensions).map((extension) => {
+				const normalized = extension.toLocaleLowerCase("zh-CN");
+				return normalized.startsWith(".") ? normalized : `.${normalized}`;
+			}),
 			keywords: stringArray(rawGroup.keywords),
 		});
 	}
@@ -228,6 +252,7 @@ export async function loadPacks(): Promise<void> {
 					tools,
 					activation: readActivation(manifest),
 					toolGroups: readToolGroups(manifest, toolNames),
+					skillGroups: readSkillGroups(manifest),
 					deferred,
 					metaToolName,
 				},
@@ -249,6 +274,12 @@ export function listPacks(): Array<PackInfo & { toolNames: string[]; mounted: bo
 		toolNames: pack.info.tools.map((tool) => tool.name),
 		activation: pack.info.activation ? { ...pack.info.activation } : null,
 		toolGroups: pack.info.toolGroups.map((group) => ({ ...group, toolNames: [...group.toolNames] })),
+		skillGroups: pack.info.skillGroups.map((group) => ({
+			...group,
+			skillNames: [...group.skillNames],
+			extensions: [...group.extensions],
+			keywords: [...group.keywords],
+		})),
 		mounted: mountedPackNames.includes(pack.info.name),
 	}));
 }
@@ -272,6 +303,116 @@ export function fullPackToolNames(name: string, includeMetaTool = false): string
 	return pack.info.tools
 		.map((tool) => tool.name)
 		.filter((toolName) => includeMetaTool || toolName !== pack.info.metaToolName);
+}
+
+const FILE_EXPLORATION_EXTENSIONS = [
+	".c",
+	".cc",
+	".cpp",
+	".cs",
+	".css",
+	".go",
+	".h",
+	".hpp",
+	".html",
+	".java",
+	".js",
+	".json",
+	".jsx",
+	".kt",
+	".md",
+	".py",
+	".rs",
+	".sql",
+	".toml",
+	".ts",
+	".tsx",
+	".vue",
+	".xml",
+	".yaml",
+	".yml",
+];
+
+const FILE_EXPLORATION_KEYWORDS = [
+	"代码",
+	"源码",
+	"代码库",
+	"项目结构",
+	"目录结构",
+	"浏览目录",
+	"列出目录",
+	"搜索文件",
+	"查找文件",
+	"找文件",
+	"定位文件",
+	"搜索内容",
+	"全文搜索",
+	"在哪个文件",
+	"which file",
+	"search files",
+	"find file",
+	"repository structure",
+];
+
+const WINDOWS_SYSTEM_KEYWORDS = [
+	"windows",
+	"powershell",
+	"注册表",
+	"系统进程",
+	"系统服务",
+	"windows 服务",
+	"磁盘空间",
+	"驱动器",
+	"环境变量",
+	"端口占用",
+	"网络配置",
+	"任务计划",
+	"设备管理",
+	"事件查看器",
+	".ps1",
+];
+
+function matchedReasons(normalizedText: string, values: string[], prefix: string): string[] {
+	return values
+		.filter((value) => normalizedText.includes(value.toLocaleLowerCase("zh-CN")))
+		.map((value) => `${prefix}${value}`);
+}
+
+function selectCoreCapabilities(normalizedText: string): CapabilityMatch[] {
+	const matches: CapabilityMatch[] = [];
+	const fileReasons = [
+		...matchedReasons(normalizedText, FILE_EXPLORATION_EXTENSIONS, "发现文件类型 "),
+		...matchedReasons(normalizedText, FILE_EXPLORATION_KEYWORDS, "匹配文件任务“"),
+	].map((reason) => (reason.startsWith("匹配文件任务") ? `${reason}”` : reason));
+	if (fileReasons.length > 0) {
+		matches.push({
+			packName: "pi-file-exploration",
+			displayName: "文件与代码浏览",
+			groupNames: ["explore"],
+			groupDisplayNames: ["搜索与浏览"],
+			toolNames: ["grep", "find", "ls"],
+			skillNames: [],
+			reasons: fileReasons,
+		});
+	}
+
+	if (isWindowsPowerShellAvailable()) {
+		const windowsReasons = matchedReasons(normalizedText, WINDOWS_SYSTEM_KEYWORDS, "匹配 Windows 任务“").map(
+			(reason) => `${reason}”`,
+		);
+		if (windowsReasons.length > 0) {
+			matches.push({
+				packName: "windows-system",
+				displayName: "Windows 系统操作",
+				groupNames: ["system"],
+				groupDisplayNames: ["系统诊断与操作"],
+				toolNames: ["powershell"],
+				skillNames: [],
+				reasons: windowsReasons,
+			});
+		}
+	}
+	return matches;
 }
 
 /** 根据会话绑定的助手和本轮文字，在本地选择最小工具组；不请求模型，不消耗 token。 */
@@ -306,16 +447,29 @@ export function selectCapabilities(text: string, enabledPackNames: Iterable<stri
 			selectedGroups.length > 0
 				? [...new Set(selectedGroups.flatMap((group) => group.toolNames))]
 				: fullPackToolNames(packName);
-		if (toolNames.length === 0) continue;
+		let selectedSkillGroups = pack.info.skillGroups.filter(
+			(group) =>
+				group.extensions.some((extension) => normalizedText.includes(extension)) ||
+				group.keywords.some((keyword) => normalizedText.includes(keyword.toLocaleLowerCase("zh-CN"))),
+		);
+		if (selectedSkillGroups.length === 0) {
+			selectedSkillGroups = pack.info.skillGroups.filter((group) =>
+				activation.defaultSkillGroups.includes(group.name),
+			);
+		}
+		const skillNames = [...new Set(selectedSkillGroups.flatMap((group) => group.skillNames))];
+		if (toolNames.length === 0 && skillNames.length === 0) continue;
 		matches.push({
 			packName,
 			displayName: pack.info.displayName,
 			groupNames: selectedGroups.map((group) => group.name),
 			groupDisplayNames: selectedGroups.map((group) => group.displayName),
 			toolNames,
+			skillNames,
 			reasons,
 		});
 	}
+	matches.push(...selectCoreCapabilities(normalizedText));
 	return matches;
 }
 

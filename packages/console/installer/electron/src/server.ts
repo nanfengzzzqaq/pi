@@ -18,6 +18,7 @@ import {
 	createAgentSession,
 	ModelRuntime,
 	SessionManager,
+	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -29,6 +30,7 @@ import { extractFileReferences } from "./artifacts.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
+import * as customModels from "./custom-models.ts";
 import * as fsExplorer from "./fs.ts";
 import { isAllowedLoopbackHost } from "./http-security.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
@@ -64,6 +66,7 @@ import {
 	type TrackedSessionPrompt,
 } from "./session-lifecycle.ts";
 import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
+import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -94,6 +97,8 @@ const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
  */
 const CONSOLE_AGENT_DIR = join(DATA_DIR, "agent");
+/** 控制台界面管理的自定义 OpenAI 兼容模型；Key 仍单独保存在 auth.json。 */
+const CUSTOM_MODELS_FILE = join(CONSOLE_AGENT_DIR, "custom-models.json");
 // Pi 官方 grep/find 会从 agent/bin 读取私有 rg/fd；网页开发模式与 Electron 安装版保持一致。
 process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 /** 旧内部包名继续保留，避免历史会话失效；客户端统一显示为 OfficeCLI 工具。 */
@@ -147,6 +152,8 @@ interface ConsoleSession {
 	enabledPacks: Set<string>;
 	/** 本轮临时激活的最小工具组；agent_settled 后清空。 */
 	activePackTools: Map<string, Set<string>>;
+	/** 完整发现、按本轮过滤的 Skill 资源加载器。 */
+	resourceLoader: RoutedSkillResourceLoader;
 	lastCapabilityTrace: CapabilityTrace | null;
 	lastUsage: unknown;
 	/** DELETE 已开始后禁止再提交消息。 */
@@ -208,6 +215,7 @@ interface CapabilityTrace extends ToolSnapshot {
 	stepDisplayName: string;
 	enabledCapabilities: Array<{ name: string; displayName: string }>;
 	selectedCapabilities: CapabilityMatch[];
+	selectedSkills: Array<{ name: string; description: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +346,13 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+try {
+	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
+		modelRuntime.registerProvider(definition.providerId, customModels.toProviderConfig(definition));
+	}
+} catch (error) {
+	console.warn(`自定义模型配置加载失败：${error instanceof Error ? error.message : String(error)}`);
+}
 const codexOAuth = new CodexOAuthCoordinator({
 	isConnected: () => modelRuntime.isUsingOAuth("openai-codex"),
 	login: async (interaction) => {
@@ -354,6 +369,9 @@ if (seedBundledWindowsRuntime()) {
 }
 if (seedBundledSearchRuntime()) {
 	console.log("Windows 工具：已把 Pi 私有文件搜索运行时复制到数据目录");
+}
+if (removeObsoleteTravelExpenseSkill(CONSOLE_AGENT_DIR)) {
+	console.log("Skill 迁移：已移除缺少对应工具的旧差旅 Skill");
 }
 
 // 加载能力包（新加的包重启服务后生效）
@@ -522,6 +540,26 @@ function activeToolSnapshot(session: AgentSession): ToolSnapshot {
 	return toolSnapshot(session, session.getActiveToolNames());
 }
 
+function requestedSkillNames(text: string): string[] {
+	const match = text.trimStart().match(/^\/skill:([A-Za-z0-9_-]+)/);
+	return match ? [match[1]] : [];
+}
+
+function availableSelectedSkills(
+	resourceLoader: RoutedSkillResourceLoader,
+	names: Iterable<string>,
+): Array<{ name: string; description: string }> {
+	const requested = new Set(names);
+	return resourceLoader
+		.getAllSkills()
+		.skills.filter((skill) => requested.has(skill.name))
+		.map((skill) => ({ name: skill.name, description: skill.description }));
+}
+
+function skillNamesForTurn(text: string, selectedCapabilities: CapabilityMatch[]): string[] {
+	return [...new Set([...selectedCapabilities.flatMap((match) => match.skillNames), ...requestedSkillNames(text)])];
+}
+
 /**
  * capability_search 是本地确定性路由，不属于 Pi 原生消息；切换会话时按当时的用户消息重新生成，
  * 这样无需再次调用模型，也不会让实时执行过程在历史中消失。
@@ -536,12 +574,14 @@ function historicalCapabilityTrace(
 	const selectedTools = new Map<string, Set<string>>();
 	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
 	const names = effectiveToolNames(enabledPacks, selectedTools);
+	const resourceLoader = session.resourceLoader as RoutedSkillResourceLoader;
 	return {
 		stepId: `history-capability-${timestamp}`,
 		stepName: "capability_search",
 		stepDisplayName: "查找可用能力（capability_search）",
 		enabledCapabilities: packSummaries(enabledPacks),
 		selectedCapabilities,
+		selectedSkills: availableSelectedSkills(resourceLoader, skillNamesForTurn(text, selectedCapabilities)),
 		...toolSnapshot(session, names),
 	};
 }
@@ -552,6 +592,8 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 	for (const match of selectedCapabilities) {
 		cs.activePackTools.set(match.packName, new Set(match.toolNames));
 	}
+	const selectedSkills = availableSelectedSkills(cs.resourceLoader, skillNamesForTurn(text, selectedCapabilities));
+	cs.resourceLoader.setActiveSkillNames(selectedSkills.map((skill) => skill.name));
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	const trace: CapabilityTrace = {
 		stepId: `capability-${randomUUID()}`,
@@ -559,6 +601,7 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 		stepDisplayName: "查找可用能力（capability_search）",
 		enabledCapabilities: packSummaries(cs.enabledPacks),
 		selectedCapabilities,
+		selectedSkills,
 		...activeToolSnapshot(cs.session),
 	};
 	cs.lastCapabilityTrace = trace;
@@ -566,8 +609,9 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 }
 
 function releaseTurnCapabilities(cs: ConsoleSession): void {
-	if (cs.activePackTools.size === 0) return;
+	if (cs.activePackTools.size === 0 && cs.resourceLoader.getSkills().skills.length === 0) return;
 	cs.activePackTools.clear();
+	cs.resourceLoader.setActiveSkillNames([]);
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 }
 
@@ -604,6 +648,7 @@ async function buildSession(
 	modelFallbackMessage?: string;
 	enabledPacks: Set<string>;
 	activePackTools: Map<string, Set<string>>;
+	resourceLoader: RoutedSkillResourceLoader;
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -613,6 +658,9 @@ async function buildSession(
 		: SessionManager.create(cwd, SESSION_DIR);
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
+	const settingsManager = SettingsManager.create(cwd, CONSOLE_AGENT_DIR);
+	const resourceLoader = new RoutedSkillResourceLoader({ cwd, agentDir: CONSOLE_AGENT_DIR, settingsManager });
+	await resourceLoader.reload();
 	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
@@ -622,11 +670,15 @@ async function buildSession(
 		agentDir: string;
 		model?: SessionModel;
 		customTools: ToolDefinition<any, any, any>[];
+		settingsManager: SettingsManager;
+		resourceLoader: RoutedSkillResourceLoader;
 	} = {
 		cwd,
 		modelRuntime,
 		sessionManager,
 		agentDir: CONSOLE_AGENT_DIR,
+		settingsManager,
+		resourceLoader,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
 		customTools: [
 			...instantiateCoreFileTools(cwd),
@@ -671,6 +723,7 @@ async function buildSession(
 		modelFallbackMessage,
 		enabledPacks,
 		activePackTools,
+		resourceLoader,
 	};
 }
 
@@ -690,13 +743,8 @@ async function createConsoleSession(
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const {
-		session,
-		sessionFile,
-		modelFallbackMessage,
-		enabledPacks,
-		activePackTools,
-	} = await buildSession(cwd, enabledPackNames);
+	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
+		await buildSession(cwd, enabledPackNames);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -706,6 +754,7 @@ async function createConsoleSession(
 		sseClients: new Set(),
 		enabledPacks,
 		activePackTools,
+		resourceLoader,
 		lastCapabilityTrace: null,
 		lastUsage: null,
 		deleting: false,
@@ -731,13 +780,8 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	try {
 		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
 		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
-		const {
-			session,
-			sessionFile,
-			modelFallbackMessage,
-			enabledPacks,
-			activePackTools,
-		} = await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
+		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
+			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -746,6 +790,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			sseClients: new Set(),
 			enabledPacks,
 			activePackTools,
+			resourceLoader,
 			lastCapabilityTrace: null,
 			lastUsage: null,
 			deleting: false,
@@ -811,9 +856,7 @@ function buildHistory(session: AgentSession, enabledPacks: Set<string>): History
 					text: redactSensitiveText(parsed.text),
 					attachments: parsed.attachments,
 				};
-				if (enabledPacks.size > 0) {
-					item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
-				}
+				item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
 				items.push(item);
 			}
 		} else if (message.role === "assistant") {
@@ -1133,6 +1176,19 @@ function deleteAuthEntry(provider: string): boolean {
 	delete data[provider];
 	writeAuthFile(data);
 	return true;
+}
+
+function savedApiKey(provider: string): string | undefined {
+	const entry = readAuthFile()[provider];
+	return entry?.type === "api_key" ? entry.key : undefined;
+}
+
+function listCustomModels() {
+	const authFile = readAuthFile();
+	return customModels.loadCustomModels(CUSTOM_MODELS_FILE).map((definition) => ({
+		...definition,
+		hasKey: authFile[definition.providerId]?.type === "api_key",
+	}));
 }
 
 /** Key 列表：文件里已存的 + 环境变量配置的（标注来源），脱敏显示 */
@@ -1698,6 +1754,73 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
+	// 自定义 OpenAI 兼容模型：独立保存服务配置，Key 复用 auth.json。
+	if (pathname === "/api/custom-models" && req.method === "GET") {
+		sendJson(res, 200, listCustomModels());
+		return;
+	}
+	if (pathname === "/api/custom-models/discover" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { baseUrl?: unknown; apiKey?: unknown; providerId?: unknown };
+		const providerId = typeof body.providerId === "string" ? body.providerId : "";
+		const apiKey =
+			typeof body.apiKey === "string" && body.apiKey.trim()
+				? body.apiKey.trim()
+				: providerId
+					? savedApiKey(providerId)
+					: undefined;
+		try {
+			sendJson(res, 200, { models: await customModels.discoverOpenAIModels(body.baseUrl, apiKey) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/custom-models" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as customModels.CustomModelInput & {
+			providerId?: unknown;
+			apiKey?: unknown;
+		};
+		const requestedProviderId = typeof body.providerId === "string" ? body.providerId : "";
+		const providerId = requestedProviderId || customModels.createCustomProviderId(randomUUID());
+		if (requestedProviderId && !customModels.isCustomProviderId(requestedProviderId)) {
+			sendJson(res, 400, { error: "自定义模型服务标识无效" });
+			return;
+		}
+		const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+		if (!apiKey && !savedApiKey(providerId)) {
+			sendJson(res, 400, { error: "首次添加时请填写 API Key；无鉴权服务可填写任意占位值" });
+			return;
+		}
+		try {
+			const definition = customModels.normalizeCustomModel(providerId, body);
+			customModels.saveCustomModel(CUSTOM_MODELS_FILE, definition);
+			if (apiKey) writeAuthEntry(providerId, apiKey);
+			modelRuntime.registerProvider(providerId, customModels.toProviderConfig(definition));
+			await modelRuntime.refresh();
+			sendJson(res, 200, { ok: true, ...definition });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+	const customModelMatch = pathname.match(/^\/api\/custom-models\/([^/]+)$/u);
+	if (customModelMatch && req.method === "DELETE") {
+		const providerId = decodeURIComponent(customModelMatch[1]);
+		try {
+			if (!customModels.removeCustomModel(CUSTOM_MODELS_FILE, providerId)) {
+				sendJson(res, 404, { error: "自定义模型不存在" });
+				return;
+			}
+			modelRuntime.unregisterProvider(providerId);
+			deleteAuthEntry(providerId);
+			await modelRuntime.refresh();
+			sendJson(res, 200, { ok: true });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+		}
+		return;
+	}
+
 	// Codex 订阅登录（Pi 官方 openai-codex OAuth；使用设备码避免占用本地回调端口）
 	if (pathname === "/api/oauth/openai-codex/status" && req.method === "GET") {
 		sendJson(res, 200, codexOAuth.status());
@@ -2019,9 +2142,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
-			if (cs.enabledPacks.size > 0) {
-				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
-			}
+			bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
 			updateSessionTitle(

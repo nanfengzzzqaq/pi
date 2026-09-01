@@ -21,10 +21,18 @@
 			"报告",
 			"合同",
 			"简历",
-			"模板"
+			"模板",
+			"学术论文",
+			"融资",
+			"路演",
+			"财务模型",
+			"数据看板",
+			"动态变形",
+			"三维演示"
 		],
 		"minimumScore": 2,
-		"defaultGroups": ["inspect"]
+		"defaultGroups": ["inspect"],
+		"defaultSkillGroups": ["word", "pptx", "excel"]
 	},
 	"toolGroups": [
 		{
@@ -66,6 +74,66 @@
 				"office_help"
 			],
 			"keywords": ["修改", "编辑", "替换", "删除", "移动", "交换", "调整", "更新", "批量", "处理", "修复"]
+		}
+	],
+	"skillGroups": [
+		{
+			"name": "word",
+			"displayName": "Word 文档技能",
+			"skills": ["officecli-docx"],
+			"extensions": [".docx"],
+			"keywords": ["Word", "文档", "合同", "报告", "简历", "模板"]
+		},
+		{
+			"name": "academic",
+			"displayName": "学术论文技能",
+			"skills": ["officecli-docx", "officecli-academic-paper"],
+			"keywords": ["学术", "论文", "参考文献", "脚注", "公式编号"]
+		},
+		{
+			"name": "pptx",
+			"displayName": "PowerPoint 技能",
+			"skills": ["officecli-pptx"],
+			"extensions": [".pptx"],
+			"keywords": ["PowerPoint", "PPT", "演示文稿", "幻灯片"]
+		},
+		{
+			"name": "pitch",
+			"displayName": "融资路演技能",
+			"skills": ["officecli-pptx", "officecli-pitch-deck"],
+			"keywords": ["融资", "路演", "投资人", "种子轮", "A轮", "B轮", "C轮"]
+		},
+		{
+			"name": "morph",
+			"displayName": "动态变形演示技能",
+			"skills": ["officecli-pptx", "morph-ppt"],
+			"keywords": ["动态变形", "变形动画", "连续移动", "连续缩放", "Morph"]
+		},
+		{
+			"name": "morph-3d",
+			"displayName": "三维动态演示技能",
+			"skills": ["officecli-pptx", "morph-ppt", "morph-ppt-3d"],
+			"extensions": [".glb"],
+			"keywords": ["三维演示", "3D演示", "三维模型", "镜头运动"]
+		},
+		{
+			"name": "excel",
+			"displayName": "Excel 工作簿技能",
+			"skills": ["officecli-xlsx"],
+			"extensions": [".xlsx", ".csv", ".tsv"],
+			"keywords": ["Excel", "表格", "工作簿", "数据表"]
+		},
+		{
+			"name": "finance",
+			"displayName": "财务模型技能",
+			"skills": ["officecli-xlsx", "officecli-financial-model"],
+			"keywords": ["财务模型", "现金流", "估值", "敏感性分析", "经营预测"]
+		},
+		{
+			"name": "dashboard",
+			"displayName": "数据看板技能",
+			"skills": ["officecli-xlsx", "officecli-data-dashboard"],
+			"keywords": ["数据看板", "仪表盘", "指标卡", "迷你图"]
 		}
 	]
 }

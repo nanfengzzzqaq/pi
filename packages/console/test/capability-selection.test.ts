@@ -9,7 +9,7 @@ describe("按本轮选择能力", () => {
 	it("普通问候不注入 Office 工具", () => {
 		const tools = baseToolNames(["office-assistant"]);
 		expect(tools).toEqual(expect.arrayContaining(["read", "edit", "write"]));
-		if (process.platform === "win32") expect(tools).toContain("powershell");
+		for (const dynamicTool of ["grep", "find", "ls", "powershell"]) expect(tools).not.toContain(dynamicTool);
 		expect(selectCapabilities("你好", ["office-assistant"])).toEqual([]);
 	});
 
@@ -17,6 +17,7 @@ describe("按本轮选择能力", () => {
 		const [match] = selectCapabilities("请查看 uploads/report.xlsx 的内容", ["office-assistant"]);
 		expect(match?.groupNames).toEqual(["inspect"]);
 		expect(match?.toolNames).toEqual(["office_view", "office_get", "office_query", "office_help"]);
+		expect(match?.skillNames).toEqual(["officecli-xlsx"]);
 	});
 
 	it("修改文档只加载编辑分组", () => {
@@ -24,6 +25,7 @@ describe("按本轮选择能力", () => {
 		expect(match?.groupNames).toEqual(["edit"]);
 		expect(match?.toolNames).toContain("office_set");
 		expect(match?.toolNames).not.toContain("office_create");
+		expect(match?.skillNames).toEqual(["officecli-docx"]);
 	});
 
 	it("网页任务只加载客户端浏览器所需分组", () => {
@@ -48,6 +50,27 @@ describe("按本轮选择能力", () => {
 		const [github] = selectCapabilities("把当前分支推送到 GitHub 并创建 PR", ["code-development"]);
 		expect(github?.groupNames).toEqual(expect.arrayContaining(["change", "github"]));
 		expect(github?.toolNames).toContain("github_pull_request");
+		expect(github?.skillNames).toEqual(["code-development-workflow"]);
+	});
+
+	it("文件搜索和 Windows 系统工具只在相应任务中加载", () => {
+		const fileTools = selectCapabilities("请在代码里搜索 createAgentSession", []).flatMap((match) => match.toolNames);
+		expect(fileTools).toEqual(expect.arrayContaining(["grep", "find", "ls"]));
+		expect(selectCapabilities("帮我写一封普通邮件", []).flatMap((match) => match.toolNames)).toEqual([]);
+
+		const windowsTools = selectCapabilities("检查 Windows 系统进程和端口占用", []).flatMap(
+			(match) => match.toolNames,
+		);
+		if (process.platform === "win32") expect(windowsTools).toContain("powershell");
+		else expect(windowsTools).not.toContain("powershell");
+	});
+
+	it("复杂 Office 场景只选择匹配的 Skill 组合", () => {
+		const [pitch] = selectCapabilities("请制作一份融资路演 PPT", ["office-assistant"]);
+		expect(pitch?.skillNames).toEqual(["officecli-pptx", "officecli-pitch-deck"]);
+
+		const [dashboard] = selectCapabilities("把数据做成 Excel 数据看板", ["office-assistant"]);
+		expect(dashboard?.skillNames).toEqual(["officecli-xlsx", "officecli-data-dashboard"]);
 	});
 
 	it("面向用户显示中文名称和内部代码名", () => {

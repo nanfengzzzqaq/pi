@@ -40,6 +40,9 @@
 		"minimumScore": 2,
 		"defaultGroups": [
 			"inspect"
+		],
+		"defaultSkillGroups": [
+			"workflow"
 		]
 	},
 	"toolGroups": [
@@ -129,6 +132,32 @@
 				"测试",
 				"构建"
 			]
+		}
+	],
+	"skillGroups": [
+		{
+			"name": "workflow",
+			"displayName": "代码开发工作流",
+			"skills": ["code-development-workflow"],
+			"extensions": [
+				".js",
+				".jsx",
+				".ts",
+				".tsx",
+				".py",
+				".java",
+				".go",
+				".rs",
+				".cs",
+				".cpp",
+				".c",
+				".html",
+				".css",
+				".json",
+				".toml",
+				".yaml"
+			],
+			"keywords": ["代码", "编程", "开发", "仓库", "Git", "GitHub", "提交", "推送", "测试", "构建"]
 		}
 	]
 }

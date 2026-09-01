@@ -18,6 +18,7 @@ import {
 	createAgentSession,
 	ModelRuntime,
 	SessionManager,
+	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -65,6 +66,7 @@ import {
 	type TrackedSessionPrompt,
 } from "./session-lifecycle.ts";
 import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
+import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
@@ -150,6 +152,8 @@ interface ConsoleSession {
 	enabledPacks: Set<string>;
 	/** 本轮临时激活的最小工具组；agent_settled 后清空。 */
 	activePackTools: Map<string, Set<string>>;
+	/** 完整发现、按本轮过滤的 Skill 资源加载器。 */
+	resourceLoader: RoutedSkillResourceLoader;
 	lastCapabilityTrace: CapabilityTrace | null;
 	lastUsage: unknown;
 	/** DELETE 已开始后禁止再提交消息。 */
@@ -211,6 +215,7 @@ interface CapabilityTrace extends ToolSnapshot {
 	stepDisplayName: string;
 	enabledCapabilities: Array<{ name: string; displayName: string }>;
 	selectedCapabilities: CapabilityMatch[];
+	selectedSkills: Array<{ name: string; description: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +369,9 @@ if (seedBundledWindowsRuntime()) {
 }
 if (seedBundledSearchRuntime()) {
 	console.log("Windows 工具：已把 Pi 私有文件搜索运行时复制到数据目录");
+}
+if (removeObsoleteTravelExpenseSkill(CONSOLE_AGENT_DIR)) {
+	console.log("Skill 迁移：已移除缺少对应工具的旧差旅 Skill");
 }
 
 // 加载能力包（新加的包重启服务后生效）
@@ -532,6 +540,26 @@ function activeToolSnapshot(session: AgentSession): ToolSnapshot {
 	return toolSnapshot(session, session.getActiveToolNames());
 }
 
+function requestedSkillNames(text: string): string[] {
+	const match = text.trimStart().match(/^\/skill:([A-Za-z0-9_-]+)/);
+	return match ? [match[1]] : [];
+}
+
+function availableSelectedSkills(
+	resourceLoader: RoutedSkillResourceLoader,
+	names: Iterable<string>,
+): Array<{ name: string; description: string }> {
+	const requested = new Set(names);
+	return resourceLoader
+		.getAllSkills()
+		.skills.filter((skill) => requested.has(skill.name))
+		.map((skill) => ({ name: skill.name, description: skill.description }));
+}
+
+function skillNamesForTurn(text: string, selectedCapabilities: CapabilityMatch[]): string[] {
+	return [...new Set([...selectedCapabilities.flatMap((match) => match.skillNames), ...requestedSkillNames(text)])];
+}
+
 /**
  * capability_search 是本地确定性路由，不属于 Pi 原生消息；切换会话时按当时的用户消息重新生成，
  * 这样无需再次调用模型，也不会让实时执行过程在历史中消失。
@@ -546,12 +574,14 @@ function historicalCapabilityTrace(
 	const selectedTools = new Map<string, Set<string>>();
 	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
 	const names = effectiveToolNames(enabledPacks, selectedTools);
+	const resourceLoader = session.resourceLoader as RoutedSkillResourceLoader;
 	return {
 		stepId: `history-capability-${timestamp}`,
 		stepName: "capability_search",
 		stepDisplayName: "查找可用能力（capability_search）",
 		enabledCapabilities: packSummaries(enabledPacks),
 		selectedCapabilities,
+		selectedSkills: availableSelectedSkills(resourceLoader, skillNamesForTurn(text, selectedCapabilities)),
 		...toolSnapshot(session, names),
 	};
 }
@@ -562,6 +592,8 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 	for (const match of selectedCapabilities) {
 		cs.activePackTools.set(match.packName, new Set(match.toolNames));
 	}
+	const selectedSkills = availableSelectedSkills(cs.resourceLoader, skillNamesForTurn(text, selectedCapabilities));
+	cs.resourceLoader.setActiveSkillNames(selectedSkills.map((skill) => skill.name));
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 	const trace: CapabilityTrace = {
 		stepId: `capability-${randomUUID()}`,
@@ -569,6 +601,7 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 		stepDisplayName: "查找可用能力（capability_search）",
 		enabledCapabilities: packSummaries(cs.enabledPacks),
 		selectedCapabilities,
+		selectedSkills,
 		...activeToolSnapshot(cs.session),
 	};
 	cs.lastCapabilityTrace = trace;
@@ -576,8 +609,9 @@ function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTr
 }
 
 function releaseTurnCapabilities(cs: ConsoleSession): void {
-	if (cs.activePackTools.size === 0) return;
+	if (cs.activePackTools.size === 0 && cs.resourceLoader.getSkills().skills.length === 0) return;
 	cs.activePackTools.clear();
+	cs.resourceLoader.setActiveSkillNames([]);
 	cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
 }
 
@@ -614,6 +648,7 @@ async function buildSession(
 	modelFallbackMessage?: string;
 	enabledPacks: Set<string>;
 	activePackTools: Map<string, Set<string>>;
+	resourceLoader: RoutedSkillResourceLoader;
 }> {
 	mkdirSync(cwd, { recursive: true });
 	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
@@ -623,6 +658,9 @@ async function buildSession(
 		: SessionManager.create(cwd, SESSION_DIR);
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
+	const settingsManager = SettingsManager.create(cwd, CONSOLE_AGENT_DIR);
+	const resourceLoader = new RoutedSkillResourceLoader({ cwd, agentDir: CONSOLE_AGENT_DIR, settingsManager });
+	await resourceLoader.reload();
 	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
 	const options: {
@@ -632,11 +670,15 @@ async function buildSession(
 		agentDir: string;
 		model?: SessionModel;
 		customTools: ToolDefinition<any, any, any>[];
+		settingsManager: SettingsManager;
+		resourceLoader: RoutedSkillResourceLoader;
 	} = {
 		cwd,
 		modelRuntime,
 		sessionManager,
 		agentDir: CONSOLE_AGENT_DIR,
+		settingsManager,
+		resourceLoader,
 		// 每会话独立实例化能力包工具，execute 时通过 getWorkspaceRoot 拿到本会话 cwd
 		customTools: [
 			...instantiateCoreFileTools(cwd),
@@ -681,6 +723,7 @@ async function buildSession(
 		modelFallbackMessage,
 		enabledPacks,
 		activePackTools,
+		resourceLoader,
 	};
 }
 
@@ -700,10 +743,8 @@ async function createConsoleSession(
 	// 用户设置了工作区则以其为会话工作目录（多会话共享）；否则用默认 workspaces/<uuid>
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
-	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
-		cwd,
-		enabledPackNames,
-	);
+	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
+		await buildSession(cwd, enabledPackNames);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -713,6 +754,7 @@ async function createConsoleSession(
 		sseClients: new Set(),
 		enabledPacks,
 		activePackTools,
+		resourceLoader,
 		lastCapabilityTrace: null,
 		lastUsage: null,
 		deleting: false,
@@ -738,12 +780,8 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 	try {
 		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
 		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
-		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools } = await buildSession(
-			entry.cwd,
-			restoredEnabledPacks,
-			undefined,
-			entry.sessionFile,
-		);
+		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
+			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -752,6 +790,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			sseClients: new Set(),
 			enabledPacks,
 			activePackTools,
+			resourceLoader,
 			lastCapabilityTrace: null,
 			lastUsage: null,
 			deleting: false,
@@ -817,9 +856,7 @@ function buildHistory(session: AgentSession, enabledPacks: Set<string>): History
 					text: redactSensitiveText(parsed.text),
 					attachments: parsed.attachments,
 				};
-				if (enabledPacks.size > 0) {
-					item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
-				}
+				item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
 				items.push(item);
 			}
 		} else if (message.role === "assistant") {
@@ -2105,9 +2142,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
-			if (cs.enabledPacks.size > 0) {
-				bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
-			}
+			bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
 			sendJson(res, 202, { ok: true });
 			updateSessionTitle(

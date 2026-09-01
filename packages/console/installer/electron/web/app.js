@@ -27,7 +27,6 @@ const messagesEl = $("messages");
 const messagesEmptyEl = $("messages-empty");
 const inputEl = $("input");
 const sendBtn = $("send-btn");
-const stopBtn = $("stop-btn");
 const indicatorEl = $("indicator");
 const errorBarEl = $("error-bar");
 const connStateEl = $("conn-state");
@@ -2001,7 +2000,9 @@ function formatCapabilitySelection(event) {
 		}
 	}
 	const tools = Array.isArray(event.tools) ? event.tools.map((tool) => tool.displayName || tool.name) : [];
+	const skills = Array.isArray(event.selectedSkills) ? event.selectedSkills.map((skill) => skill.name) : [];
 	lines.push(`本轮实际工具（${event.toolCount ?? tools.length}）：${tools.join("、") || "无"}`);
+	lines.push(`本轮 Skills（${skills.length}）：${skills.join("、") || "无"}`);
 	lines.push(`工具定义大小：${formatByteSize(event.schemaBytes)}；指纹：${event.schemaFingerprint || "无"}`);
 	return lines.join("\n");
 }
@@ -2855,8 +2856,13 @@ function summarizeArgs(args) {
 
 function setRunning(value, restoreOnly = false) {
 	running = value;
-	sendBtn.hidden = value;
-	stopBtn.hidden = !value;
+	sendBtn.classList.toggle("is-running", value);
+	sendBtn.querySelector("span").textContent = value ? "停止" : "发送";
+	sendBtn.querySelector(".send-icon").hidden = value;
+	sendBtn.querySelector(".stop-icon").hidden = !value;
+	sendBtn.setAttribute("aria-label", value ? "停止生成" : "发送消息");
+	sendBtn.title = value ? "停止生成" : "发送消息";
+	sendBtn.disabled = false;
 	if (!value) {
 		currentAssistant = null;
 		setIndicator(false);
@@ -3143,15 +3149,21 @@ async function sendMessage() {
 
 async function abortRun() {
 	if (!sessionId) return;
+	sendBtn.disabled = true;
+	sendBtn.querySelector("span").textContent = "停止中…";
 	try {
 		await api(`/api/sessions/${sessionId}/abort`, { method: "POST", body: "{}" });
 	} catch (error) {
 		showError(error.message);
+	} finally {
+		if (running) {
+			sendBtn.disabled = false;
+			sendBtn.querySelector("span").textContent = "停止";
+		}
 	}
 }
 
-sendBtn.addEventListener("click", sendMessage);
-stopBtn.addEventListener("click", abortRun);
+sendBtn.addEventListener("click", () => (running ? abortRun() : sendMessage()));
 
 /** 输入框按内容增高，避免空白时占据过多聊天空间。 */
 function resizeComposerInput() {

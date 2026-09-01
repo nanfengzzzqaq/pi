@@ -1867,7 +1867,7 @@ body {
 	cursor: default;
 }
 
-#stop-btn {
+#send-btn.is-running {
 	background: var(--error);
 	color: #fff;
 }
@@ -6385,7 +6385,7 @@ body::before {
 	opacity: 0.58;
 }
 
-#stop-btn {
+#send-btn.is-running {
 	border: 1px solid rgb(255 116 127 / 0.35);
 	background: linear-gradient(135deg, #ef6672, #d94b65);
 	box-shadow: 0 9px 24px rgb(170 47 66 / 0.24), inset 0 1px 0 rgb(255 255 255 / 0.2);
