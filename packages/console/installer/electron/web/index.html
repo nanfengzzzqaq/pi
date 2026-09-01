@@ -207,7 +207,7 @@
 							<span id="code-editor-status" class="office-preview-status">未修改</span>
 						</div>
 						<div class="office-preview-actions">
-							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异（git_diff）">查看差异</button>
+							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异（git_diff）" hidden>查看差异</button>
 							<button id="code-editor-preview" class="secondary-btn small" type="button" title="预览 Markdown" hidden>预览</button>
 							<button id="code-editor-focus" class="secondary-btn small" type="button" title="进入专注模式">专注</button>
 							<button id="code-editor-save" class="primary-btn small" type="button" title="保存当前文件（code_save）" disabled>保存</button>
@@ -221,7 +221,7 @@
 					<div id="code-editor-markdown-preview" class="code-editor-markdown-preview text" hidden></div>
 				</section>
 
-				<!-- 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换，原生浏览器只在浏览器标签激活时显示） -->
+				<!-- 右侧统一边栏：只保留终端 / 浏览器；执行活动已在对话内展示 -->
 				<div id="workbench-side-resizer" class="office-preview-resizer" title="拖动调整侧栏宽度" hidden></div>
 				<section id="workbench-side" class="workbench-side" hidden>
 					<div id="activity-pane" class="workbench-pane" hidden>
@@ -323,12 +323,6 @@
 					</div>
 
 					<nav class="workbench-tabs" aria-label="侧栏视图">
-						<button id="side-tab-activity" class="workbench-tab" type="button" title="查看智能体执行活动">
-							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M10 6.5v3.8l2.6 1.6"></path></svg></span><span>活动</span>
-						</button>
-						<button id="side-tab-review" class="workbench-tab" type="button" title="审查工作区代码差异">
-							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 4.5h10M5 10h6M5 15.5h8"></path><circle cx="15" cy="10" r="1.5"></circle></svg></span><span>变更</span>
-						</button>
 						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
 							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 6 3.5 4-3.5 4M10.5 14h5"></path></svg></span><span>终端</span>
 						</button>

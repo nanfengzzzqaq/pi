@@ -27,6 +27,11 @@ import {
 	vaultSensitiveUrlsInText,
 } from "./agent-browser-runtime.ts";
 import { extractFileReferences } from "./artifacts.ts";
+import {
+	deleteAttachmentSnapshots,
+	resolveAttachmentSnapshots,
+	saveAttachmentSnapshot,
+} from "./attachment-snapshots.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
@@ -830,7 +835,7 @@ interface HistoryItem {
 }
 
 /** 从 session.messages 生成消息快照（user/assistant 文本 + 工具调用记录），供页面刷新恢复 */
-function buildHistory(session: AgentSession, enabledPacks: Set<string>): HistoryItem[] {
+function buildHistory(sessionId: string, session: AgentSession, enabledPacks: Set<string>): HistoryItem[] {
 	const items: HistoryItem[] = [];
 	for (const message of session.messages) {
 		if (message.role === "user") {
@@ -847,14 +852,15 @@ function buildHistory(session: AgentSession, enabledPacks: Set<string>): History
 				text = parts.join("\n");
 			}
 			const parsed = parseUserMessage(text);
+			const messageAttachments = resolveAttachmentSnapshots(DATA_DIR, sessionId, parsed.attachments);
 			if (hasImage && parsed.attachments.length === 0) {
 				parsed.text = `${parsed.text}${parsed.text ? "\n" : ""}[图片]`;
 			}
-			if (parsed.text || parsed.attachments.length > 0) {
+			if (parsed.text || messageAttachments.length > 0) {
 				const item: HistoryItem = {
 					role: "user",
 					text: redactSensitiveText(parsed.text),
-					attachments: parsed.attachments,
+					attachments: messageAttachments,
 				};
 				item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
 				items.push(item);
@@ -2268,6 +2274,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const uploadsDir = join(cs.session.sessionManager.getCwd(), "uploads");
 			mkdirSync(uploadsDir, { recursive: true });
 			const saved: string[] = [];
+			const messageFiles: string[] = [];
 			let totalBytes = 0;
 			for (const file of body.files as Array<{ name?: unknown; mimeType?: unknown; dataBase64?: unknown }>) {
 				if (typeof file?.name !== "string" || typeof file?.dataBase64 !== "string") {
@@ -2289,9 +2296,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					.slice(0, 200);
 				const relative = uniquePath(uploadsDir, safeName);
 				writeFileSync(join(uploadsDir, relative), data);
-				saved.push(`uploads/${relative}`);
+				const workingPath = `uploads/${relative}`;
+				saved.push(workingPath);
+				messageFiles.push(saveAttachmentSnapshot(DATA_DIR, cs.sessionId, workingPath, safeName, data));
 			}
-			sendJson(res, 200, { files: saved });
+			sendJson(res, 200, { files: saved, messageFiles });
 			return;
 		}
 
@@ -2360,7 +2369,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 200, {
 				sessionId: cs.sessionId,
 				streaming: cs.session.isStreaming,
-				messages: buildHistory(cs.session, cs.enabledPacks),
+				messages: buildHistory(cs.sessionId, cs.session, cs.enabledPacks),
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
@@ -2413,6 +2422,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			}
 			delete index[sessionId];
 			writeSessionIndex(index);
+			deleteAttachmentSnapshots(DATA_DIR, sessionId);
 			sendJson(res, 200, { ok: true });
 			return;
 		}

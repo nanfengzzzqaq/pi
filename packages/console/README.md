@@ -38,7 +38,7 @@ npx tsx packages/console/src/server.ts
 - **设置（顶栏 ⚙）→ 模型服务**：选择厂商 + 粘贴 API Key 即可添加（存 `%APPDATA%pi-consoledataagentauth.json`，也可删除）；环境变量配置的会标注环境变量。也可添加 vLLM、Ollama、LM Studio 等 OpenAI 兼容地址，自动读取模型列表，并配置上下文、最大输出、图片能力和可选的 `low / medium / xhigh` 推理等级。
 - **客户端窗口**：快捷方式以 Edge App 模式打开独立窗口（无地址栏/标签页），找不到 Edge 时回退默认浏览器
 - **应用内更新**：设置 → 关于与更新 → 检查更新 / 立即更新（从 GitHub Release 拉取最新 Setup，校验 SHA256 后静默重装，并从用户实际安装位置自动重启；私有仓库需在设置里填写 GitHub Token）
-- **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式
+- **附件**：📎 选择、拖拽文件到窗口、粘贴（Ctrl+V）截图/文件三种方式。用户消息保存不可变原始快照，智能体只修改工作区副本，修改结果作为新的产物文件展示。
 - **代码开发插件**：工具页只有一个“代码开发（code-development）”入口，内部统一提供 Monaco 编辑器、私有 Git/GitHub 工作流，以及按项目安装的 Node.js、Python、Java、Go、Rust、.NET 环境。组件都保存在 Pi 数据目录，不修改 Windows 系统 PATH，也不覆盖电脑已有环境。
 
 ## 客户端形态
@@ -88,7 +88,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/sessions` | 创建会话，返回 `{ sessionId }` |
 | `GET /api/sessions/:id/stream?since=N` | SSE 事件流；`since` 补发，缓冲不足下发 `resync` |
 | `POST /api/sessions/:id/messages` | body `{"text":"...","images":[{"data","mimeType"}]}`；立即回 202，错误走 SSE |
-| `POST /api/sessions/:id/files` | body `{"files":[{name,mimeType,dataBase64}]}`；单文件 ≤20MB、总量 ≤50MB，超限 413；写入 `<会话cwd>/uploads/`，重名加后缀 |
+| `POST /api/sessions/:id/files` | body `{"files":[{name,mimeType,dataBase64}]}`；单文件 ≤20MB、总量 ≤50MB，超限 413；返回模型工作副本 `files` 与消息原始快照 `messageFiles` |
 | `POST /api/sessions/:id/abort` | 中止当前运行 |
 | `GET /api/sessions/:id/history` | 消息快照（含 `model`、`thinkingLevel`、`lastSeq`），刷新恢复 |
 | `POST /api/sessions/:id/model` | body `{"provider","modelId"}` → `session.setModel`，SSE 发 `model_changed` |
@@ -134,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 - 顶栏：模型选择器（已配置 Key 的完整列出，未配置的按 provider 折叠）、思考等级选择器
 - 左侧：可折叠"能力包"面板（开关 + OfficeCLI 状态行 + 下载进度条）
-- 输入区：📎 附件（多文件芯片、可移除）；图片同时作为 `images` 传给模型，所有附件先存 `uploads/` 并在消息末尾追加 `[附件: ...]` 行；历史快照中图片显示为 `[图片]`
+- 输入区：📎 附件（多文件芯片、可移除）；图片同时作为 `images` 传给模型。附件在 `uploads/` 生成模型工作副本，在 Pi 数据目录生成消息原始快照；历史消息始终打开原始快照，模型只看到工作副本路径。
 - SSE 断线自动重连（`since` 补发 + seq 去重 + `resync` 全量重建兜底）
 
 ## 验收清单

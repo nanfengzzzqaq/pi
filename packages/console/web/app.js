@@ -154,8 +154,6 @@ const workbenchSideEl = $("workbench-side");
 const workbenchSideResizerEl = $("workbench-side-resizer");
 const workbenchCloseButtons = document.querySelectorAll("[data-workbench-close]");
 const workbenchMaximizeButtons = document.querySelectorAll("[data-workbench-maximize]");
-const sideTabActivityEl = $("side-tab-activity");
-const sideTabReviewEl = $("side-tab-review");
 const sideTabTerminalEl = $("side-tab-terminal");
 const sideTabBrowserEl = $("side-tab-browser");
 const reviewPaneEl = $("review-pane");
@@ -290,8 +288,8 @@ function cleanOfficeFilePath(path) {
 
 function applyOfficePreviewWidth(width) {
 	const bounds = conversationWorkbenchEl.getBoundingClientRect();
-	const max = Math.max(360, bounds.width - 340);
-	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.56), max));
+	const max = Math.max(360, bounds.width - 560);
+	const next = Math.max(360, Math.min(Number(width) || Math.round(bounds.width * 0.44), max));
 	officePreviewPaneEl.style.width = `${next}px`;
 }
 
@@ -448,7 +446,7 @@ officePreviewResizerEl.addEventListener("pointerdown", (event) => {
 });
 
 // ---------------------------------------------------------------------------
-// 右侧统一边栏：审查 / 终端 / 浏览器（底部标签切换）
+// 右侧统一边栏：终端 / 浏览器（底部标签切换）
 // 原生浏览器画面只在“浏览器标签激活 + 目录/文档面板未占用主区”时显示，
 // 其余情况自动隐藏原生视图，从根本上避免面板互相遮挡。
 // ---------------------------------------------------------------------------
@@ -457,7 +455,7 @@ const WORKBENCH_SIDE_WIDTH_KEY = "pi-console-workbench-side-width";
 /** 用户手动关闭浏览器后，智能体导航新页面在此时长内不自动重开（毫秒）。 */
 const SIDE_BROWSER_AUTO_REOPEN_MS = 60_000;
 
-let activeSideTab = null; // "activity" | "review" | "terminal" | "browser" | null（面板关闭）
+let activeSideTab = null; // "terminal" | "browser" | null（面板关闭）
 let browserIntent = false; // 用户或智能体希望浏览器保持可用
 let browserUserClosedAt = 0;
 let sideBrowserLastUrl = "";
@@ -465,14 +463,10 @@ let sideBrowserLastUrl = "";
 let sidePanelSuppressed = false;
 
 const sideTabButtons = {
-	activity: sideTabActivityEl,
-	review: sideTabReviewEl,
 	terminal: sideTabTerminalEl,
 	browser: sideTabBrowserEl,
 };
 const sideTabPanes = {
-	activity: activityPaneEl,
-	review: reviewPaneEl,
 	terminal: terminalPaneEl,
 	browser: agentBrowserPaneEl,
 };
@@ -530,6 +524,7 @@ function renderSideTabs() {
 }
 
 function showSidePanel(tab) {
+	if (!sideTabPanes[tab]) return;
 	applyWorkbenchSideWidth(localStorage.getItem(WORKBENCH_SIDE_WIDTH_KEY));
 	sidePanelSuppressed = false;
 	activeSideTab = tab;
@@ -539,7 +534,6 @@ function showSidePanel(tab) {
 	sideTabButtons[tab]?.classList.remove("activity");
 	renderSideTabs();
 	syncBrowserNativeVisibility();
-	if (tab === "review") void loadReview();
 }
 
 /** 完整关闭右侧工作台；只隐藏画面，不停止智能体、命令或网页后台状态。 */
@@ -585,14 +579,6 @@ function restoreSidePanel() {
 	syncBrowserNativeVisibility();
 }
 
-sideTabActivityEl.addEventListener("click", () => {
-	if (activeSideTab === "activity" && sidePanelVisible()) closeSidePanel();
-	else showSidePanel("activity");
-});
-sideTabReviewEl.addEventListener("click", () => {
-	if (activeSideTab === "review" && sidePanelVisible()) closeSidePanel();
-	else showSidePanel("review");
-});
 sideTabTerminalEl.addEventListener("click", () => {
 	if (activeSideTab === "terminal" && sidePanelVisible()) closeSidePanel();
 	else showSidePanel("terminal");
@@ -610,7 +596,7 @@ for (const button of workbenchCloseButtons) button.addEventListener("click", () 
 for (const button of workbenchMaximizeButtons) button.addEventListener("click", toggleSidePanelMaximized);
 workbenchBtnEl.addEventListener("click", () => {
 	if (sidePanelVisible()) closeSidePanel();
-	else showSidePanel(activeSideTab || "activity");
+	else showSidePanel(activeSideTab || "terminal");
 });
 
 workbenchSideResizerEl.addEventListener("pointerdown", (event) => {
@@ -825,7 +811,7 @@ document.addEventListener("keydown", (event) => {
 	if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase("en-US") === "b") {
 		event.preventDefault();
 		if (sidePanelVisible()) closeSidePanel();
-		else showSidePanel(activeSideTab || "activity");
+		else showSidePanel(activeSideTab || "terminal");
 		return;
 	}
 	if (event.key === "Escape" && sidePanelVisible()) {
@@ -1258,16 +1244,12 @@ function clearTerminal() {
 /** 终端工具开始执行：记录条目并展示终端标签（不打断用户正在查看的其他标签）。 */
 function handleTerminalToolStart(event) {
 	appendTerminalEntry(event.toolCallId, event.toolName, event.args, "running");
-	if (!sidePanelVisible() && Date.now() - terminalAutoShowSuppressedAt >= 8000) showSidePanel("activity");
-	else if (activeSideTab !== "activity") {
-		sideTabActivityEl.classList.add("activity");
-		sideTabTerminalEl.classList.add("activity");
-	}
+	if (activeSideTab !== "terminal" || !sidePanelVisible()) sideTabTerminalEl.classList.add("activity");
 	updateTerminalStatus();
 }
 
 // 用户手动点击侧栏标签视为“我在看这里”：短期内终端工具不再自动切换标签
-for (const button of [sideTabActivityEl, sideTabReviewEl, sideTabTerminalEl, sideTabBrowserEl]) {
+for (const button of [sideTabTerminalEl, sideTabBrowserEl]) {
 	button.addEventListener("click", () => {
 		terminalAutoShowSuppressedAt = Date.now();
 	});
@@ -2058,6 +2040,7 @@ function startPathDrag(event, path) {
 function renderArtifactCards(container, files) {
 	container.innerHTML = "";
 	const items = Array.isArray(files) ? files : [];
+	const messageAttachment = container.classList.contains("sent-attachments");
 	container.hidden = items.length === 0;
 	if (items.length === 0) return;
 	let list = container;
@@ -2114,6 +2097,7 @@ function renderArtifactCards(container, files) {
 		preview.title = file.officePreview ? "实时预览（office_preview_watch）" : "预览文件（file_preview）";
 		preview.dataset.previewPath = file.path;
 		preview.dataset.previewName = file.name;
+		preview.dataset.previewSource = messageAttachment ? "message-attachment" : "artifact";
 		actions.appendChild(preview);
 		const download = document.createElement("button");
 		download.type = "button";
@@ -2124,6 +2108,7 @@ function renderArtifactCards(container, files) {
 		download.dataset.downloadName = file.name;
 		actions.appendChild(download);
 		card.append(icon, info, actions);
+		card.dataset.artifactSource = messageAttachment ? "message-attachment" : "artifact";
 		list.appendChild(card);
 	}
 }
@@ -2953,7 +2938,11 @@ messagesEl.addEventListener("click", (e) => {
 	const previewLink = e.target.closest("[data-preview-path]");
 	if (previewLink) {
 		e.preventDefault();
-		void openFilePreview(previewLink.dataset.previewPath, previewLink.dataset.previewName, "artifact");
+		void openFilePreview(
+			previewLink.dataset.previewPath,
+			previewLink.dataset.previewName,
+			previewLink.dataset.previewSource || "artifact",
+		);
 		return;
 	}
 	const downloadLink = e.target.closest("[data-download-path]");
@@ -2975,7 +2964,11 @@ messagesEl.addEventListener("click", (e) => {
 	const artifactCard = e.target.closest("[data-artifact-path]");
 	if (artifactCard) {
 		e.preventDefault();
-		void openFilePreview(artifactCard.dataset.artifactPath, artifactCard.dataset.artifactName, "artifact");
+		void openFilePreview(
+			artifactCard.dataset.artifactPath,
+			artifactCard.dataset.artifactName,
+			artifactCard.dataset.artifactSource || "artifact",
+		);
 		return;
 	}
 	const btn = e.target.closest("[data-copy]");
@@ -3104,6 +3097,7 @@ async function sendMessage() {
 			if (attachment.isImage) images.push({ data: attachment.dataBase64, mimeType: attachment.mimeType });
 		}
 		let savedPaths = [];
+		let messagePaths = [];
 		if (attachmentsToSend.length > 0) {
 			const saved = await api(`/api/sessions/${targetSessionId}/files`, {
 				method: "POST",
@@ -3112,6 +3106,7 @@ async function sendMessage() {
 				}),
 			});
 			savedPaths = saved.files;
+			messagePaths = Array.isArray(saved.messageFiles) ? saved.messageFiles : saved.files;
 			pendingAttachments = pendingAttachments.filter((attachment) => !attachmentsToSend.includes(attachment));
 			renderAttachments();
 		}
@@ -3119,7 +3114,7 @@ async function sendMessage() {
 			userBubble = appendMessage(
 				"user",
 				redactSensitiveDisplayText(text || `发送了 ${attachmentsToSend.length} 个文件`),
-				savedPaths,
+				messagePaths,
 			);
 		}
 		await api(`/api/sessions/${targetSessionId}/messages`, {
@@ -3970,11 +3965,7 @@ function appendCodeDevelopmentDetails(tool) {
 	project.textContent = tool.project?.reasons?.length
 		? `识别到：${tool.project.reasons.join("；")}`
 		: "暂未识别到明确的语言环境；打开具体项目后会自动检测。";
-	const diffButton = document.createElement("button");
-	diffButton.className = "secondary-btn small";
-	diffButton.textContent = "查看代码差异（git_diff）";
-	diffButton.addEventListener("click", () => void showRepositoryDiff());
-	drawerContentEl.append(projectTitle, project, diffButton);
+	drawerContentEl.append(projectTitle, project);
 
 	const componentsTitle = document.createElement("div");
 	componentsTitle.className = "drawer-block-title";
@@ -4631,7 +4622,7 @@ async function openFilePreview(path, name, source = "file") {
 			return;
 		}
 		const shownName = name || path.split(/[\\/]/).pop() || "文件预览";
-		if (isTextPreviewPath(path) && (await openCodeEditor(path, shownName))) return;
+		if (source !== "message-attachment" && isTextPreviewPath(path) && (await openCodeEditor(path, shownName))) return;
 		if (/\.pdf$/i.test(path)) {
 			if (!catalogCache) catalogCache = await api("/api/catalog");
 			const token = localStorage.getItem(TOKEN_KEY);
