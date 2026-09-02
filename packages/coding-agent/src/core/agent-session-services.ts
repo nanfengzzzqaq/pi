@@ -15,7 +15,6 @@ import {
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
 import { SettingsManager } from "./settings-manager.ts";
-import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo-provider.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -149,7 +148,6 @@ export async function createAgentSessionServices(
 			modelsPath: join(agentDir, "models.json"),
 			signal: options.modelRuntimeSignal,
 		}));
-	await registerDetectedWhiteRabbitNeo(modelRuntime);
 	const resourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		cwd,

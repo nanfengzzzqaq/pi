@@ -30,7 +30,6 @@ import {
 	type ToolName,
 	withFileMutationQueue,
 } from "./tools/index.ts";
-import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo-provider.ts";
 
 // Preserve the pre-0.81 fallback for extensions that construct Agent instances
 // or invoke low-level agent loops without supplying streamFn. Agent core remains
@@ -185,9 +184,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
 	}
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-	if (!options.runtimeServicesConfigured) {
-		await registerDetectedWhiteRabbitNeo(modelRuntime);
-	}
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
