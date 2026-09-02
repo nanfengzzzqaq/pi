@@ -160,14 +160,11 @@ describe("openai-completions empty tools handling", () => {
 		expect(params.max_completion_tokens).toBe(3904);
 	});
 
-	it("uses conservative OpenAI-compatible fields for Cloudflare AI Gateway /compat endpoints", async () => {
-		// models.dev 已下线 gateway 目录的 openai-completions 模型；这里手工构造
-		// /compat baseUrl 的模型，钉住 api 层按 baseUrl 判定的保守请求字段行为。
-		const { compat: _compat, ...baseModel } = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6")!;
-		const model = {
-			...baseModel,
-			baseUrl: "https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat",
-		} as const;
+	it("uses conservative OpenAI-compatible fields for Cloudflare AI Gateway /compat models", async () => {
+		process.env.CLOUDFLARE_API_KEY = "cf-token";
+		process.env.CLOUDFLARE_ACCOUNT_ID = "account-id";
+		process.env.CLOUDFLARE_GATEWAY_ID = "gateway-id";
+		const model = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6")!;
 
 		await streamSimple(
 			model,
@@ -175,7 +172,7 @@ describe("openai-completions empty tools handling", () => {
 				systemPrompt: "You are helpful.",
 				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
 			},
-			{ apiKey: "test", maxTokens: 1234, reasoning: "high" },
+			{ maxTokens: 1234, reasoning: "high" },
 		).result();
 
 		const params = mockState.lastParams as {
@@ -190,21 +187,28 @@ describe("openai-completions empty tools handling", () => {
 		expect(params.max_completion_tokens).toBeUndefined();
 		expect(params.reasoning_effort).toBeUndefined();
 		expect(params.store).toBeUndefined();
+
+		const clientOptions = mockState.lastClientOptions as {
+			baseURL?: string;
+			defaultHeaders?: Record<string, unknown>;
+		};
+		expect(clientOptions.baseURL).toBe("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat");
+		expect(clientOptions.defaultHeaders?.Authorization).toBeNull();
+		expect(clientOptions.defaultHeaders?.["cf-aig-authorization"]).toBe("Bearer cf-token");
 	});
 
-	it("resolves Cloudflare gateway URL placeholders from provider env", async () => {
-		const { resolveCloudflareModel } = await import("../src/providers/cloudflare-stream.ts");
-		const { compat: _compat, ...baseModel } = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6")!;
-		const model = {
-			...baseModel,
-			baseUrl: "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat",
-		} as const;
+	it("resolves Cloudflare AI Gateway base URL through provider auth", async () => {
+		process.env.CLOUDFLARE_API_KEY = "cf-token";
+		process.env.CLOUDFLARE_ACCOUNT_ID = "account-id";
+		process.env.CLOUDFLARE_GATEWAY_ID = "gateway-id";
+		const model = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6")!;
 
-		const resolved = resolveCloudflareModel(model, {
-			CLOUDFLARE_ACCOUNT_ID: "account-id",
-			CLOUDFLARE_GATEWAY_ID: "gateway-id",
-		});
-		expect(resolved.baseUrl).toBe("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat");
+		await streamSimple(model, {
+			messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+		}).result();
+
+		const clientOptions = mockState.lastClientOptions as { baseURL?: string };
+		expect(clientOptions.baseURL).toBe("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat");
 	});
 
 	it("preserves inline upstream Authorization for Cloudflare AI Gateway BYOK requests", async () => {
@@ -230,7 +234,7 @@ describe("openai-completions empty tools handling", () => {
 		process.env.CLOUDFLARE_API_KEY = "cf-token";
 		process.env.CLOUDFLARE_ACCOUNT_ID = "account-id";
 		process.env.CLOUDFLARE_GATEWAY_ID = "gateway-id";
-		const workersModel = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6")!;
+		const workersModel = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6")!;
 
 		await streamSimple(
 			workersModel,

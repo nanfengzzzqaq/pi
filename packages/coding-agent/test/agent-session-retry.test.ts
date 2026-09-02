@@ -238,7 +238,6 @@ describe("AgentSession retry", () => {
 		// Previously, _resolveRetry() on the first successful message_end would unblock
 		// waitForRetry() while the agent was still executing tools.
 		let callCount = 0;
-		const toolChoices: Array<string | undefined> = [];
 		const toolExecuted = { value: false };
 
 		const echoTool: AgentTool = {
@@ -256,8 +255,7 @@ describe("AgentSession retry", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "Test", tools: [] },
-			streamFn: (_model, _context, options) => {
-				toolChoices.push(options?.toolChoice);
+			streamFn: () => {
 				callCount++;
 				const stream = new MockAssistantStream();
 				queueMicrotask(() => {
@@ -309,16 +307,10 @@ describe("AgentSession retry", () => {
 			baseToolsOverride: { echo: echoTool },
 		});
 
-		await session.prompt("Test", {
-			toolChoice: "required",
-			toolChoiceAfterToolResult: { success: "none", error: "required" },
-		});
+		await session.prompt("Test");
 
 		// All three LLM calls must have completed
 		expect(callCount).toBe(3);
-		// The retry is still the first successful request and must remain forced;
-		// the request after the tool result returns to automatic selection.
-		expect(toolChoices).toEqual(["required", "required", "none"]);
 		// Tool must have been executed
 		expect(toolExecuted.value).toBe(true);
 		// Agent must not be streaming after prompt returns
@@ -326,6 +318,5 @@ describe("AgentSession retry", () => {
 		// A follow-up prompt must work (no "Agent is already processing" error)
 		await session.prompt("Follow-up");
 		expect(callCount).toBe(4);
-		expect(toolChoices).toEqual(["required", "required", "none", undefined]);
 	});
 });

@@ -311,11 +311,14 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
+	// The loop's widened one-shot toolChoice ("required") exceeds the neutral
+	// SimpleStreamOptions union; it is forwarded as-is for OpenAI-compatible
+	// adapters, so narrow only at the type level here.
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
-	});
+	} as Parameters<StreamFn>[2]);
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;

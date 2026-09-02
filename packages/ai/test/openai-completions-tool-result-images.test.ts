@@ -19,13 +19,19 @@ const emptyUsage: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-const compat: Omit<Required<OpenAICompletionsCompat>, "deferredToolsMode"> & {
+const compat: Omit<
+	Required<OpenAICompletionsCompat>,
+	| "deferredToolsMode"
+	| "requiresAssistantContentOnToolCalls"
+	| "supportsToolChoiceWithThinking"
+	| "thinkingTokenBudgetField"
+> & {
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
+	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
 } = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
 	supportsReasoningEffort: true,
-	supportsToolChoiceWithThinking: true,
 	supportsUsageInStreaming: true,
 	supportsFinishReason: true,
 	maxTokensField: "max_completion_tokens",
@@ -33,7 +39,6 @@ const compat: Omit<Required<OpenAICompletionsCompat>, "deferredToolsMode"> & {
 	requiresAssistantAfterToolResult: false,
 	requiresThinkingAsText: false,
 	requiresReasoningContentOnAssistantMessages: false,
-	requiresAssistantContentOnToolCalls: false,
 	thinkingFormat: "openai",
 	openRouterRouting: {},
 	vercelGatewayRouting: {},
@@ -41,6 +46,7 @@ const compat: Omit<Required<OpenAICompletionsCompat>, "deferredToolsMode"> & {
 	chatTemplateArgs: {},
 	zaiToolStream: false,
 	supportsThinkingTokenBudget: false,
+	thinkingTokenBudgetField: undefined,
 	supportsStrictMode: true,
 	supportsOpenAIGrammarTools: false,
 	cacheControlFormat: "anthropic",

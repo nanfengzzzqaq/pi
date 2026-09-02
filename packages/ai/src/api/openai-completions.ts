@@ -178,12 +178,19 @@ interface OpenAICompatCacheControl {
 
 type ResolvedOpenAICompletionsCompat = Omit<
 	Required<OpenAICompletionsCompat>,
-	"cacheControlFormat" | "deferredToolsMode" | "supportsThinkingTokenBudget" | "thinkingTokenBudgetField"
+	| "cacheControlFormat"
+	| "deferredToolsMode"
+	| "requiresAssistantContentOnToolCalls"
+	| "supportsThinkingTokenBudget"
+	| "thinkingTokenBudgetField"
+	| "supportsToolChoiceWithThinking"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
+	requiresAssistantContentOnToolCalls?: OpenAICompletionsCompat["requiresAssistantContentOnToolCalls"];
 	supportsThinkingTokenBudget?: OpenAICompletionsCompat["supportsThinkingTokenBudget"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
+	supportsToolChoiceWithThinking?: OpenAICompletionsCompat["supportsToolChoiceWithThinking"];
 };
 
 type ResolvedChatTemplateKwargValue = string | number | boolean | null;
@@ -795,6 +802,16 @@ function buildParams(
 		compat.supportsOpenAIGrammarTools,
 	),
 ) {
+	// Providers that reject tool_choice alongside thinking keep deterministic
+	// tool routing usable by turning thinking off for that provider request.
+	if (
+		options?.toolChoice !== undefined &&
+		options.toolChoice !== "auto" &&
+		options.reasoningEffort !== undefined &&
+		compat.supportsToolChoiceWithThinking === false
+	) {
+		options = { ...options, reasoningEffort: undefined };
+	}
 	const messages = convertMessages(model, context, compat, { grammarToolInputProperties });
 	const cacheControl = getCompatCacheControl(compat, cacheRetention);
 
@@ -1270,6 +1287,9 @@ export function convertMessages(
 
 			const thinkingBlocks = msg.content.filter(isThinkingContentBlock);
 			const toolCalls = msg.content.filter(isToolCallBlock);
+			if (compat.requiresAssistantContentOnToolCalls && toolCalls.length > 0 && assistantText.length === 0) {
+				assistantMsg.content = "";
+			}
 			const signedReasoningDetails = thinkingBlocks
 				.map((block) => parseOpenAIReasoningDetails(block.thinkingSignature))
 				.find((details) => details !== undefined);
@@ -1632,6 +1652,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		requiresAssistantAfterToolResult: false,
 		requiresThinkingAsText: false,
 		requiresReasoningContentOnAssistantMessages: isDeepSeek,
+		requiresAssistantContentOnToolCalls: undefined,
+		supportsToolChoiceWithThinking: undefined,
 		thinkingFormat: isDeepSeek
 			? "deepseek"
 			: isZai
@@ -1688,6 +1710,10 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		requiresReasoningContentOnAssistantMessages:
 			model.compat.requiresReasoningContentOnAssistantMessages ??
 			detected.requiresReasoningContentOnAssistantMessages,
+		requiresAssistantContentOnToolCalls:
+			model.compat.requiresAssistantContentOnToolCalls ?? detected.requiresAssistantContentOnToolCalls,
+		supportsToolChoiceWithThinking:
+			model.compat.supportsToolChoiceWithThinking ?? detected.supportsToolChoiceWithThinking,
 		thinkingFormat: model.compat.thinkingFormat ?? detected.thinkingFormat,
 		openRouterRouting: model.compat.openRouterRouting ?? {},
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,

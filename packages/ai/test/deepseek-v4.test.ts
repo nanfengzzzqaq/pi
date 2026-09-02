@@ -73,8 +73,13 @@ describe("DeepSeek V4 compatibility", () => {
 	});
 
 	it("publishes direct Flash, Pro, and Vision metadata with official limits and effort mappings", () => {
-		for (const id of ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"] as const) {
-			const model = getModel("deepseek", id);
+		const effortMaps: Record<string, Record<string, string | null>> = {
+			"deepseek-v4-flash": { minimal: null, low: "low", medium: null, high: "high", max: "max" },
+			"deepseek-v4-flash-vision-exp": { minimal: null, low: "low", medium: null, high: "high", max: "max" },
+			"deepseek-v4-pro": { minimal: null, low: null, medium: null, high: "high", max: "max" },
+		};
+		for (const [id, thinkingLevelMap] of Object.entries(effortMaps)) {
+			const model = getModel("deepseek", id as "deepseek-v4-flash");
 			expect(model).toBeDefined();
 			expect(model).toMatchObject({
 				api: "openai-completions",
@@ -82,14 +87,7 @@ describe("DeepSeek V4 compatibility", () => {
 				reasoning: true,
 				contextWindow: 1_000_000,
 				maxTokens: 384_000,
-				thinkingLevelMap: {
-					minimal: null,
-					low: "low",
-					medium: null,
-					high: "high",
-					xhigh: null,
-					max: "max",
-				},
+				thinkingLevelMap,
 				compat: {
 					supportsStore: false,
 					supportsDeveloperRole: false,
@@ -207,7 +205,7 @@ describe("DeepSeek V4 compatibility", () => {
 		async (toolChoice) => {
 			const model = getModel("deepseek", "deepseek-v4-flash")!;
 			let captured: unknown;
-			const options: SimpleStreamOptions & { toolChoice: typeof toolChoice } = {
+			const options: Omit<SimpleStreamOptions, "toolChoice"> & { toolChoice: typeof toolChoice } = {
 				apiKey: "test",
 				reasoning: "max",
 				toolChoice,
@@ -228,7 +226,9 @@ describe("DeepSeek V4 compatibility", () => {
 						},
 					],
 				},
-				options,
+				// "required" exceeds the provider-neutral union; it is forwarded
+				// verbatim for OpenAI-compatible adapters.
+				options as SimpleStreamOptions,
 			).result();
 
 			const payload = (captured ?? mockState.lastParams) as CapturedPayload;
@@ -242,7 +242,7 @@ describe("DeepSeek V4 compatibility", () => {
 	it("keeps tool_choice available when DeepSeek thinking is disabled", async () => {
 		const model = getModel("deepseek", "deepseek-v4-flash")!;
 		let captured: unknown;
-		const options: SimpleStreamOptions & { toolChoice: "required" } = {
+		const options: Omit<SimpleStreamOptions, "toolChoice"> & { toolChoice: "required" } = {
 			apiKey: "test",
 			toolChoice: "required",
 			onPayload: (payload) => {
@@ -262,7 +262,8 @@ describe("DeepSeek V4 compatibility", () => {
 					},
 				],
 			},
-			options,
+			// Same one-shot "required" widening as the tool-choice policy test above.
+			options as unknown as SimpleStreamOptions,
 		).result();
 
 		const payload = (captured ?? mockState.lastParams) as CapturedPayload;

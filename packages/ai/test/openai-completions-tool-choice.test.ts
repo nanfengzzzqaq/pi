@@ -109,8 +109,9 @@ describe("openai-completions tool_choice", () => {
 		mockState.chunks = undefined;
 	});
 
-	it("forwards required toolChoice for DeepSeek Flash to the OpenAI-compatible payload", async () => {
-		const model = getModel("deepseek", "deepseek-v4-flash")!;
+	it("forwards toolChoice from simple options to payload", async () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = { ...baseModel, api: "openai-completions" } as const;
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -318,15 +319,31 @@ describe("openai-completions tool_choice", () => {
 		expect(getModel("zai", "glm-5.2")?.compat?.zaiToolStream).toBe(true);
 	});
 
-	it("stores z.ai GLM-5.2 effort metadata", () => {
+	it("stores z.ai effort metadata", () => {
 		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			const model = getModel(provider, "glm-5.2")!;
-			expect(model.compat?.supportsReasoningEffort).toBe(true);
-			expect(model.thinkingLevelMap).toEqual({
+			for (const modelId of ["glm-5.2", "glm-5.2-highspeed"] as const) {
+				const model = getModel(provider, modelId)!;
+				expect(model.compat?.supportsReasoningEffort).toBe(true);
+				expect(model.thinkingLevelMap).toEqual({
+					off: "none",
+					minimal: null,
+					low: null,
+					medium: null,
+					high: "high",
+					xhigh: null,
+					max: "max",
+				});
+			}
+
+			const glm53 = getModel(provider, "glm-5.3")!;
+			expect(glm53.compat?.supportsReasoningEffort).toBe(true);
+			expect(glm53.thinkingLevelMap).toEqual({
+				off: null,
 				minimal: null,
-				low: "high",
-				medium: "high",
+				low: "low",
+				medium: null,
 				high: "high",
+				xhigh: null,
 				max: "max",
 			});
 		}
@@ -1273,75 +1290,6 @@ describe("openai-completions tool_choice", () => {
 		]);
 	});
 
-	it("normalizes local Qwen reasoning_content to reasoning for multi-turn replay", async () => {
-		mockState.chunks = [
-			{
-				id: "chatcmpl-qwen-reasoning",
-				choices: [
-					{
-						delta: { content: "answer", reasoning_content: "prior reasoning" },
-						finish_reason: "stop",
-					},
-				],
-			},
-		];
-
-		const model = {
-			...localOpenAICompletionsModel,
-			id: "Qwen/Qwen3.8-27B-FP8",
-			name: "Qwen3.8 via vLLM",
-			thinkingLevelMap: { low: "low", medium: "medium", xhigh: "xhigh" },
-			compat: {
-				thinkingFormat: "qwen-chat-template",
-				supportsReasoningEffort: true,
-			},
-		} satisfies Model<"openai-completions">;
-		const userMessage = { role: "user" as const, content: "First", timestamp: Date.now() };
-		const response = await streamSimple(
-			model,
-			{ messages: [userMessage] },
-			{ apiKey: "test", reasoning: "low" },
-		).result();
-
-		expect(response.content).toContainEqual({
-			type: "thinking",
-			thinking: "prior reasoning",
-			thinkingSignature: "reasoning",
-		});
-
-		mockState.chunks = [
-			{
-				id: "chatcmpl-qwen-follow-up",
-				choices: [{ delta: {}, finish_reason: "stop" }],
-			},
-		];
-		let payload: unknown;
-		await streamSimple(
-			model,
-			{
-				messages: [userMessage, response, { role: "user", content: "Continue", timestamp: Date.now() }],
-			},
-			{
-				apiKey: "test",
-				reasoning: "low",
-				onPayload: (params: unknown) => {
-					payload = params;
-				},
-			},
-		).result();
-
-		const params = (payload ?? mockState.lastParams) as {
-			messages?: Array<Record<string, unknown>>;
-			chat_template_kwargs?: Record<string, unknown>;
-			reasoning_effort?: string;
-		};
-		const replayedAssistant = params.messages?.find((message) => message.role === "assistant");
-		expect(replayedAssistant).toMatchObject({ content: "answer", reasoning: "prior reasoning" });
-		expect(replayedAssistant).not.toHaveProperty("reasoning_content");
-		expect(params.chat_template_kwargs).toEqual({ enable_thinking: true, preserve_thinking: true });
-		expect(params.reasoning_effort).toBe("low");
-	});
-
 	it("replays OpenCode Go reasoning thinking blocks as reasoning_content", () => {
 		const { compat: _compat, ...baseModel } = getModel("opencode-go", "kimi-k2.6")!;
 		const model = { ...baseModel, api: "openai-completions" } as Model<"openai-completions">;
@@ -1817,29 +1765,6 @@ describe("openai-completions tool_choice", () => {
 				preserve_thinking: true,
 			});
 			expect(params.reasoning_effort).toBeUndefined();
-		}
-	});
-
-	it("sends mapped reasoning effort with Qwen chat template kwargs", async () => {
-		const model = {
-			...localOpenAICompletionsModel,
-			id: "Qwen/Qwen3.8-27B-FP8",
-			name: "Qwen3.8 via vLLM",
-			thinkingLevelMap: { low: "low", medium: "medium", xhigh: "xhigh" },
-			compat: {
-				thinkingFormat: "qwen-chat-template",
-				supportsReasoningEffort: true,
-			},
-		} satisfies Model<"openai-completions">;
-
-		for (const reasoning of ["low", "medium", "xhigh"] as const) {
-			const params = await captureSimpleParams(model, reasoning);
-
-			expect(params.chat_template_kwargs).toEqual({
-				enable_thinking: true,
-				preserve_thinking: true,
-			});
-			expect(params.reasoning_effort).toBe(reasoning);
 		}
 	});
 

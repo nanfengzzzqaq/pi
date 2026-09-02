@@ -28,7 +28,7 @@ import type { Static, TSchema } from "typebox";
 export type StreamFn = (
 	model: Model<Api>,
 	context: Context,
-	options?: AgentStreamOptions,
+	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 /** OpenAI-compatible string modes supported by one-shot agent prompts. */
@@ -38,11 +38,6 @@ export type AgentPromptToolChoice = "auto" | "none" | "required";
 export interface AgentToolResultChoicePolicy {
 	success: AgentPromptToolChoice;
 	error: AgentPromptToolChoice;
-}
-
-/** Stream options used internally by the agent loop. */
-export interface AgentStreamOptions extends SimpleStreamOptions {
-	toolChoice?: AgentPromptToolChoice;
 }
 
 /**
@@ -160,8 +155,15 @@ export interface AgentLoopTurnUpdate {
 
 export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
-export interface AgentLoopConfig extends AgentStreamOptions {
+/**
+ * Loop configuration extends the provider-neutral stream options with
+ * agent-only callbacks. `toolChoice` is re-widened to also permit "required"
+ * for one-shot prompts (honored by OpenAI-compatible adapters) and is cast back
+ * to the neutral type at the single stream-function call site in agent-loop.
+ */
+export interface AgentLoopConfig extends Omit<SimpleStreamOptions, "toolChoice"> {
 	model: Model<any>;
+	toolChoice?: AgentPromptToolChoice;
 	toolChoiceAfterToolResult?: AgentToolResultChoicePolicy;
 
 	/**
