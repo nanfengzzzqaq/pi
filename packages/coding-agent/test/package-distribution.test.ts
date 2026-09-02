@@ -16,11 +16,13 @@ const packageJson = JSON.parse(
 ) as CodingAgentPackageJson;
 
 describe("package distribution entrypoints", () => {
-	test("uses the bundle for executables and modular output for libraries", () => {
-		expect(packageJson.bin.pi).toBe("dist/bundle/cli.js");
+	test("uses unbundled executables and modular output for libraries", () => {
+		// This fork ships the unbundled layout: the console consumes workspace
+		// builds directly and no npm bundle is produced.
+		expect(packageJson.bin.pi).toBe("dist/cli.js");
 		expect(packageJson.main).toBe("./dist/index.js");
 		expect(packageJson.exports["."].import).toBe("./dist/index.js");
 		expect(packageJson.exports["./client"].import).toBe("./dist/client/index.js");
-		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/bundle/rpc-entry.js");
+		expect(packageJson.exports["./rpc-entry"].import).toBe("./dist/rpc-entry.js");
 	});
 });
