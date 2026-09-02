@@ -7,7 +7,6 @@ import asar from "@electron/asar";
 
 export const LOCAL_AGENT_CRITICAL_FILES = [
 	"core/http-dispatcher.js",
-	"core/whiterabbitneo-provider.js",
 	"core/sdk.js",
 	"core/agent-session-services.js",
 ];
