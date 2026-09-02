@@ -1,7 +1,7 @@
 # @pi/console — Pi 桌面控制台（按需能力包 + Windows 安装包）
 
 在浏览器里使用 Pi：`node:http` 原生后端 + 纯 HTML/JS/CSS 前端，无新增 npm 依赖、无构建步骤。
-默认形态为**纯净原生 Pi**（内置 read/bash/edit/write 工具，官方系统提示词）；能力包通过 `customTools` 注册、
+默认形态为**纯净原生 Pi**（内置 read/bash/edit/write + find/grep/ls 全套原生工具，官方系统提示词）；能力包通过 `customTools` 注册、
 `setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与纯净版完全一致。
 
 ## 安装与启动（开发模式）
@@ -113,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 - 包形态：`packs/<name>/pack.json`（name/displayName/description/version）+ `index.ts`（`export default definePack(ctx): { tools }`）
 - 后端为**每个会话独立实例化**包工具（`ctx.getWorkspaceRoot()` 返回该会话 cwd），新增包重启服务后生效
-- 挂载语义：创建会话时把全部已安装包工具注册进 `createAgentSession` 的 `customTools`；挂载/卸载 = 对全部会话调 `setActiveToolsByName(["read","bash","edit","write", ...包工具])`，不重建会话、不丢历史
+- 挂载语义：创建会话时把全部已安装包工具注册进 `createAgentSession` 的 `customTools`；挂载/卸载 = 对全部会话调 `setActiveToolsByName(["read","bash","edit","write","grep","find","ls", ...包工具])`，不重建会话、不丢历史
 
 ### Office 助手包（office-assistant）
 

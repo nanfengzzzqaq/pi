@@ -95,7 +95,7 @@ function hasUsableBash(): boolean {
 
 /** 只把当前电脑上确实可执行的命令工具交给模型，避免“看得到但调用必失败”。 */
 function availableBuiltinToolNames(): string[] {
-	return ["read", ...(hasUsableBash() ? ["bash"] : []), "edit", "write"];
+	return ["read", ...(hasUsableBash() ? ["bash"] : []), "edit", "write", "grep", "find", "ls"];
 }
 
 const BUILTIN_TOOL_LABELS: Record<string, string> = {
@@ -305,55 +305,6 @@ export function fullPackToolNames(name: string, includeMetaTool = false): string
 		.filter((toolName) => includeMetaTool || toolName !== pack.info.metaToolName);
 }
 
-const FILE_EXPLORATION_EXTENSIONS = [
-	".c",
-	".cc",
-	".cpp",
-	".cs",
-	".css",
-	".go",
-	".h",
-	".hpp",
-	".html",
-	".java",
-	".js",
-	".json",
-	".jsx",
-	".kt",
-	".md",
-	".py",
-	".rs",
-	".sql",
-	".toml",
-	".ts",
-	".tsx",
-	".vue",
-	".xml",
-	".yaml",
-	".yml",
-];
-
-const FILE_EXPLORATION_KEYWORDS = [
-	"代码",
-	"源码",
-	"代码库",
-	"项目结构",
-	"目录结构",
-	"浏览目录",
-	"列出目录",
-	"搜索文件",
-	"查找文件",
-	"找文件",
-	"定位文件",
-	"搜索内容",
-	"全文搜索",
-	"在哪个文件",
-	"which file",
-	"search files",
-	"find file",
-	"repository structure",
-];
-
 const WINDOWS_SYSTEM_KEYWORDS = [
 	"windows",
 	"powershell",
@@ -380,21 +331,8 @@ function matchedReasons(normalizedText: string, values: string[], prefix: string
 
 function selectCoreCapabilities(normalizedText: string): CapabilityMatch[] {
 	const matches: CapabilityMatch[] = [];
-	const fileReasons = [
-		...matchedReasons(normalizedText, FILE_EXPLORATION_EXTENSIONS, "发现文件类型 "),
-		...matchedReasons(normalizedText, FILE_EXPLORATION_KEYWORDS, "匹配文件任务“"),
-	].map((reason) => (reason.startsWith("匹配文件任务") ? `${reason}”` : reason));
-	if (fileReasons.length > 0) {
-		matches.push({
-			packName: "pi-file-exploration",
-			displayName: "文件与代码浏览",
-			groupNames: ["explore"],
-			groupDisplayNames: ["搜索与浏览"],
-			toolNames: ["grep", "find", "ls"],
-			skillNames: [],
-			reasons: fileReasons,
-		});
-	}
+	// grep/find/ls 已纳入会话基础工具，模型按原生 Pi 方式自主取用，
+	// 不再按关键词门禁，避免路由未命中时模型拿不到文件搜索能力。
 
 	if (isWindowsPowerShellAvailable()) {
 		const windowsReasons = matchedReasons(normalizedText, WINDOWS_SYSTEM_KEYWORDS, "匹配 Windows 任务“").map(

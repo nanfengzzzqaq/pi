@@ -8,8 +8,8 @@ describe("按本轮选择能力", () => {
 
 	it("普通问候不注入 Office 工具", () => {
 		const tools = baseToolNames(["office-assistant"]);
-		expect(tools).toEqual(expect.arrayContaining(["read", "edit", "write"]));
-		for (const dynamicTool of ["grep", "find", "ls", "powershell"]) expect(tools).not.toContain(dynamicTool);
+		expect(tools).toEqual(expect.arrayContaining(["read", "edit", "write", "grep", "find", "ls"]));
+		expect(tools).not.toContain("powershell");
 		expect(selectCapabilities("你好", ["office-assistant"])).toEqual([]);
 	});
 
@@ -53,9 +53,9 @@ describe("按本轮选择能力", () => {
 		expect(github?.skillNames).toEqual(["code-development-workflow"]);
 	});
 
-	it("文件搜索和 Windows 系统工具只在相应任务中加载", () => {
-		const fileTools = selectCapabilities("请在代码里搜索 createAgentSession", []).flatMap((match) => match.toolNames);
-		expect(fileTools).toEqual(expect.arrayContaining(["grep", "find", "ls"]));
+	it("文件搜索工具常驻基础集，Windows 系统工具只在相应任务中加载", () => {
+		expect(baseToolNames([])).toEqual(expect.arrayContaining(["grep", "find", "ls"]));
+		expect(selectCapabilities("请在代码里搜索 createAgentSession", [])).toEqual([]);
 		expect(selectCapabilities("帮我写一封普通邮件", []).flatMap((match) => match.toolNames)).toEqual([]);
 
 		const windowsTools = selectCapabilities("检查 Windows 系统进程和端口占用", []).flatMap(
