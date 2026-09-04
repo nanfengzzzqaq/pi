@@ -162,6 +162,14 @@ function usesQwenChatTemplate(modelId: string): boolean {
 	return /(^|[/_.-])qwen(?=$|[/_.-]|\d)/iu.test(modelId);
 }
 
+/**
+ * Reasoning on these models shares the single `max_tokens` output ceiling, so an
+ * xhigh turn can spend the whole budget on reasoning and emit no answer. The cap
+ * narrows only this custom model's thinking budget; the global per-level budgets
+ * stay untouched, and the server only sees the standard budget field.
+ */
+const QWEN_THINKING_TOKEN_BUDGET_CAP = 8192;
+
 export function toProviderConfig(definition: CustomModelDefinition) {
 	const input: ("text" | "image")[] = definition.vision ? ["text", "image"] : ["text"];
 	return {
@@ -193,7 +201,11 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 					supportsDeveloperRole: false,
 					supportsReasoningEffort: definition.reasoning,
 					...(definition.reasoning && usesQwenChatTemplate(definition.modelId)
-						? { thinkingFormat: "qwen-chat-template" as const }
+						? {
+								thinkingFormat: "qwen-chat-template" as const,
+								thinkingTokenBudgetField: "thinking_token_budget" as const,
+								thinkingTokenBudgetCap: QWEN_THINKING_TOKEN_BUDGET_CAP,
+							}
 						: {}),
 					supportsStrictMode: false,
 					supportsOpenAIGrammarTools: false,

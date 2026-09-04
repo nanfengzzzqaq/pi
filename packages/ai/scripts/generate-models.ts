@@ -613,11 +613,16 @@ const OPENAI_COMPLETIONS_DEFAULT_COMPAT = {
 } satisfies Required<
 	Omit<
 		OpenAICompletionsCompat,
-		"cacheControlFormat" | "deferredToolsMode" | "supportsThinkingTokenBudget" | "thinkingTokenBudgetField"
+		| "cacheControlFormat"
+		| "deferredToolsMode"
+		| "supportsThinkingTokenBudget"
+		| "thinkingTokenBudgetField"
+		| "thinkingTokenBudgetCap"
 	>
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
+	thinkingTokenBudgetCap?: OpenAICompletionsCompat["thinkingTokenBudgetCap"];
 };
 
 type OpenAICompletionsResolvedCompat = typeof OPENAI_COMPLETIONS_DEFAULT_COMPAT & {

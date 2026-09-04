@@ -56,7 +56,12 @@ import {
 } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { buildBaseOptions, clampThinkingBudgetToAnswerRoom, thinkingBudgetForLevel } from "./simple-options.ts";
+import {
+	buildBaseOptions,
+	clampThinkingBudgetToAnswerRoom,
+	MIN_ANSWER_TOKENS,
+	thinkingBudgetForLevel,
+} from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
 /**
@@ -183,6 +188,7 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	| "requiresAssistantContentOnToolCalls"
 	| "supportsThinkingTokenBudget"
 	| "thinkingTokenBudgetField"
+	| "thinkingTokenBudgetCap"
 	| "supportsToolChoiceWithThinking"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
@@ -190,6 +196,7 @@ type ResolvedOpenAICompletionsCompat = Omit<
 	requiresAssistantContentOnToolCalls?: OpenAICompletionsCompat["requiresAssistantContentOnToolCalls"];
 	supportsThinkingTokenBudget?: OpenAICompletionsCompat["supportsThinkingTokenBudget"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
+	thinkingTokenBudgetCap?: OpenAICompletionsCompat["thinkingTokenBudgetCap"];
 	supportsToolChoiceWithThinking?: OpenAICompletionsCompat["supportsToolChoiceWithThinking"];
 };
 
@@ -360,6 +367,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			if (nextParams !== undefined) {
 				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
 			}
+			enforceCappedReasoningLimits(params, model, options, compat);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -791,6 +799,58 @@ function createClient(
 	});
 }
 
+function enforceCappedReasoningLimits(
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	model: Model<"openai-completions">,
+	options: OpenAICompletionsOptions | undefined,
+	compat: ResolvedOpenAICompletionsCompat,
+): void {
+	if (compat.thinkingTokenBudgetCap === undefined || !options?.reasoningEffort || !model.reasoning) return;
+
+	const budgetField = resolveThinkingTokenBudgetField(compat);
+	if (!budgetField) return;
+
+	const paramsRecord = params as unknown as Record<string, unknown>;
+	const maxTokensField = compat.maxTokensField;
+	// streamSimple already narrows options.maxTokens to the remaining context.
+	// Treat that value as the trusted ceiling: later payload customization may
+	// request a smaller response, but must never widen it to the model-wide cap.
+	const trustedCeiling =
+		typeof options.maxTokens === "number" && Number.isSafeInteger(options.maxTokens) && options.maxTokens > 0
+			? Math.min(options.maxTokens, model.maxTokens)
+			: model.maxTokens;
+	const rawCeiling = paramsRecord[maxTokensField];
+	const requestedCeiling =
+		typeof rawCeiling === "number" && Number.isSafeInteger(rawCeiling) && rawCeiling > 0
+			? rawCeiling
+			: trustedCeiling;
+	const ceiling = Math.min(requestedCeiling, trustedCeiling);
+	paramsRecord[maxTokensField] = ceiling;
+
+	if (ceiling <= MIN_ANSWER_TOKENS) {
+		throw new Error(
+			`context_length_exceeded: capped reasoning requires at least ${MIN_ANSWER_TOKENS + 1} output tokens; ` +
+				`only ${ceiling} remain. Compact the conversation and retry.`,
+		);
+	}
+
+	const trustedLevelBudget = Math.max(
+		1,
+		Math.floor(
+			Math.min(
+				thinkingBudgetForLevel(options.reasoningEffort, options.thinkingBudgets),
+				compat.thinkingTokenBudgetCap,
+			),
+		),
+	);
+	const rawBudget = paramsRecord[budgetField];
+	const requestedBudget =
+		typeof rawBudget === "number" && Number.isSafeInteger(rawBudget) && rawBudget > 0
+			? rawBudget
+			: trustedLevelBudget;
+	paramsRecord[budgetField] = clampThinkingBudgetToAnswerRoom(Math.min(requestedBudget, trustedLevelBudget), ceiling);
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -999,6 +1059,10 @@ function buildParams(
 		Object.assign(params, options.samplingParams);
 	}
 
+	// A late samplingParams merge can remove/retype/re-widen the protected values.
+	// Rebuild them from trusted numeric limits for capped reasoning models.
+	enforceCappedReasoningLimits(params, model, options, compat);
+
 	return params;
 }
 
@@ -1016,11 +1080,16 @@ function resolveClampedThinkingBudget(
 	params: { max_tokens?: number | null; max_completion_tokens?: number | null },
 ): number | undefined {
 	if (!options?.reasoningEffort || !model.reasoning) return undefined;
+	const compat = getCompat(model);
 	const ceiling = params.max_tokens ?? params.max_completion_tokens ?? model.maxTokens;
-	const budget = clampThinkingBudgetToAnswerRoom(
+	// The compat cap is a pi-internal ceiling for this model, not a server field. It
+	// narrows the level budget (e.g. a per-model xhigh cap) before the shared
+	// answer-room clamp, so the global per-level defaults stay untouched.
+	const scopedBudget = Math.min(
 		thinkingBudgetForLevel(options.reasoningEffort, options.thinkingBudgets),
-		ceiling,
+		compat.thinkingTokenBudgetCap ?? Infinity,
 	);
+	const budget = clampThinkingBudgetToAnswerRoom(scopedBudget, ceiling);
 	return budget > 0 ? budget : undefined;
 }
 
@@ -1380,7 +1449,16 @@ export function convertMessages(
 				content !== null &&
 				content !== undefined &&
 				(typeof content === "string" ? content.length > 0 : content.length > 0);
-			if (!hasContent && !assistantMsg.tool_calls) {
+			const hasReasoning =
+				OPENAI_COMPLETIONS_REASONING_FIELDS.some((field) => {
+					const value = assistantMsg[field];
+					return typeof value === "string" && value.trim().length > 0;
+				}) || (assistantMsg.reasoning_details?.length ?? 0) > 0;
+			// A reasoning-only length stop is valid replay context for adapters that
+			// support a reasoning field. Keeping it lets the bounded recovery request use
+			// the analysis already produced instead of starting from two user messages.
+			const hasReplayableReasoning = msg.stopReason === "length" && hasReasoning;
+			if (!hasContent && !assistantMsg.tool_calls && !hasReplayableReasoning) {
 				continue;
 			}
 			params.push(assistantMsg);
@@ -1722,6 +1800,7 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		zaiToolStream: model.compat.zaiToolStream ?? detected.zaiToolStream,
 		supportsThinkingTokenBudget: model.compat.supportsThinkingTokenBudget ?? detected.supportsThinkingTokenBudget,
 		thinkingTokenBudgetField: model.compat.thinkingTokenBudgetField ?? detected.thinkingTokenBudgetField,
+		thinkingTokenBudgetCap: model.compat.thinkingTokenBudgetCap,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
 		supportsOpenAIGrammarTools: model.compat.supportsOpenAIGrammarTools ?? detected.supportsOpenAIGrammarTools,
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,

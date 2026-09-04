@@ -74,6 +74,11 @@ import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages
 import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
+import {
+	BRAVE_WEB_SEARCH_AUTH_RECORD,
+	BRAVE_WEB_SEARCH_DISPLAY_NAME,
+	resolveBraveSearchApiKey,
+} from "./web-search-tools.ts";
 import { registerDetectedWhiteRabbitNeo } from "./whiterabbitneo.ts";
 import { instantiateWindowsTools, seedBundledSearchRuntime, seedBundledWindowsRuntime } from "./windows-tools.ts";
 import * as workspace from "./workspace.ts";
@@ -110,6 +115,7 @@ process.env.PI_CODING_AGENT_DIR ??= CONSOLE_AGENT_DIR;
 const OFFICECLI_PACK_NAME = "office-assistant";
 const AGENT_BROWSER_PACK_NAME = "agent-browser";
 const CODE_DEVELOPMENT_PACK_NAME = "code-development";
+const WEB_SEARCH_PACK_NAME = "web-search";
 
 const MANAGED_TOOL_PACKS: Partial<Record<managedFileTools.ManagedToolId, string>> = {
 	sevenzip: "archive-files",
@@ -275,9 +281,11 @@ function touchSessionIndex(
 /**
  * “安装工具”替代旧的“给某个会话添加助手”：工具一旦可用，就绑定到全部会话；
  * 每轮仍由本地能力路由只注入命中的最小工具组。
+ * 返回挂载状态是否发生变化（与 mountPack 一致），会话绑定无论是否变化都会执行。
  */
-function activatePackForAllSessions(packName: string): void {
-	mountPack(packName);
+function activatePackForAllSessions(packName: string): boolean {
+	if (!listPacks().some((pack) => pack.name === packName)) return false;
+	const changed = mountPack(packName);
 	for (const cs of sessions.values()) {
 		cs.enabledPacks.add(packName);
 		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
@@ -288,6 +296,7 @@ function activatePackForAllSessions(packName: string): void {
 		entry.enabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...enabled])];
 	}
 	writeSessionIndex(index);
+	return changed;
 }
 
 function activateOfficeCliForAllSessions(): void {
@@ -389,6 +398,9 @@ if (isAgentBrowserRuntimeAvailable()) {
 } else {
 	deactivatePackForAllSessions(AGENT_BROWSER_PACK_NAME);
 }
+// 联网检索按用户意愿启用：已挂载过的包重启后立即重新绑定到全部会话；
+// 全新安装保持未挂载，等用户在工具目录里显式启用。
+if (isMountedPack(WEB_SEARCH_PACK_NAME)) activatePackForAllSessions(WEB_SEARCH_PACK_NAME);
 for (const [id, packName] of Object.entries(MANAGED_TOOL_PACKS) as Array<[managedFileTools.ManagedToolId, string]>) {
 	if (managedFileTools.getManagedToolStatus(id).installed) activatePackForAllSessions(packName);
 	else deactivatePackForAllSessions(packName);
@@ -917,6 +929,7 @@ async function buildCapabilityCatalog() {
 	const redteamStatus = await redteam.getLocalStatus();
 	const redteamPack = listPacks().find((item) => item.name === redteam.REDTEAM_PACK_NAME);
 	const browserPack = listPacks().find((item) => item.name === AGENT_BROWSER_PACK_NAME);
+	const webSearchPack = listPacks().find((item) => item.name === WEB_SEARCH_PACK_NAME);
 	const codeDevelopmentStatus = codeDevelopment.getCodeDevelopmentStatus();
 	const codeDevelopmentPack = listPacks().find((item) => item.name === CODE_DEVELOPMENT_PACK_NAME);
 	const codeDevelopmentCwd = workspace.getWorkspacePath() ?? DATA_DIR;
@@ -976,6 +989,29 @@ async function buildCapabilityCatalog() {
 				skillCount: 0,
 				installedSkillCount: 0,
 				removable: false,
+			},
+			{
+				id: "web-search",
+				internalName: "web-search",
+				displayName: "联网检索（Brave）",
+				description:
+					"通过 Brave LLM Context 返回带来源的网页证据片段，由本地模型分析后作答。仅发送最终搜索词到 Brave；搜索词可能由当前上下文生成，敏感内容会在本地拦截。",
+				category: "效率工具",
+				formats: ["网页证据", "来源引用"],
+				installed: isMountedPack(WEB_SEARCH_PACK_NAME),
+				version: webSearchPack?.version ?? "1.0.0",
+				installPath: "Pi 控制台内置",
+				platform: `${process.platform}-${process.arch}`,
+				iconText: "搜",
+				sourceName: "Brave Search LLM Context API",
+				sourceUrl: "https://api-dashboard.search.brave.com/documentation/services/llm-context",
+				activation: "启用后常驻提供，由模型按需调用",
+				capabilities: webSearchPack?.tools ?? [],
+				skillCount: 0,
+				installedSkillCount: 0,
+				removable: true,
+				keyConfigured: resolveBraveSearchApiKey() !== undefined,
+				keyRecord: BRAVE_WEB_SEARCH_AUTH_RECORD,
 			},
 			{
 				id: "officecli",
@@ -1201,13 +1237,16 @@ function listCustomModels() {
 function listKeys(): Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> {
 	const entries: Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> = [];
 	const names = new Map(modelRuntime.getProviders().map((p) => [p.id, p.name ?? p.id]));
+	// 非模型服务的凭据记录（如 Brave 联网检索）也在此展示，使用固定显示名。
+	names.set(BRAVE_WEB_SEARCH_AUTH_RECORD, BRAVE_WEB_SEARCH_DISPLAY_NAME);
 	const authFile = readAuthFile();
 	for (const [provider, entry] of Object.entries(authFile)) {
 		if (entry.type !== "api_key") continue;
 		entries.push({
 			provider,
 			displayName: names.get(provider) ?? provider,
-			masked: maskKey(entry.key),
+			// The Brave credential never crosses into the renderer, even partially.
+			masked: provider === BRAVE_WEB_SEARCH_AUTH_RECORD ? "****" : maskKey(entry.key),
 			source: "file",
 		});
 	}
@@ -1221,6 +1260,15 @@ function listKeys(): Array<{ provider: string; displayName: string; masked: stri
 				source: "env",
 			});
 		}
+	}
+	// 开发环境用 BRAVE_SEARCH_API_KEY 配置的检索 Key 同样可见（未落盘）。
+	if (!(BRAVE_WEB_SEARCH_AUTH_RECORD in authFile) && resolveBraveSearchApiKey()) {
+		entries.push({
+			provider: BRAVE_WEB_SEARCH_AUTH_RECORD,
+			displayName: BRAVE_WEB_SEARCH_DISPLAY_NAME,
+			masked: "（环境变量）",
+			source: "env",
+		});
 	}
 	return entries;
 }
@@ -1599,7 +1647,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	const packMatch = pathname.match(/^\/api\/packs\/([^/]+)\/(mount|unmount)$/);
 	if (packMatch && req.method === "POST") {
 		const [, packName, action] = packMatch;
-		const changed = action === "mount" ? mountPack(packName) : deactivatePackForAllSessions(packName);
+		// mount 走 activatePackForAllSessions：立即同步当前内存会话与持久化会话，
+		// 不要求重启或新建会话；unmount 本身就解除全部绑定。
+		const changed =
+			action === "mount" ? activatePackForAllSessions(packName) : deactivatePackForAllSessions(packName);
 		if (!changed) {
 			sendJson(res, 404, { error: `能力包 ${packName} 不存在或状态未变化` });
 			return;
@@ -1850,6 +1901,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const body = (await readBodyJson(req)) as { provider?: unknown; key?: unknown };
 		if (typeof body?.provider !== "string" || typeof body?.key !== "string" || !body.key.trim()) {
 			sendJson(res, 400, { error: '请求体需为 {"provider": "...", "key": "..."}' });
+			return;
+		}
+		// Brave 联网检索不是模型服务，走同一 auth.json 存储，但无需注册 provider。
+		if (body.provider === BRAVE_WEB_SEARCH_AUTH_RECORD) {
+			writeAuthEntry(body.provider, body.key.trim());
+			sendJson(res, 200, { ok: true });
 			return;
 		}
 		if (!modelRuntime.getProvider(body.provider)) {

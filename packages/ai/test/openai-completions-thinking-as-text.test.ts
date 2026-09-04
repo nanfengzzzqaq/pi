@@ -40,6 +40,7 @@ const compat = {
 	zaiToolStream: false,
 	supportsThinkingTokenBudget: false,
 	thinkingTokenBudgetField: undefined,
+	thinkingTokenBudgetCap: undefined,
 	supportsStrictMode: true,
 	supportsOpenAIGrammarTools: false,
 	cacheControlFormat: undefined,
@@ -53,10 +54,12 @@ const compat = {
 	| "requiresAssistantContentOnToolCalls"
 	| "supportsToolChoiceWithThinking"
 	| "thinkingTokenBudgetField"
+	| "thinkingTokenBudgetCap"
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat["cacheControlFormat"];
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
+	thinkingTokenBudgetCap?: OpenAICompletionsCompat["thinkingTokenBudgetCap"];
 };
 
 function buildModel(baseUrl = "http://127.0.0.1:1"): Model<"openai-completions"> {

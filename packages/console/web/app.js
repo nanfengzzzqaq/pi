@@ -3453,22 +3453,25 @@ function createCard(item, options) {
 	main.append(titleRow, desc);
 	const actions = document.createElement("div");
 	actions.className = "catalog-card-actions";
+	const isToggleTool = item.id === "web-search";
 	const status = document.createElement("span");
 	status.className = `catalog-status${item.installed ? " installed" : options.installing ? " installing" : ""}`;
 	status.textContent = item.updateAvailable
 		? "可更新"
 		: item.installed
-			? `已安装${item.version ? ` · ${item.version}` : ""}`
+			? `${isToggleTool ? "已启用" : "已安装"}${item.version ? ` · ${item.version}` : ""}`
 			: options.installing
 				? "安装中"
-				: "未安装";
+				: isToggleTool
+					? "未启用"
+					: "未安装";
 	actions.appendChild(status);
 	if (!item.installed) {
 		const install = document.createElement("button");
 		install.type = "button";
 		install.className = "primary-btn small";
 		install.dataset.installToolId = item.id;
-		install.textContent = options.installText || "安装";
+		install.textContent = options.installText || (isToggleTool ? "启用" : "安装");
 		install.disabled = options.installDisabled === true || options.installing === true;
 		if (options.installing) install.title = options.installTitle || "正在安装，请稍候";
 		else if (options.installDisabled) install.title = "请先安装所属工具";
@@ -3497,7 +3500,43 @@ function installDispatcher(tool) {
 	if (tool.id === "code-development") return installCodeDevelopment;
 	if (tool.id === "officecli") return installOfficeCli;
 	if (tool.id === "redteam") return installRedTeam;
+	if (tool.id === "web-search") return installWebSearch;
 	return (button) => installManagedTool(tool, button);
+}
+
+/** 启用联网检索：挂载 web-search 能力包并立即同步全部会话。 */
+async function installWebSearch(button) {
+	button.disabled = true;
+	button.textContent = "启用中…";
+	try {
+		await api("/api/packs/web-search/mount", { method: "POST" });
+		closeDrawer();
+		await refreshCatalog();
+		await loadSessions();
+		showInfo("联网检索已启用；请确认已在设置中保存 Brave Search API Key");
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "启用联网检索";
+		showError(`启用联网检索失败：${error.message}`);
+	}
+}
+
+/** 停用联网检索：解除 web-search 能力包与全部会话的绑定；已保存的 Key 保留。 */
+async function disableWebSearch(button) {
+	if (!window.confirm("停用联网检索？\n\n模型将不再获得 web_search 工具；已保存的 Brave API Key 会保留，可随时重新启用。")) return;
+	button.disabled = true;
+	button.textContent = "停用中…";
+	try {
+		await api("/api/packs/web-search/unmount", { method: "POST" });
+		closeDrawer();
+		await refreshCatalog();
+		await loadSessions();
+		showInfo("联网检索已停用");
+	} catch (error) {
+		button.disabled = false;
+		button.textContent = "停用联网检索";
+		showError(`停用联网检索失败：${error.message}`);
+	}
 }
 
 async function uninstallTool(tool, button) {
@@ -4082,11 +4121,20 @@ function openToolDetail(tool) {
 	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
 	meta.className = "drawer-meta";
-	meta.textContent = `${tool.installed ? "已安装" : "未安装"}${tool.version ? ` · ${tool.version}` : ""} · ${tool.activation}`;
+	meta.textContent = `${tool.installed ? (tool.id === "web-search" ? "已启用" : "已安装") : tool.id === "web-search" ? "未启用" : "未安装"}${tool.version ? ` · ${tool.version}` : ""} · ${tool.activation}`;
 	const desc = document.createElement("div");
 	desc.className = "drawer-desc";
 	desc.textContent = tool.description;
 	drawerContentEl.append(meta, desc);
+	if (tool.id === "web-search") {
+		const privacy = document.createElement("div");
+		privacy.className = "drawer-desc";
+		privacy.textContent =
+			`隐私说明：仅发送最终搜索词到 Brave；搜索词可能由当前上下文生成，敏感内容会在本地拦截。当前${
+				tool.keyConfigured ? "已" : "尚未"
+			}保存 Brave Search API Key（设置 → API Key → Brave 联网检索）。`;
+		drawerContentEl.appendChild(privacy);
+	}
 	const source = document.createElement("a");
 	source.className = "drawer-link";
 	source.href = tool.sourceUrl;
@@ -4129,7 +4177,9 @@ function openToolDetail(tool) {
 				? "安装红队引擎"
 				: tool.id === "officecli"
 					? "安装 OfficeCLI"
-					: `安装${tool.displayName}`;
+					: tool.id === "web-search"
+						? "启用联网检索"
+						: `安装${tool.displayName}`;
 		install.disabled = installState.installing;
 		install.title = installState.installTitle;
 		install.addEventListener("click", () => installDispatcher(tool)(install));
@@ -4148,7 +4198,14 @@ function openToolDetail(tool) {
 			inputEl.focus();
 		});
 		actions.appendChild(use);
-		if (tool.removable !== false) {
+		if (tool.id === "web-search") {
+			const disable = document.createElement("button");
+			disable.className = "secondary-btn";
+			disable.type = "button";
+			disable.textContent = "停用联网检索";
+			disable.addEventListener("click", () => disableWebSearch(disable));
+			actions.appendChild(disable);
+		} else if (tool.removable !== false) {
 			const more = document.createElement("details");
 			more.className = "danger-menu";
 			more.innerHTML = "<summary>更多操作</summary>";
@@ -4923,6 +4980,8 @@ async function loadKeysSection() {
 	try {
 		const [keys, models] = await Promise.all([api("/api/keys"), api("/api/models")]);
 		const providers = new Map(models.map((m) => [m.provider, m.label.split(" · ")[0]]));
+		// Brave 联网检索不是模型服务，但 Key 同样保存在这里；即使尚未保存也始终可选。
+		providers.set("brave-web-search", "Brave 联网检索");
 		keyProviderEl.innerHTML = "";
 		const existing = new Set(keys.map((k) => k.provider));
 		const sorted = [...providers.keys()].sort((a, b) => {
@@ -4934,6 +4993,9 @@ async function loadKeysSection() {
 			const option = document.createElement("option");
 			option.value = p;
 			option.textContent = existing.has(p) ? `${providers.get(p)}（已配置）` : providers.get(p);
+			if (p === "brave-web-search") {
+				option.title = "仅发送最终搜索词到 Brave；搜索词可能由当前上下文生成，敏感内容会在本地拦截。";
+			}
 			keyProviderEl.appendChild(option);
 		}
 		renderKeyList(keys);

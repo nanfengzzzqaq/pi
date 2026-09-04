@@ -828,8 +828,9 @@ jobs:
           {
             echo '## 本版关键修复'
             echo
-            echo '- 修复已知问题并改进稳定性。'
-            echo '- 安装包强制内置并校验本仓库 Pi AI，包含 DeepSeek V4 工具调用兼容与视觉模型。'
+            echo '- Qwen 本地模型在 xhigh 下限制单轮思考预算，为正文和完整工具调用保留空间；仅在推理耗尽输出且正文为空时自动续答一次。'
+            echo '- 新增 Brave 联网检索，提供可核验来源、查询脱敏、响应限长和提示注入隔离。'
+            echo '- 收紧浏览器自动启用边界，并强化安装包内 Pi AI、搜索能力和前端资源的一致性校验。'
             echo
             printf '构建来源：`%s`。\n' "${SOURCE_SHA}"
             printf '%s\n' "${release_marker}"

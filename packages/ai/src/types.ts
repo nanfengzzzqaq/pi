@@ -612,6 +612,14 @@ export interface OpenAICompletionsCompat {
 	thinkingTokenBudgetField?: ThinkingTokenBudgetField;
 	/** Alias for `thinkingTokenBudgetField: "thinking_token_budget"` (vLLM). Prefer `thinkingTokenBudgetField`. Default: false. */
 	supportsThinkingTokenBudget?: boolean;
+	/**
+	 * Pi-internal ceiling applied to the level budget before the answer-room clamp.
+	 * Not sent to the server; it only lowers the value delivered through
+	 * `thinkingTokenBudgetField` so reasoning cannot consume the whole response.
+	 * Scope it to specific models (e.g. a per-model xhigh cap) instead of changing
+	 * the global `DEFAULT_THINKING_BUDGETS`.
+	 */
+	thinkingTokenBudgetCap?: number;
 	/** Whether the provider supports OpenAI custom tools with Lark/regex grammar formats. When false, grammar-constrained tools fall back to normal function tools. Default: false; the generated model catalog enables it for capable models. */
 	supportsOpenAIGrammarTools?: boolean;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: true. */

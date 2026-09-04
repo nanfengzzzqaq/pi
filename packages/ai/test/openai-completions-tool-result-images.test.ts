@@ -25,9 +25,11 @@ const compat: Omit<
 	| "requiresAssistantContentOnToolCalls"
 	| "supportsToolChoiceWithThinking"
 	| "thinkingTokenBudgetField"
+	| "thinkingTokenBudgetCap"
 > & {
 	deferredToolsMode?: OpenAICompletionsCompat["deferredToolsMode"];
 	thinkingTokenBudgetField?: OpenAICompletionsCompat["thinkingTokenBudgetField"];
+	thinkingTokenBudgetCap?: OpenAICompletionsCompat["thinkingTokenBudgetCap"];
 } = {
 	supportsStore: true,
 	supportsDeveloperRole: true,
@@ -47,6 +49,7 @@ const compat: Omit<
 	zaiToolStream: false,
 	supportsThinkingTokenBudget: false,
 	thinkingTokenBudgetField: undefined,
+	thinkingTokenBudgetCap: undefined,
 	supportsStrictMode: true,
 	supportsOpenAIGrammarTools: false,
 	cacheControlFormat: "anthropic",

@@ -88,11 +88,51 @@ describe("custom model configuration", () => {
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: true,
 						thinkingFormat: "qwen-chat-template",
+						thinkingTokenBudgetField: "thinking_token_budget",
+						thinkingTokenBudgetCap: 8192,
 						supportsOpenAIGrammarTools: false,
 					},
 				},
 			],
 		});
+	});
+
+	it("enables the capped thinking_token_budget only for Qwen reasoning custom models", () => {
+		const reasoning = normalizeCustomModel(createCustomProviderId("qwen-budget"), {
+			name: "Qwen reasoning",
+			baseUrl: "http://127.0.0.1:8000/v1",
+			modelId: "qwen27b-fp8",
+			reasoning: true,
+		});
+		const nonReasoning = normalizeCustomModel(createCustomProviderId("qwen-plain"), {
+			name: "Qwen plain",
+			baseUrl: "http://127.0.0.1:8000/v1",
+			modelId: "qwen27b-fp8",
+			reasoning: false,
+		});
+		const otherModel = normalizeCustomModel(createCustomProviderId("other"), {
+			name: "Other reasoning",
+			baseUrl: "http://127.0.0.1:8000/v1",
+			modelId: "deepseek-reasoner",
+			reasoning: true,
+		});
+
+		expect(toProviderConfig(reasoning).models[0]?.compat).toEqual({
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			thinkingFormat: "qwen-chat-template",
+			thinkingTokenBudgetField: "thinking_token_budget",
+			thinkingTokenBudgetCap: 8192,
+			supportsStrictMode: false,
+			supportsOpenAIGrammarTools: false,
+			maxTokensField: "max_tokens",
+		});
+		for (const definition of [nonReasoning, otherModel]) {
+			const compat = toProviderConfig(definition).models[0]?.compat;
+			expect(compat).not.toHaveProperty("thinkingTokenBudgetField");
+			expect(compat).not.toHaveProperty("thinkingTokenBudgetCap");
+		}
 	});
 
 	it("preserves custom compatibility flags after runtime registration", async () => {
@@ -112,7 +152,10 @@ describe("custom model configuration", () => {
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: true,
 			thinkingFormat: "qwen-chat-template",
+			thinkingTokenBudgetField: "thinking_token_budget",
+			thinkingTokenBudgetCap: 8192,
 		});
+		expect(runtime.getModel(providerId, "qwen")?.thinkingLevelMap?.xhigh).toBe("xhigh");
 	});
 
 	it("keeps non-Qwen reasoning models on generic OpenAI reasoning parameters", () => {

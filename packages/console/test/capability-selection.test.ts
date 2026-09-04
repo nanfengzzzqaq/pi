@@ -80,4 +80,27 @@ describe("按本轮选择能力", () => {
 		expect(toolDisplayName("powershell")).toBe("运行 Windows 命令（powershell）");
 		expect(toolDisplayName("browser_snapshot")).toBe("获取页面状态（browser_snapshot）");
 	});
+
+	it("普通联网检索不激活客户端浏览器，明确打开或操作网址才激活", () => {
+		expect(selectCapabilities("帮我联网搜索今天的最新新闻", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("上网搜索网络上的版本信息", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("搜索网页上的最新资料", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("找一下这个网站的公开资料和官网链接", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("请访问相关网页获取最新新闻", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("检查登录函数为什么报错", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("分析按钮的点击事件", ["agent-browser"])).toEqual([]);
+		expect(selectCapabilities("只分析 https://example.com 字符串，不要打开", ["agent-browser"])).toEqual([]);
+		const [directUrl] = selectCapabilities("请打开 https://example.com/report", ["agent-browser"]);
+		expect(directUrl?.toolNames).toContain("browser_navigate");
+		const [navigate] = selectCapabilities("用浏览器打开 https://example.com/report 并点击下载", ["agent-browser"]);
+		expect(navigate?.toolNames).toContain("browser_navigate");
+		const [interact] = selectCapabilities("在这个网页里搜索相关内容并点击第一个结果", ["agent-browser"]);
+		expect(interact?.toolNames).toContain("browser_click");
+	});
+
+	it("web-search 能力包挂载后常驻提供 web_search，不依赖关键词门禁", () => {
+		expect(baseToolNames(["web-search"])).toContain("web_search");
+		// 无 activation 规则：按本轮选择永远为空，但工具已在会话基础集里。
+		expect(selectCapabilities("帮我联网搜索最新新闻", ["web-search"])).toEqual([]);
+	});
 });

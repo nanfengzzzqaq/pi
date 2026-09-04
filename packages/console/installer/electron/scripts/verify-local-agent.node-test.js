@@ -1202,6 +1202,34 @@ test("accepts the same critical console resources before and after packaging", (
 	);
 });
 
+test("keeps Qwen and web-search resources in the critical console verification list", () => {
+	for (const relativePath of [
+		"src/custom-models.ts",
+		"src/brave-web-search.ts",
+		"src/web-search-tools.ts",
+		"web/app.js",
+		"packs/web-search/index.ts",
+		"packs/web-search/pack.json",
+	]) {
+		assert.ok(CONSOLE_CRITICAL_FILES.includes(relativePath), `missing critical resource: ${relativePath}`);
+	}
+});
+
+test("rejects stale staged and unpacked web-search resources", () => {
+	const fixture = createConsoleFixture();
+	writeFileSync(join(fixture.stagedElectron, "src/web-search-tools.ts"), "stale staged search tool");
+	assert.throws(
+		() => verifyStagedConsole(fixture.sourceConsole, fixture.stagedElectron),
+		/控制台关键资源校验失败/u,
+	);
+
+	writeFileSync(join(fixture.unpackedApp, "packs/web-search/pack.json"), "stale unpacked search pack");
+	assert.throws(
+		() => verifyPackagedConsole(fixture.sourceConsole, fixture.unpackedApp),
+		/控制台关键资源校验失败/u,
+	);
+});
+
 test("accepts the packaged trusted browser controller and rejects a stale one", async () => {
 	const fixture = createFixture();
 	const sourceElectron = addElectronFixture(fixture.directory, fixture.appDirectory);

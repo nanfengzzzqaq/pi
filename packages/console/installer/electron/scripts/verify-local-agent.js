@@ -20,10 +20,16 @@ export const LOCAL_AI_CRITICAL_FILES = [
 export const CONSOLE_CRITICAL_FILES = [
 	"src/server.ts",
 	"src/packs.ts",
+	"src/custom-models.ts",
+	"src/brave-web-search.ts",
+	"src/web-search-tools.ts",
 	"src/session-messages.ts",
 	"src/agent-browser-runtime.ts",
 	"src/agent-browser-tools.ts",
+	"web/app.js",
 	"packs/agent-browser/pack.json",
+	"packs/web-search/index.ts",
+	"packs/web-search/pack.json",
 ];
 
 export const ELECTRON_ASAR_CRITICAL_FILES = ["browser-controller.js"];

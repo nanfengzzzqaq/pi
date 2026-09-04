@@ -1,0 +1,6 @@
+{
+	"name": "web-search",
+	"displayName": "联网检索（Brave）",
+	"description": "通过 Brave LLM Context 检索带来源的网页证据片段，由本地模型分析后作答",
+	"version": "1.1.0"
+}

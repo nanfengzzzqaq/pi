@@ -65,7 +65,11 @@ const ThinkingLevelMapSchema = Type.Object({
 
 const ChatTemplateKwargScalarSchema = Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]);
 const ChatTemplateKwargVariableSchema = Type.Object({
-	$var: Type.Union([Type.Literal("thinking.enabled"), Type.Literal("thinking.effort")]),
+	$var: Type.Union([
+		Type.Literal("thinking.enabled"),
+		Type.Literal("thinking.effort"),
+		Type.Literal("thinking.budget"),
+	]),
 	omitWhenOff: Type.Optional(Type.Boolean()),
 });
 const ChatTemplateKwargSchema = Type.Union([ChatTemplateKwargScalarSchema, ChatTemplateKwargVariableSchema]);
@@ -98,6 +102,15 @@ const OpenAICompletionsCompatSchema = Type.Object({
 	),
 	chatTemplateKwargs: Type.Optional(Type.Record(Type.String(), ChatTemplateKwargSchema)),
 	chatTemplateArgs: Type.Optional(Type.Record(Type.String(), ChatTemplateKwargSchema)),
+	supportsThinkingTokenBudget: Type.Optional(Type.Boolean()),
+	thinkingTokenBudgetField: Type.Optional(
+		Type.Union([
+			Type.Literal("thinking_token_budget"),
+			Type.Literal("thinking_budget"),
+			Type.Literal("thinking_budget_tokens"),
+		]),
+	),
+	thinkingTokenBudgetCap: Type.Optional(Type.Number({ minimum: 1 })),
 	cacheControlFormat: Type.Optional(Type.Literal("anthropic")),
 	openRouterRouting: Type.Optional(OpenRouterRoutingSchema),
 	vercelGatewayRouting: Type.Optional(VercelGatewayRoutingSchema),
