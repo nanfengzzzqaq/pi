@@ -33,7 +33,7 @@ import {
 	resolveAttachmentSnapshots,
 	saveAttachmentSnapshot,
 } from "./attachment-snapshots.ts";
-import { bundledProviderExtensionPaths } from "./bundled-providers.ts";
+import { bundledProviderExtensionPaths, createAntigravityModelRefresher } from "./bundled-providers.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
@@ -362,6 +362,7 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+const refreshAntigravityModels = createAntigravityModelRefresher(modelRuntime);
 try {
 	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
 		modelRuntime.registerProvider(definition.providerId, customModels.toProviderConfig(definition));
@@ -1919,6 +1920,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// Google 登录使用独立 provider 凭据，绝不写入 openai-codex 的记录。
 	if (pathname.startsWith("/api/oauth/antigravity")) {
 		res.setHeader("Cache-Control", "no-store");
+		if (pathname === "/api/oauth/antigravity/models/refresh" && req.method === "POST") {
+			try {
+				const count = await refreshAntigravityModels();
+				sendJson(res, 200, { count });
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : "模型目录刷新未完成，请重试" });
+			}
+			return;
+		}
 		if (pathname === "/api/oauth/antigravity/status" && req.method === "GET") {
 			sendJson(res, 200, antigravityOAuth.status());
 			return;

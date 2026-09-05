@@ -30,7 +30,9 @@ npx tsx packages/console/src/server.ts
 1. 打开 **设置 → 模型服务 → Google Antigravity → Google 登录**。
 2. 在系统浏览器中选择自己的 Google 账号并授权。回调监听在本机 `127.0.0.1:51121`，正常情况下会自动完成。
 3. 如果浏览器授权后未自动连接，复制地址栏中完整的 `localhost:51121/oauth-callback?...` 地址，粘贴到 Pi 的回调输入框，点击 **继续登录**。保留地址中的 `code` 和 `state`；输入错误可重新粘贴，登录等待五分钟后超时，也可随时取消。
-4. 显示已连接后，在对话底部模型列表选择 Antigravity 模型。可用模型、额度和访问权限由 Google 账号决定。
+4. 显示已连接后，客户端自动向 Google 刷新目录，再更新对话底部的模型列表；重新打开客户端时也会刷新。若仍只看到 Gemini，点击 **刷新模型** 重试，无需退出 Google 或 Codex。
+
+适配器包含 Gemini、Claude Sonnet 4.6、Claude Opus 4.6 和 GPT-OSS 120B。这里的 GPT 指 **GPT-OSS**，不是 Codex 订阅中的全部 GPT 型号。模型列表包含适配器的备用目录，列出不代表账号已获使用权限；实际可用型号和额度由 Google 决定。网络失败时保留已有目录，可稍后手动刷新。
 
 Google 与 Codex 可以同时保持登录，模型选择决定当前对话使用哪一方。凭据由 Pi 原生账号存储管理，分别使用 `antigravity` 和 `openai-codex` 记录；**退出 Google 不会退出 Codex**。凭据文件为 `<PI_CONSOLE_DATA>/agent/auth.json`（Electron 默认 `%APPDATA%\pi-console\data\agent\auth.json`），不会随代码提交或安装包分发。适配器自身的模型目录缓存仍使用 `~/.pi/agent/antigravity-model-catalog.json`，其中不保存登录凭据。
 
@@ -110,6 +112,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/sessions/:id/model` | body `{"provider","modelId"}` → `session.setModel`，SSE 发 `model_changed` |
 | `POST /api/sessions/:id/thinking` | body `{"level"}`（off/minimal/low/medium/high/xhigh/max），返回实际生效值 |
 | `GET /api/models` | 全部 provider 的模型（`{provider,modelId,label,hasAuth}`） |
+| `POST /api/oauth/antigravity/models/refresh` | 使用已登录 Google 账号刷新 Antigravity 目录，返回 `{count}`；不会刷新其他服务 |
 | `GET` / `POST /api/custom-models` | 列出或保存自定义 OpenAI 兼容模型；API Key 单独存入 `auth.json` |
 | `POST /api/custom-models/discover` | 从兼容服务的 `/models` 读取可用模型 ID |
 | `DELETE /api/custom-models/:providerId` | 删除自定义模型及其保存的 API Key |

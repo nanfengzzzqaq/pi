@@ -427,9 +427,12 @@
 					<button id="antigravity-login" type="button">Google 登录</button>
 					<button id="antigravity-open" class="secondary-btn" type="button" hidden>打开登录网页</button>
 					<button id="antigravity-cancel" class="secondary-btn" type="button" hidden>取消登录</button>
+					<button id="antigravity-refresh-models" class="secondary-btn" type="button" hidden>刷新模型</button>
 					<button id="antigravity-logout" class="key-delete" type="button" hidden>退出 Google</button>
 				</div>
+				<p id="antigravity-model-status" class="modal-hint" role="status" aria-live="polite" hidden></p>
 				<p class="modal-hint">Google 与 Codex 可同时保持登录。换电脑后，在该电脑的 Pi 中重新授权即可。</p>
+				<p class="modal-hint">Antigravity 包含 Gemini、Claude 和 GPT-OSS；登录后自动刷新模型。实际可用型号与额度由 Google 账号决定。</p>
 				<form id="antigravity-callback-form" hidden>
 					<p class="modal-hint">浏览器授权后通常会自动连接。若未自动完成，请复制地址栏中完整的 localhost 回调地址，粘贴到这里继续。</p>
 					<div class="key-add-row">
