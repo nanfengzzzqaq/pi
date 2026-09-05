@@ -1,6 +1,6 @@
 {
 	"name": "@pi/console",
-	"version": "0.3.52",
+	"version": "0.3.53",
 	"private": true,
 	"type": "module",
 	"description": "Pi 控制台：本地对话、模型服务与按需工具工作台",
@@ -10,6 +10,7 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.84.2",
+		"jiti": "2.7.0",
 		"pi-antigravity": "0.7.1",
 		"undici": "8.9.0"
 	}
