@@ -2137,11 +2137,10 @@ export class AgentSession {
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
-				this._compactionAbortController.signal.throwIfAborted();
-
 				if (result?.cancel) {
 					throw new Error("Compaction cancelled");
 				}
+				this._compactionAbortController.signal.throwIfAborted();
 
 				if (result?.compaction) {
 					extensionCompaction = result.compaction;
