@@ -39,14 +39,23 @@ async function startServer(port: number): Promise<void> {
 	const child = spawn(process.execPath, [TSX_CLI, SERVER_ENTRY], {
 		cwd: CONSOLE_DIR,
 		env: {
-			...process.env,
+			// 仅继承启动所需环境，避免集成测试发现开发机上的模型 Key 或云凭据。
+			...Object.fromEntries(
+				Object.entries(process.env).filter(([name]) =>
+					/^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP)$/i.test(name),
+				),
+			),
 			PORT: String(port),
 			PI_CONSOLE_DATA: dataDir,
+			PI_CODING_AGENT_DIR: join(dataDir, "agent"),
+			PI_OFFLINE: "1",
+			ANTIGRAVITY_NO_PREWARM: "1",
 			// 独立于开发机环境：确保“未配置 Key”与挂载状态只由本测试驱动。
 			BRAVE_SEARCH_API_KEY: "",
 			PI_CONSOLE_TOKEN: "",
 			PI_CONSOLE_MODEL: "",
 		},
+		windowsHide: true,
 		stdio: ["ignore", "ignore", "pipe"],
 	});
 	children.push(child);
@@ -117,11 +126,15 @@ async function postMessageWhenIdle(port: number, sessionId: string, text: string
 
 /** 只订阅未来事件，返回本次消息而非历史回放的 capability_selection。 */
 async function messageToolNames(port: number, sessionId: string, text: string): Promise<string[]> {
-	const controller = new AbortController();
-	const response = await fetch(
-		`http://127.0.0.1:${port}/api/sessions/${sessionId}/stream?since=${Number.MAX_SAFE_INTEGER}`,
-		{ signal: controller.signal },
+	const history = await api<{ lastSeq: number; streamEpoch: string }>(
+		port,
+		`/api/sessions/${sessionId}/history?limit=1`,
 	);
+	const cursor = new URLSearchParams({ since: String(history.lastSeq), epoch: history.streamEpoch });
+	const controller = new AbortController();
+	const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/stream?${cursor}`, {
+		signal: controller.signal,
+	});
 	const reader = response.body?.getReader();
 	if (!reader) throw new Error("SSE stream has no body");
 	const decoder = new TextDecoder();
@@ -148,8 +161,8 @@ async function messageToolNames(port: number, sessionId: string, text: string): 
 		}
 	})();
 	try {
-		await postMessageWhenIdle(port, sessionId, text);
-		return await nextCapability;
+		const [, toolNames] = await Promise.all([postMessageWhenIdle(port, sessionId, text), nextCapability]);
+		return toolNames;
 	} finally {
 		clearTimeout(watchdog);
 		controller.abort();
