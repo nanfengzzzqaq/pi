@@ -26,12 +26,14 @@ import {
 	redactSensitiveText,
 	vaultSensitiveUrlsInText,
 } from "./agent-browser-runtime.ts";
+import { AntigravityOAuthCoordinator } from "./antigravity-oauth.ts";
 import { extractFileReferences } from "./artifacts.ts";
 import {
 	deleteAttachmentSnapshots,
 	resolveAttachmentSnapshots,
 	saveAttachmentSnapshot,
 } from "./attachment-snapshots.ts";
+import { bundledProviderExtensionPaths } from "./bundled-providers.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
@@ -374,6 +376,14 @@ const codexOAuth = new CodexOAuthCoordinator({
 	},
 	logout: () => modelRuntime.logout("openai-codex"),
 });
+const antigravityOAuth = new AntigravityOAuthCoordinator({
+	isAvailable: () => Boolean(modelRuntime.getProvider("antigravity")),
+	isConnected: () => modelRuntime.isUsingOAuth("antigravity"),
+	login: async (interaction) => {
+		await modelRuntime.login("antigravity", "oauth", interaction);
+	},
+	logout: () => modelRuntime.logout("antigravity"),
+});
 if (await registerDetectedWhiteRabbitNeo(modelRuntime)) {
 	console.log("本地模型：已连接 WhiteRabbitNeo V3");
 }
@@ -418,9 +428,17 @@ if (await officecli.isBinaryReady()) activateOfficeCliForAllSessions();
 try {
 	const warmupCwd = join(DATA_DIR, "warmup");
 	mkdirSync(warmupCwd, { recursive: true });
+	const resourceLoader = new RoutedSkillResourceLoader({
+		cwd: warmupCwd,
+		agentDir: CONSOLE_AGENT_DIR,
+		additionalExtensionPaths: bundledProviderExtensionPaths(),
+	});
+	await resourceLoader.reload();
 	await createAgentSession({
 		cwd: warmupCwd,
 		modelRuntime,
+		agentDir: CONSOLE_AGENT_DIR,
+		resourceLoader,
 		sessionManager: SessionManager.inMemory(warmupCwd),
 	});
 } catch (error) {
@@ -676,7 +694,12 @@ async function buildSession(
 	const enabledPacks = new Set([...enabledPackNames].filter(isMountedPack));
 	const activePackTools = new Map<string, Set<string>>();
 	const settingsManager = SettingsManager.create(cwd, CONSOLE_AGENT_DIR);
-	const resourceLoader = new RoutedSkillResourceLoader({ cwd, agentDir: CONSOLE_AGENT_DIR, settingsManager });
+	const resourceLoader = new RoutedSkillResourceLoader({
+		cwd,
+		agentDir: CONSOLE_AGENT_DIR,
+		settingsManager,
+		additionalExtensionPaths: bundledProviderExtensionPaths(),
+	});
 	await resourceLoader.reload();
 	// 兼容尚未迁移到 activation/toolGroups 清单的旧 deferred 包。
 	let sessionRef: AgentSession | null = null;
@@ -1379,11 +1402,12 @@ class HttpBodyError extends Error {
 	}
 }
 
-/** 静态文件只映射三个固定路径，不读任意文件 */
+/** 静态文件只映射固定路径，不读任意文件 */
 const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/index.html": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
+	"/antigravity-login.js": { file: "antigravity-login.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
 	"/redteam.svg": { file: "redteam.svg", contentType: "image/svg+xml" },
@@ -1892,6 +1916,36 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
+	// Google 登录使用独立 provider 凭据，绝不写入 openai-codex 的记录。
+	if (pathname.startsWith("/api/oauth/antigravity")) {
+		res.setHeader("Cache-Control", "no-store");
+		if (pathname === "/api/oauth/antigravity/status" && req.method === "GET") {
+			sendJson(res, 200, antigravityOAuth.status());
+			return;
+		}
+		if (pathname === "/api/oauth/antigravity/start" && req.method === "POST") {
+			sendJson(res, 202, await antigravityOAuth.start());
+			return;
+		}
+		if (pathname === "/api/oauth/antigravity/response" && req.method === "POST") {
+			const body = (await readBodyJson(req)) as { promptId?: unknown; value?: unknown };
+			try {
+				sendJson(res, 200, antigravityOAuth.respond(body?.promptId, body?.value));
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : "登录输入无效" });
+			}
+			return;
+		}
+		if (pathname === "/api/oauth/antigravity/cancel" && req.method === "POST") {
+			sendJson(res, 200, await antigravityOAuth.stop());
+			return;
+		}
+		if (pathname === "/api/oauth/antigravity" && req.method === "DELETE") {
+			sendJson(res, 200, await antigravityOAuth.logout());
+			return;
+		}
+	}
+
 	// 模型服务 Key 管理（auth.json 读写 + runtime 刷新）
 	if (pathname === "/api/keys" && req.method === "GET") {
 		sendJson(res, 200, listKeys());
@@ -1901,6 +1955,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const body = (await readBodyJson(req)) as { provider?: unknown; key?: unknown };
 		if (typeof body?.provider !== "string" || typeof body?.key !== "string" || !body.key.trim()) {
 			sendJson(res, 400, { error: '请求体需为 {"provider": "...", "key": "..."}' });
+			return;
+		}
+		if (body.provider === "antigravity") {
+			sendJson(res, 400, { error: "Antigravity 请使用上方的 Google 登录入口" });
 			return;
 		}
 		// Brave 联网检索不是模型服务，走同一 auth.json 存储，但无需注册 provider。
@@ -2500,6 +2558,7 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 
 server.on("close", () => {
 	codexOAuth.cancel();
+	antigravityOAuth.cancel();
 	void officePreview.stopAllOfficePreviews();
 });
 process.once("exit", officePreview.terminateAllOfficePreviewsNow);

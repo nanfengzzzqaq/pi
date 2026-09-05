@@ -421,6 +421,22 @@
 					<button id="codex-oauth-logout-btn" class="key-delete" type="button" hidden>退出</button>
 				</div>
 				<div class="workspace-current" id="codex-oauth-code" title="点击复制设备码" hidden></div>
+				<div class="key-row">
+					<span class="key-name">Google Antigravity</span>
+					<span class="key-masked" id="antigravity-status" role="status" aria-live="polite">读取中…</span>
+					<button id="antigravity-login" type="button">Google 登录</button>
+					<button id="antigravity-open" class="secondary-btn" type="button" hidden>打开登录网页</button>
+					<button id="antigravity-cancel" class="secondary-btn" type="button" hidden>取消登录</button>
+					<button id="antigravity-logout" class="key-delete" type="button" hidden>退出 Google</button>
+				</div>
+				<p class="modal-hint">Google 与 Codex 可同时保持登录。换电脑后，在该电脑的 Pi 中重新授权即可。</p>
+				<form id="antigravity-callback-form" hidden>
+					<p class="modal-hint">浏览器授权后通常会自动连接。若未自动完成，请复制地址栏中完整的 localhost 回调地址，粘贴到这里继续。</p>
+					<div class="key-add-row">
+						<input id="antigravity-callback" type="password" aria-label="Google 登录回调地址" placeholder="粘贴完整回调地址" autocomplete="off" spellcheck="false" maxlength="8192">
+						<button id="antigravity-submit" type="submit">继续登录</button>
+					</div>
+				</form>
 				<div class="key-add-row">
 					<select id="key-provider"></select>
 					<input type="password" id="key-input" placeholder="粘贴 API Key（sk-…）" autocomplete="off">
@@ -490,5 +506,6 @@
 	</div>
 
 	<script src="/app.js"></script>
+	<script type="module" src="/antigravity-login.js"></script>
 </body>
 </html>

@@ -10,7 +10,9 @@
 		"dist": "node scripts/generate-icon.js && electron-builder --win nsis"
 	},
 	"dependencies": {
+		"@earendil-works/pi-ai": "0.84.2",
 		"@earendil-works/pi-coding-agent": "0.84.2",
+		"pi-antigravity": "0.7.1",
 		"typebox": "1.3.7",
 		"undici": "8.9.0"
 	},
@@ -43,6 +45,7 @@
 			"node_modules/**"
 		],
 		"asarUnpack": [
+			"node_modules/pi-antigravity/**",
 			"src/**",
 			"packs/**",
 			"skills/**",

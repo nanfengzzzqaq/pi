@@ -1,6 +1,6 @@
 # @pi/console — Pi 桌面控制台（按需能力包 + Windows 安装包）
 
-在浏览器里使用 Pi：`node:http` 原生后端 + 纯 HTML/JS/CSS 前端，无新增 npm 依赖、无构建步骤。
+在浏览器里使用 Pi：`node:http` 原生后端 + 纯 HTML/JS/CSS 前端，前端无需构建。
 默认形态为**纯净原生 Pi**（内置 read/bash/edit/write + find/grep/ls 全套原生工具，官方系统提示词）；能力包通过 `customTools` 注册、
 `setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与纯净版完全一致。
 
@@ -22,6 +22,21 @@ npx tsx packages/console/src/server.ts
 ```
 
 > PowerShell 请用 `$env:PI_CONSOLE_MODEL="..."`，Git Bash 请用 `export PI_CONSOLE_MODEL=...`。
+
+## Google Antigravity 登录
+
+客户端内置固定版本的 [`pi-antigravity` 0.7.1](https://github.com/Rahularya01/pi-antigravity)，无需手工安装 Pi 扩展，也无需单独运行反代服务。开发环境更新项目后先在仓库根目录执行 `npm ci --ignore-scripts`；首次检出还需要 `npm run hydrate:model-data` 和 `npm run build:offline`，然后按上面的方式启动控制台。Electron 安装包通过 `installer/electron-build.ps1` 构建，包含同一适配器和登录页面。
+
+1. 打开 **设置 → 模型服务 → Google Antigravity → Google 登录**。
+2. 在系统浏览器中选择自己的 Google 账号并授权。回调监听在本机 `127.0.0.1:51121`，正常情况下会自动完成。
+3. 如果浏览器授权后未自动连接，复制地址栏中完整的 `localhost:51121/oauth-callback?...` 地址，粘贴到 Pi 的回调输入框，点击 **继续登录**。保留地址中的 `code` 和 `state`；输入错误可重新粘贴，登录等待五分钟后超时，也可随时取消。
+4. 显示已连接后，在对话底部模型列表选择 Antigravity 模型。可用模型、额度和访问权限由 Google 账号决定。
+
+Google 与 Codex 可以同时保持登录，模型选择决定当前对话使用哪一方。凭据由 Pi 原生账号存储管理，分别使用 `antigravity` 和 `openai-codex` 记录；**退出 Google 不会退出 Codex**。凭据文件为 `<PI_CONSOLE_DATA>/agent/auth.json`（Electron 默认 `%APPDATA%\pi-console\data\agent\auth.json`），不会随代码提交或安装包分发。适配器自身的模型目录缓存仍使用 `~/.pi/agent/antigravity-model-catalog.json`，其中不保存登录凭据。
+
+换电脑后更新或安装这个版本的 Pi，再在那台电脑授权 Google；不需要复制账号文件。此功能是第三方账号接入，并非 Google 官方 API；Google 当前[服务条款](https://antigravity.google/terms)限制第三方调用，服务端可能拒绝授权或请求。本次自动化测试使用模拟账号，真实账号授权和模型请求需由使用者自行验证。
+
+登录接口：`GET /api/oauth/antigravity/status`、`POST .../start`、`POST .../response`（`{promptId,value}`）、`POST .../cancel`、`DELETE /api/oauth/antigravity`。这些接口与其他控制台接口共用本机访问限制及可选的 `PI_CONSOLE_TOKEN`；状态接口不返回访问令牌、刷新令牌或已提交的回调地址。
 
 ## 新特性（v0.2.x）：
 
