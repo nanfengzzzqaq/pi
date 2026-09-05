@@ -21,6 +21,8 @@ export interface SessionIndexEntry {
 	title: string;
 	createdAt: number;
 	updatedAt: number;
+	/** Durable deletion intent: hidden from restoration until cleanup succeeds. */
+	deletionRequestedAt?: number;
 }
 
 export type SessionIndex = Record<string, SessionIndexEntry>;
@@ -38,6 +40,8 @@ function parseIndex(text: string): SessionIndex {
 			!Number.isFinite(item.createdAt) ||
 			typeof item.updatedAt !== "number" ||
 			!Number.isFinite(item.updatedAt) ||
+			(item.deletionRequestedAt !== undefined &&
+				(typeof item.deletionRequestedAt !== "number" || !Number.isFinite(item.deletionRequestedAt))) ||
 			(item.sessionFile !== undefined && typeof item.sessionFile !== "string") ||
 			(item.enabledPacks !== undefined &&
 				(!Array.isArray(item.enabledPacks) || item.enabledPacks.some((name) => typeof name !== "string")))
@@ -49,7 +53,7 @@ function parseIndex(text: string): SessionIndex {
 }
 
 /** Flush a complete sibling file before replacing the destination. */
-function atomicWrite(path: string, content: string): void {
+export function atomicWrite(path: string, content: string): void {
 	mkdirSync(dirname(path), { recursive: true });
 	const temporary = `${path}.${randomUUID()}.tmp`;
 	let created = false;

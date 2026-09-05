@@ -25,6 +25,16 @@ function redactSensitiveDisplayText(value) {
 
 const $ = (id) => document.getElementById(id);
 
+function enableKeyboardClick(element, action = () => element.click()) {
+	element.tabIndex = 0;
+	element.setAttribute("role", "button");
+	element.addEventListener("keydown", event => {
+		if (event.target !== element || event.isComposing || !["Enter", " "].includes(event.key)) return;
+		event.preventDefault();
+		action();
+	});
+}
+
 const messagesEl = $("messages");
 const messagesEmptyEl = $("messages-empty");
 const inputEl = $("input");
@@ -53,6 +63,7 @@ const customModelProviderIdEl = $("custom-model-provider-id");
 const customModelNameEl = $("custom-model-name");
 const customModelBaseUrlEl = $("custom-model-base-url");
 const customModelApiKeyEl = $("custom-model-api-key");
+const customModelNoAuthEl = $("custom-model-no-auth");
 const customModelIdEl = $("custom-model-id");
 const customModelOptionsEl = $("custom-model-options");
 const customModelDiscoverBtnEl = $("custom-model-discover-btn");
@@ -238,6 +249,21 @@ const draftAttachments = new Map();
 const pendingMessageSessions = new Set();
 const attachmentReads = new Map();
 let draftSaveTimer = null;
+let previewRequest = 0;
+let modelChangeRequest = 0;
+let thinkingChangeRequest = 0;
+let confirmedThinkingLevel = "off";
+let customModelRevision = 0;
+let customModelDiscovery = 0;
+let initializing = false;
+let sessionsRequest = 0;
+const deletedSessions = new Set();
+const activeSubmissions = new Map();
+const recoverableSubmissions = new Map();
+const activePolls = new Set();
+let catalogRequest = 0;
+let keysRequest = 0;
+let codexOAuthGeneration = 0;
 
 function saveComposerDraft() {
 	if (!sessionId) return;
@@ -257,6 +283,15 @@ function restoreComposerDraft() {
 	pendingAttachments = draftAttachments.get(sessionId) || [];
 	renderAttachments();
 	resizeComposerInput();
+	renderMessageRecovery();
+	if (agentBrowserState) $("side-browser-claim").hidden = agentBrowserState.ownerSessionId === sessionId;
+}
+
+function insertComposerText(text) {
+	inputEl.value = `${inputEl.value}${inputEl.value.trim() ? "\n\n" : ""}${text}`;
+	resizeComposerInput();
+	saveComposerDraft();
+	inputEl.focus();
 }
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
@@ -379,9 +414,10 @@ async function closeOfficePreview() {
 	await stopOfficePreviewSession(closing);
 }
 
-async function openOfficePreview(path, source = "manual") {
+async function openOfficePreview(path, source = "manual", previewIntent = ++previewRequest) {
 	if (!isOfficeFilePath(path)) return false;
 	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return false;
+	closeFilePreview(false);
 	if (!catalogViewEl.hidden) closeCatalog();
 	suspendSidePanel();
 	const cleanPath = cleanOfficeFilePath(path);
@@ -397,7 +433,7 @@ async function openOfficePreview(path, source = "manual") {
 			method: "POST",
 			body: JSON.stringify({ path: cleanPath, sessionId }),
 		});
-		if (request !== officePreviewRequest) {
+		if (request !== officePreviewRequest || previewIntent !== previewRequest) {
 			if (next.id !== officePreview?.id) await stopOfficePreviewSession(next);
 			return true;
 		}
@@ -415,7 +451,7 @@ async function openOfficePreview(path, source = "manual") {
 		}
 		return true;
 	} catch (error) {
-		if (request !== officePreviewRequest) return false;
+		if (request !== officePreviewRequest || previewIntent !== previewRequest) return false;
 		officePreviewLoadingEl.hidden = true;
 		officePreviewStatusEl.textContent = "实时预览启动失败（office_preview_error）";
 		if (!previous) {
@@ -550,7 +586,7 @@ function browserTabActive() {
 		!workbenchSideEl.hidden &&
 		catalogViewEl.hidden &&
 		officePreviewPaneEl.hidden &&
-		codeEditorPaneEl.hidden
+		codeEditorPaneEl.hidden && settingsModalEl.hidden && previewModalEl.hidden && updateOverlayEl.hidden
 	);
 }
 
@@ -585,6 +621,11 @@ function renderSideTabs() {
 
 function showSidePanel(tab) {
 	if (!sideTabPanes[tab]) return;
+	if (!codeEditorPaneEl.hidden || !officePreviewPaneEl.hidden) {
+		activeSideTab = tab;
+		sidePanelSuppressed = true;
+		return;
+	}
 	applyWorkbenchSideWidth(localStorage.getItem(WORKBENCH_SIDE_WIDTH_KEY));
 	sidePanelSuppressed = false;
 	activeSideTab = tab;
@@ -701,6 +742,11 @@ function syncAgentBrowserBounds() {
 function renderAgentBrowserState(state) {
 	if (!state) return;
 	agentBrowserState = state;
+	const claim = $("side-browser-claim");
+	if (claim) {
+		claim.hidden = !sessionId || state.ownerSessionId === sessionId;
+		claim.title = state.ownerSessionId ? "网页由另一对话控制，接管会停止其旧操作" : "将此独立浏览器交给当前对话";
+	}
 	agentBrowserTitleEl.textContent = state.title || "独立浏览器";
 	agentBrowserTitleEl.title = state.url || "";
 	agentBrowserStatusEl.textContent = state.status || (state.loading ? "正在加载网页" : "网页已加载");
@@ -773,6 +819,18 @@ agentBrowserBtnEl.addEventListener("click", () => {
 	else void openAgentBrowser();
 });
 agentBrowserGoEl.addEventListener("click", () => void navigateAgentBrowser());
+$("side-browser-claim").addEventListener("click", async () => {
+	const targetSessionId = sessionId;
+	if (!targetSessionId) return;
+	const button = $("side-browser-claim");
+	button.disabled = true;
+	try {
+		const state = await api(`/api/sessions/${targetSessionId}/browser/claim`, { method: "POST", body: "{}" });
+		renderAgentBrowserState(state);
+		if (targetSessionId === sessionId) showInfo("浏览器已交给当前对话");
+	} catch (error) { showError(`接管浏览器失败：${error.message}`); }
+	finally { button.disabled = false; }
+});
 agentBrowserAddressEl.addEventListener("keydown", (event) => {
 	if (event.key !== "Enter") return;
 	event.preventDefault();
@@ -855,6 +913,7 @@ agentBrowserPickEl.addEventListener("click", async () => {
 		].join("\n");
 		inputEl.value = `${inputEl.value.trimEnd()}${inputEl.value.trim() ? "\n\n" : ""}${reference}`;
 		resizeComposerInput();
+		saveComposerDraft();
 		inputEl.focus();
 		showInfo("网页元素信息已加入输入框，发送后智能体才会读取");
 	} catch (error) {
@@ -899,6 +958,7 @@ function applyCodeEditorWidth(width) {
 	const max = Math.max(420, bounds.width - 340);
 	const next = Math.max(420, Math.min(Number(width) || Math.round(bounds.width * 0.62), max));
 	codeEditorPaneEl.style.width = `${next}px`;
+	codeEditorPaneEl.classList.toggle("compact-mode", bounds.width < 780);
 }
 
 function codeLanguage(path) {
@@ -986,15 +1046,16 @@ function setCodeEditorFocus(focused) {
 	requestAnimationFrame(() => codeEditor?.layout());
 }
 
-async function openCodeEditor(path, name) {
+async function openCodeEditor(path, name, previewIntent = ++previewRequest) {
 	const request = ++codeEditorOpenRequest;
 	if (codeEditorFile?.path === path) {
+		closeFilePreview(false);
 		setCodeEditorDirty(codeEditorDirty);
 		codeEditor?.focus();
 		return true;
 	}
 	if (!catalogCache) catalogCache = await api("/api/catalog");
-	if (request !== codeEditorOpenRequest) return true;
+	if (request !== codeEditorOpenRequest || previewIntent !== previewRequest) return true;
 	const installed = catalogCache.tools?.some((tool) => tool.id === "code-development" && tool.installed);
 	if (!installed) return false;
 	if (codeEditorDirty && codeEditorFile?.path !== path && !window.confirm("当前代码文件还有未保存修改，仍要打开其他文件吗？")) {
@@ -1003,7 +1064,8 @@ async function openCodeEditor(path, name) {
 	const previousDocument = codeEditorFile;
 	const previousRevision = previousDocument?.revision;
 	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
-	if (request !== codeEditorOpenRequest) return true;
+	if (request !== codeEditorOpenRequest || previewIntent !== previewRequest) return true;
+	closeFilePreview(false);
 	if (!catalogViewEl.hidden) closeCatalog();
 	suspendSidePanel();
 	applyCodeEditorWidth(localStorage.getItem(CODE_EDITOR_WIDTH_KEY));
@@ -1012,7 +1074,7 @@ async function openCodeEditor(path, name) {
 	codeEditorStatusEl.textContent = `正在打开 ${name || path}…`;
 	try {
 		const [monaco, file] = await Promise.all([ensureMonaco(), api(`/api/fs/text?path=${encodeURIComponent(path)}`)]);
-		if (request !== codeEditorOpenRequest) return true;
+		if (request !== codeEditorOpenRequest || previewIntent !== previewRequest) return true;
 		if (previousDocument === codeEditorFile && codeEditorDirty && previousRevision !== codeEditorFile?.revision &&
 			!window.confirm("读取文件期间又有新的修改，仍要放弃修改并切换文件吗？")) {
 			setCodeEditorDirty(true);
@@ -1053,7 +1115,7 @@ async function openCodeEditor(path, name) {
 		codeEditor.focus();
 		return true;
 	} catch (error) {
-		if (request !== codeEditorOpenRequest) return true;
+		if (request !== codeEditorOpenRequest || previewIntent !== previewRequest) return true;
 		codeEditorStatusEl.textContent = codeEditorDirty ? "打开失败 · 当前文件有未保存修改" : "打开失败";
 		showError(`代码编辑器打开失败：${error.message}`);
 		return Boolean(codeEditor);
@@ -1333,7 +1395,8 @@ function updateTerminalStatus() {
 }
 
 function scrollTerminalOutput() {
-	terminalOutputEl.scrollTop = terminalOutputEl.scrollHeight;
+	if (terminalOutputEl.scrollHeight - terminalOutputEl.scrollTop - terminalOutputEl.clientHeight < 160)
+		terminalOutputEl.scrollTop = terminalOutputEl.scrollHeight;
 }
 
 function clearTerminal() {
@@ -1537,6 +1600,7 @@ function syncThinkingOptions(availableLevels) {
 		const firstEnabled = [...thinkingSelectEl.options].find((o) => !o.disabled);
 		if (firstEnabled) thinkingSelectEl.value = firstEnabled.value;
 	}
+	confirmedThinkingLevel = thinkingSelectEl.value;
 }
 
 /** 清空消息区（保留折叠控制条） */
@@ -1575,7 +1639,7 @@ function renderHistory(history) {
 				item.attachments,
 			);
 		} else if (item.role === "assistant") {
-			const container = latestAssistant || appendMessage("assistant", "");
+			const container = latestAssistant || appendMessage("assistant", "", [], { historical: true, model: item.model });
 			latestAssistant = container;
 			if (pendingCapabilityTrace) {
 				addCapabilitySelectionStep(container, pendingCapabilityTrace);
@@ -1732,8 +1796,10 @@ async function refreshFromHistory() {
 let lastSessionsSignature = null;
 
 async function loadSessions() {
+	const request = ++sessionsRequest;
 	try {
 		const list = await api("/api/sessions");
+		if (request !== sessionsRequest) return;
 		const signature = list
 			.map((s) => `${s.id}:${s.title}:${s.updatedAt}:${s.streaming ? 1 : 0}:${s.id === sessionId ? 1 : 0}`)
 			.join("|");
@@ -1748,6 +1814,7 @@ async function loadSessions() {
 			const row = document.createElement("div");
 			row.className = `session-row${session.id === sessionId ? " active" : ""}${session.streaming ? " running" : ""}`;
 			row.dataset.sid = session.id;
+			enableKeyboardClick(row);
 			const title = document.createElement("div");
 			title.className = "session-title";
 			title.textContent = session.title;
@@ -1760,6 +1827,17 @@ async function loadSessions() {
 			row.appendChild(title);
 			row.appendChild(meta);
 			row.addEventListener("click", () => switchSession(session.id));
+			const menu = document.createElement("button");
+			menu.type = "button";
+			menu.className = "session-menu-button";
+			menu.textContent = "⋯";
+			menu.setAttribute("aria-label", `${session.title} 的更多操作`);
+			menu.addEventListener("click", event => {
+				event.stopPropagation();
+				const bounds = menu.getBoundingClientRect();
+				showSessionContextMenu(bounds.left, bounds.bottom, session.id, session.title);
+			});
+			row.appendChild(menu);
 			row.addEventListener("contextmenu", (e) => {
 				e.preventDefault();
 				e.stopPropagation(); // 阻止冒泡到 document 层，避免菜单被立即隐藏
@@ -1768,6 +1846,7 @@ async function loadSessions() {
 			sessionsListEl.appendChild(row);
 		}
 	} catch (error) {
+		if (request !== sessionsRequest) return;
 		lastSessionsSignature = null;
 		sessionsListEl.textContent = `加载失败：${error.message}`;
 	}
@@ -1778,6 +1857,9 @@ async function switchSession(id) {
 	if (id === sessionId) return;
 	const navigation = ++sessionNavigation;
 	saveComposerDraft();
+	closeFilePreview();
+	modelChangeRequest++;
+	thinkingChangeRequest++;
 	historyRequest++;
 	historyDisplayLimit = 100;
 	lastStreamEpoch = null;
@@ -1792,12 +1874,14 @@ async function switchSession(id) {
 	lastSeq = -1;
 	try {
 		await ensureSession();
-		if (id !== sessionId) return;
+		if (id !== sessionId || navigation !== sessionNavigation) return;
+		modelSelectEl.disabled = !modelSelectEl.value;
+		thinkingSelectEl.disabled = false;
 		connectSSE();
 		await loadSessions();
 		await pollContext();
 	} catch (error) {
-		showError(`切换对话失败：${error.message}`);
+		if (navigation === sessionNavigation) showError(`切换对话失败：${error.message}`);
 	}
 }
 
@@ -1811,10 +1895,15 @@ async function deleteSession(id) {
 	if (id === sessionId && !codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	try {
 		await api(`/api/sessions/${id}`, { method: "DELETE" });
+		deletedSessions.add(id);
+		const submission = activeSubmissions.get(id);
+		if (submission) { submission.cancelRequested = true; submission.controller?.abort(); }
+		recoverableSubmissions.delete(id);
+		localStorage.removeItem(`pi-console-pending:${id}`);
 		localStorage.removeItem(`pi-console-draft:${id}`);
 		draftAttachments.delete(id);
 		if (id === sessionId) {
-			sessionNavigation++;
+			const navigation = ++sessionNavigation;
 			historyRequest++;
 			historyDisplayLimit = 100;
 			lastStreamEpoch = null;
@@ -1822,6 +1911,7 @@ async function deleteSession(id) {
 			pendingAttachments = [];
 			renderAttachments();
 			const list = await api("/api/sessions").catch(() => []);
+			if (navigation !== sessionNavigation || id !== sessionId) { void loadSessions(); return; }
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
 			clearMessages();
@@ -1834,6 +1924,7 @@ async function deleteSession(id) {
 				// 没有会话了：保持空状态，页面显示空（用户可点 ＋ 新对话）
 				disconnectSSE();
 				setRunning(false, true);
+				renderMessageRecovery();
 				connStateEl.textContent = "空闲";
 			}
 		}
@@ -1869,16 +1960,18 @@ function showSessionContextMenu(x, y, id, currentTitle) {
 	hideSessionContextMenu();
 	const menu = document.createElement("div");
 	menu.className = "session-context-menu";
-	const renameItem = document.createElement("div");
+	const renameItem = document.createElement("button");
+	renameItem.type = "button";
 	renameItem.className = "session-context-item";
 	renameItem.textContent = "修改会话名称";
 	renameItem.addEventListener("click", async () => {
 		hideSessionContextMenu();
 		await renameSession(id, currentTitle);
 	});
-	const deleteItem = document.createElement("div");
+	const deleteItem = document.createElement("button");
+	deleteItem.type = "button";
 	deleteItem.className = "session-context-item danger";
-	deleteItem.textContent = "删除当前会话";
+	deleteItem.textContent = "删除此对话";
 	deleteItem.addEventListener("click", async () => {
 		hideSessionContextMenu();
 		await deleteSession(id);
@@ -1887,6 +1980,10 @@ function showSessionContextMenu(x, y, id, currentTitle) {
 	menu.style.left = `${x}px`;
 	menu.style.top = `${y}px`;
 	document.body.appendChild(menu);
+	const bounds = menu.getBoundingClientRect();
+	menu.style.left = `${Math.min(x, window.innerWidth - bounds.width - 8)}px`;
+	menu.style.top = `${Math.min(y, window.innerHeight - bounds.height - 8)}px`;
+	renameItem.focus();
 	sessionContextMenuEl = menu;
 }
 
@@ -1922,6 +2019,7 @@ sessionNewBtnEl.addEventListener("click", async () => {
 		clearTerminal();
 		lastSeq = -1;
 		await ensureSession();
+		if (navigation !== sessionNavigation) return;
 		connectSSE();
 		await loadSessions();
 		await pollContext();
@@ -2119,6 +2217,7 @@ function handleEvent(event) {
 			break;
 		case "thinking_level_changed":
 			thinkingSelectEl.value = event.level;
+			confirmedThinkingLevel = event.level;
 			break;
 		case "error":
 			showError(event.message || "发生错误");
@@ -2299,7 +2398,7 @@ function resolveMessageArtifacts(id, data) {
 	});
 }
 
-function appendMessage(role, text, attachmentPaths = []) {
+function appendMessage(role, text, attachmentPaths = [], { historical = false, model = null } = {}) {
 	messagesEmptyEl.hidden = true;
 	const messageSessionId = sessionId;
 	const wrap = document.createElement("div");
@@ -2311,7 +2410,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 		const meta = document.createElement("div");
 		meta.className = "message-meta";
 		const modelName = document.createElement("span");
-		modelName.textContent = modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "Pi";
+		modelName.textContent = model ? `模型 · ${model.provider}/${model.modelId || model.id}` : historical ? "Pi · 历史记录" : modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "Pi";
 		const copyBtn = document.createElement("button");
 		copyBtn.className = "copy-btn";
 		copyBtn.textContent = "⧉";
@@ -2428,8 +2527,9 @@ function appendMessage(role, text, attachmentPaths = []) {
 					processBody.hidden = !processBody.hidden;
 					chevron.textContent = processBody.hidden ? "▸" : "▾";
 				});
+				enableKeyboardClick(head);
 				processWrap.appendChild(head);
-				processWrap.dataset.startedAt = String(Date.now());
+				processWrap.dataset.startedAt = historical ? "0" : String(Date.now());
 				processBody = document.createElement("div");
 				processBody.className = "process-body";
 				processWrap.appendChild(processBody);
@@ -2498,6 +2598,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 					toggle.textContent = body.hidden ? "展开" : "收起";
 					if (!body.hidden) body.scrollTop = body.scrollHeight;
 				});
+				enableKeyboardClick(head);
 				this._thinkingBody = body;
 			}
 			this._thinkingBody.textContent += delta;
@@ -2777,6 +2878,7 @@ function appendProcessNarration(text) {
 
 	const header = document.createElement("div");
 	header.className = "tool-header";
+	enableKeyboardClick(header);
 	const chevron = document.createElement("span");
 	chevron.className = "tool-chevron";
 	chevron.textContent = "▸";
@@ -2821,6 +2923,7 @@ function appendToolBlock(toolCallId, toolName, args, status) {
 
 	const header = document.createElement("div");
 	header.className = "tool-header";
+	enableKeyboardClick(header);
 	const chevron = document.createElement("span");
 	chevron.className = "tool-chevron";
 	chevron.textContent = "▸";
@@ -2988,7 +3091,7 @@ function copyTextFrom(btn) {
 		const block = btn.closest(".tool-block");
 		if (block) {
 			const args = block.querySelector(".tool-args")?.textContent ?? "";
-			const result = block.querySelector(".tool-result")?.innerText ?? "";
+			const result = terminalEntries.get(block.dataset.toolCallId)?.out.textContent || block.querySelector(".process-narration-text")?.textContent || block.querySelector(".tool-result")?.innerText || "";
 			const name = block.querySelector(".tool-name")?.textContent ?? "";
 			text = `${name}\n命令/参数：${args}\n${result ? `结果：\n${result}` : ""}`;
 		}
@@ -3055,6 +3158,11 @@ async function downloadPathLink(path, suggestedName) {
 async function attachPathLink(path) {
 	if (!sessionId) return;
 	const targetSessionId = sessionId;
+	const reads = attachmentReads.get(targetSessionId) || [];
+	const reservation = { size: 0 };
+	if (pendingAttachments.length + reads.length >= 32) return showError("每次最多添加 32 个附件");
+	reads.push(reservation);
+	attachmentReads.set(targetSessionId, reads);
 	try {
 		const file = await api(`/api/sessions/${targetSessionId}/attach-from-path`, {
 			method: "POST",
@@ -3067,15 +3175,12 @@ async function attachPathLink(path) {
 			size: file.size,
 			isImage: IMAGE_MIME.has(file.mimeType),
 		};
-		const attachments = targetSessionId === sessionId ? pendingAttachments : draftAttachments.get(targetSessionId) || [];
-		if (attachments.length >= 32 || attachments.reduce((sum, item) => sum + item.size, file.size) > 50 * 1024 * 1024)
-			throw new Error("每次最多添加 32 个附件，总大小不能超过 50 MB");
-		attachments.push(attachment);
-		draftAttachments.set(targetSessionId, attachments);
-		if (targetSessionId === sessionId) { renderAttachments(); saveComposerDraft(); }
-		showInfo(`已将 ${file.name} 添加到对话附件`);
+		if (enqueueAttachment(attachment, targetSessionId, reservation)) showInfo(`已将 ${file.name} 添加到对话附件`);
 	} catch (error) {
 		showError(`读取文件失败：${error.message}`);
+	} finally {
+		reads.splice(reads.indexOf(reservation), 1);
+		if (!reads.length) attachmentReads.delete(targetSessionId);
 	}
 }
 
@@ -3268,6 +3373,21 @@ messagesEl.addEventListener("dragstart", (event) => {
 
 const IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"]);
 
+function enqueueAttachment(attachment, targetSessionId = sessionId, reservation = null) {
+	if (!targetSessionId || deletedSessions.has(targetSessionId)) return false;
+	const attachments = targetSessionId === sessionId ? pendingAttachments : draftAttachments.get(targetSessionId) || [];
+	const reads = (attachmentReads.get(targetSessionId) || []).filter(item => item !== reservation);
+	if (attachment.size > 20 * 1024 * 1024) { showError("单个附件不能超过 20 MB"); return false; }
+	if (attachments.length + reads.length >= 32 || [...attachments, ...reads, attachment].reduce((sum, item) => sum + (item.size || 0), 0) > 50 * 1024 * 1024) {
+		showError("每次最多添加 32 个附件，总大小不能超过 50 MB");
+		return false;
+	}
+	attachments.push(attachment);
+	draftAttachments.set(targetSessionId, attachments);
+	if (targetSessionId === sessionId) { pendingAttachments = attachments; renderAttachments(); saveComposerDraft(); }
+	return true;
+}
+
 function formatSize(bytes) {
 	if (bytes < 1024) return `${bytes} B`;
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -3302,13 +3422,7 @@ async function addAttachment(file) {
 			size: file.size,
 			isImage: IMAGE_MIME.has(file.type),
 		};
-		if (targetSessionId === sessionId) {
-			pendingAttachments.push(attachment);
-			renderAttachments();
-			saveComposerDraft();
-		} else {
-			draftAttachments.set(targetSessionId, [...(draftAttachments.get(targetSessionId) || []), attachment]);
-		}
+		enqueueAttachment(attachment, targetSessionId, file);
 	} catch {
 		showError(`无法读取附件 ${file.name}，请重新添加`);
 	} finally {
@@ -3381,110 +3495,244 @@ window.addEventListener("paste", (e) => {
 	for (const file of files) addAttachment(file);
 });
 
+function submissionRecords(id = sessionId) {
+	if (!id) return [];
+	if (!recoverableSubmissions.has(id)) {
+		let records = [];
+		try {
+			const saved = JSON.parse(localStorage.getItem(`pi-console-pending:${id}`) || "[]");
+			if (Array.isArray(saved)) records = saved.filter(item => item && typeof item.requestId === "string" && /^[\da-f-]{36}$/i.test(item.requestId) && typeof item.originalInput === "string")
+				.map(item => ({ ...item, sessionId: id, attachments: [], phase: item.submitted ? "uncertain" : "failed", error: item.attachmentCount && !item.uploaded ? "原附件未上传，请重新添加" : "上次提交尚未确认" }));
+		} catch { /* The live draft remains available when browser storage cannot be read. */ }
+		recoverableSubmissions.set(id, records);
+	}
+	return recoverableSubmissions.get(id);
+}
+
+function persistSubmissions(id) {
+	if (!id || deletedSessions.has(id)) return;
+	try {
+		const records = submissionRecords(id).map(({ requestId, originalInput, text, phase, submitted, uploaded, savedPaths, messagePaths, imageAttachments, attachmentCount, cancelRequested }) =>
+			({ requestId, originalInput, text, phase, submitted, uploaded, savedPaths, messagePaths, imageAttachments, attachmentCount, cancelRequested }));
+		if (records.length) localStorage.setItem(`pi-console-pending:${id}`, JSON.stringify(records));
+		else localStorage.removeItem(`pi-console-pending:${id}`);
+	} catch { /* Keep the complete in-memory snapshot even if local storage is full. */ }
+}
+
+function forgetSubmission(record) {
+	const records = submissionRecords(record.sessionId);
+	const index = records.indexOf(record);
+	if (index >= 0) records.splice(index, 1);
+	persistSubmissions(record.sessionId);
+	if (record.sessionId === sessionId) renderMessageRecovery();
+}
+
+function restoreSubmissionDraft(record) {
+	if (record.sessionId !== sessionId || deletedSessions.has(record.sessionId)) return;
+	if (record.phase === "uncertain") { showInfo("请先检查请求状态，避免把已经送达的内容重复发送"); return; }
+	if (inputEl.value.trim() && inputEl.value !== record.originalInput) {
+		showInfo("当前已有新草稿，已保留。可先复制失败请求的原文，再决定如何合并。");
+		return;
+	}
+	inputEl.value = record.originalInput;
+	record.restored = true;
+	for (const attachment of record.attachments || []) {
+		if (!pendingAttachments.includes(attachment)) enqueueAttachment(attachment, record.sessionId);
+	}
+	resizeComposerInput();
+	saveComposerDraft();
+	inputEl.focus();
+}
+
+function renderMessageRecovery() {
+	const container = $("message-recovery");
+	if (!container) return;
+	container.replaceChildren();
+	const records = submissionRecords();
+	container.hidden = records.length === 0;
+	for (const record of records) {
+		const row = document.createElement("div");
+		row.className = "message-recovery-row";
+		const label = document.createElement("span");
+		const titles = { preparing: "正在准备附件", submitting: "正在提交", uncertain: "尚未确认是否送达", failed: "请求未完成", cancelled: "已停止提交" };
+		label.textContent = `${titles[record.phase] || "待确认"} · ${(record.originalInput || `${record.attachmentCount} 个附件`).slice(0, 72)}`;
+		label.title = record.error || record.originalInput;
+		row.appendChild(label);
+		const button = (title, action) => { const element = document.createElement("button"); element.type = "button"; element.textContent = title; element.addEventListener("click", action); row.appendChild(element); };
+		if (!activeSubmissions.has(record.sessionId)) {
+			if (record.submitted && record.phase === "uncertain") button("检查状态", () => void inspectSubmission(record));
+			if (record.retryAllowed && !record.cancelRequested) button("重试发送", () => void retrySubmission(record));
+			button("恢复草稿", () => restoreSubmissionDraft(record));
+			button("复制原文", () => copyTextToClipboard(record.originalInput));
+			button("移除记录", () => { if (window.confirm("移除此恢复记录？请先确认需要的原文已保存。")) forgetSubmission(record); });
+		}
+		container.appendChild(row);
+	}
+}
+
+async function inspectSubmission(record, refresh = true) {
+	try {
+		const result = await api(`/api/sessions/${record.sessionId}/requests/${record.requestId}`);
+		if (deletedSessions.has(record.sessionId)) return "cancelled";
+		if (["accepted", "running", "completed"].includes(result.status)) {
+			forgetSubmission(record);
+			if (record.sessionId === sessionId && refresh) await refreshFromHistory();
+			return result.status;
+		}
+		record.retryAllowed = result.status === "unknown" && !record.cancelRequested;
+		record.phase = result.status === "cancelled" ? "cancelled" : result.status === "unknown" || result.status === "failed" ? "failed" : "uncertain";
+		record.error = result.error || (result.status === "unknown" ? "服务器未记录此次请求，可使用原请求重试" : "请求已结束，可恢复原文后重新发送");
+		if (result.status === "failed" && record.sessionId === sessionId && refresh) await refreshFromHistory();
+		persistSubmissions(record.sessionId);
+		if (record.sessionId === sessionId) renderMessageRecovery();
+		return result.status;
+	} catch {
+		record.phase = "uncertain";
+		record.retryAllowed = false;
+		record.error = "暂时无法确认结果，请恢复连接后检查状态；不会自动重复发送";
+		persistSubmissions(record.sessionId);
+		if (record.sessionId === sessionId) renderMessageRecovery();
+		return "uncertain";
+	}
+}
+
+async function retrySubmission(record) {
+	if (running || activeSubmissions.has(record.sessionId)) return showInfo("请等待当前任务结束，原请求仍保留在恢复记录中");
+	if (record.submitted && await inspectSubmission(record) !== "unknown") return;
+	if (!record.uploaded && record.attachmentCount > (record.attachments?.length || 0)) return showInfo("原附件尚未上传，请恢复草稿并重新添加附件后发送");
+	if (record.restored && record.sessionId === sessionId && inputEl.value === record.originalInput) {
+		inputEl.value = "";
+		pendingAttachments = pendingAttachments.filter(attachment => !record.attachments.includes(attachment));
+		renderAttachments();
+		resizeComposerInput();
+		saveComposerDraft();
+	}
+	await submitMessageRecord(record);
+}
+
+async function submitMessageRecord(record) {
+	const targetSessionId = record.sessionId;
+	if (record.cancelRequested || deletedSessions.has(targetSessionId) || activeSubmissions.has(targetSessionId)) return;
+	activeSubmissions.set(targetSessionId, record);
+	pendingMessageSessions.add(targetSessionId);
+	record.controller = new AbortController();
+	record.phase = "preparing";
+	record.retryAllowed = false;
+	if (targetSessionId === sessionId) {
+		setRunning(true);
+		setIndicator(true, record.attachmentCount && !record.uploaded ? "正在准备附件…" : "正在提交…");
+		renderMessageRecovery();
+	}
+	let accepted = false;
+	try {
+		if (!record.uploaded) {
+			if (record.attachments.length) {
+				const saved = await api(`/api/sessions/${targetSessionId}/files`, {
+					method: "POST", signal: record.controller.signal,
+					body: JSON.stringify({ files: record.attachments.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })) }),
+				});
+				record.savedPaths = saved.files;
+				record.imageAttachments = saved.imageFiles || [];
+				record.messagePaths = saved.messageFiles || saved.files;
+			}
+			record.uploaded = true;
+		}
+		if (record.cancelRequested || deletedSessions.has(targetSessionId)) return;
+		record.phase = "submitting";
+		record.submitted = true;
+		persistSubmissions(targetSessionId);
+		if (targetSessionId === sessionId) {
+			record.userBubble = appendMessage("user", redactSensitiveDisplayText(record.text || `发送了 ${record.attachmentCount} 个文件`), record.messagePaths || []);
+			renderMessageRecovery();
+		}
+		const result = await api(`/api/sessions/${targetSessionId}/messages`, {
+			method: "POST",
+			body: JSON.stringify({ requestId: record.requestId, text: record.text, imageAttachments: record.imageAttachments || [], attachments: record.savedPaths || [] }),
+		});
+		if (deletedSessions.has(targetSessionId)) return;
+		if (["failed", "cancelled"].includes(result.status)) {
+			record.phase = result.status;
+			record.error = result.error || "此次请求已经结束";
+			if (targetSessionId === sessionId) await refreshFromHistory();
+		} else {
+			accepted = true;
+			forgetSubmission(record);
+			if (result.status === "completed" && targetSessionId === sessionId) await refreshFromHistory();
+			if (record.cancelRequested) await api(`/api/sessions/${targetSessionId}/abort`, { method: "POST", body: JSON.stringify({ requestId: record.requestId }) });
+		}
+		void loadSessions();
+	} catch (error) {
+		if (deletedSessions.has(targetSessionId)) return;
+		record.error = error.message;
+		if (record.submitted) {
+			const status = await inspectSubmission(record);
+			accepted = ["accepted", "running", "completed"].includes(status);
+		} else {
+			record.phase = record.cancelRequested ? "cancelled" : "failed";
+			record.retryAllowed = !record.cancelRequested;
+		}
+		if (!accepted && targetSessionId === sessionId) {
+			record.userBubble?.el?.closest(".message")?.remove();
+			if (!inputEl.value.trim() && record.phase !== "uncertain") restoreSubmissionDraft(record);
+			showError(record.cancelRequested ? "已停止提交，原文和附件已保留" : `${record.error || "发送未完成"}；原请求已保留`);
+		}
+	} finally {
+		if (record.cancelRequested && !record.submitted) record.phase = "cancelled";
+		if (activeSubmissions.get(targetSessionId) === record) {
+			activeSubmissions.delete(targetSessionId);
+			pendingMessageSessions.delete(targetSessionId);
+			if (targetSessionId === sessionId) {
+				if (!accepted) setRunning(false, true);
+				else setRunning(running, true);
+			}
+		}
+		record.controller = null;
+		persistSubmissions(targetSessionId);
+		if (targetSessionId === sessionId) renderMessageRecovery();
+	}
+}
+
 async function sendMessage() {
 	const text = inputEl.value.trim();
-	if ((!text && pendingAttachments.length === 0) || running || !sessionId || pendingMessageSessions.has(sessionId)) return;
+	if (running || pendingMessageSessions.has(sessionId)) { if (text || pendingAttachments.length) showInfo("当前任务仍在运行，内容已保留为草稿，不会自动排队发送"); saveComposerDraft(); return; }
+	if ((!text && pendingAttachments.length === 0) || !sessionId) return;
 	if (attachmentReads.get(sessionId)?.length) return showInfo("附件正在读取，请稍后发送");
-	const targetSessionId = sessionId;
-	const originalInput = inputEl.value;
-	const attachmentsToSend = [...pendingAttachments];
-	saveComposerDraft();
-	pendingMessageSessions.add(targetSessionId);
+	const record = { sessionId, requestId: crypto.randomUUID(), originalInput: inputEl.value, text, attachments: [...pendingAttachments], attachmentCount: pendingAttachments.length, phase: "preparing", submitted: false, uploaded: false, cancelRequested: false };
+	submissionRecords().push(record);
+	persistSubmissions(sessionId);
 	inputEl.value = "";
+	pendingAttachments = [];
+	renderAttachments();
 	resizeComposerInput();
+	saveComposerDraft();
 	errorBarEl.hidden = true;
 	clearActivity();
 	updateActivityOverview("准备中");
-	setRunning(true);
-	setIndicator(true, "思考中…");
-	let userBubble = null;
-
-	try {
-		let imageAttachments = [];
-		let savedPaths = [];
-		let messagePaths = [];
-		if (attachmentsToSend.length > 0) {
-			const saved = await api(`/api/sessions/${targetSessionId}/files`, {
-				method: "POST",
-				body: JSON.stringify({
-					files: attachmentsToSend.map(({ name, mimeType, dataBase64 }) => ({ name, mimeType, dataBase64 })),
-				}),
-			});
-			savedPaths = saved.files;
-			imageAttachments = saved.imageFiles || [];
-			messagePaths = Array.isArray(saved.messageFiles) ? saved.messageFiles : saved.files;
-			if (targetSessionId === sessionId) {
-				pendingAttachments = pendingAttachments.filter((attachment) => !attachmentsToSend.includes(attachment));
-				renderAttachments();
-			}
-		}
-		if (targetSessionId === sessionId) {
-			userBubble = appendMessage(
-				"user",
-				redactSensitiveDisplayText(text || `发送了 ${attachmentsToSend.length} 个文件`),
-				messagePaths,
-			);
-		}
-		await api(`/api/sessions/${targetSessionId}/messages`, {
-			method: "POST",
-			body: JSON.stringify({ text, imageAttachments, attachments: savedPaths }),
-		});
-		if (targetSessionId === sessionId) saveComposerDraft();
-		else {
-			try {
-				const key = `pi-console-draft:${targetSessionId}`;
-				if (localStorage.getItem(key) === originalInput) localStorage.removeItem(key);
-			} catch { /* The live composer remains usable without local storage. */ }
-			const remaining = (draftAttachments.get(targetSessionId) || []).filter(attachment => !attachmentsToSend.includes(attachment));
-			if (remaining.length) draftAttachments.set(targetSessionId, remaining);
-			else draftAttachments.delete(targetSessionId);
-		}
-		void loadSessions(); // 首条消息后标题更新，并显示后台运行状态。
-	} catch (error) {
-		pendingMessageSessions.delete(targetSessionId);
-		showError(error.message);
-		if (targetSessionId === sessionId) {
-			setRunning(false);
-			// 发送失败：撤回乐观渲染的气泡，并把内容放回输入框，避免长文案丢失
-			userBubble?.el?.closest(".message")?.remove();
-			if (!inputEl.value.trim() && text) {
-				inputEl.value = text;
-				resizeComposerInput();
-			}
-			const missing = attachmentsToSend.filter((attachment) => !pendingAttachments.includes(attachment));
-			if (missing.length > 0) {
-				pendingAttachments = [...missing, ...pendingAttachments];
-				renderAttachments();
-			}
-			inputEl.focus();
-			saveComposerDraft();
-		} else {
-			try {
-				const key = `pi-console-draft:${targetSessionId}`;
-				if (!localStorage.getItem(key) && originalInput) localStorage.setItem(key, originalInput);
-			} catch { /* Keep attachment drafts available even when storage is full. */ }
-			const existing = draftAttachments.get(targetSessionId) || [];
-			draftAttachments.set(targetSessionId, [...attachmentsToSend.filter(attachment => !existing.includes(attachment)), ...existing]);
-		}
-	} finally {
-		pendingMessageSessions.delete(targetSessionId);
-		if (targetSessionId === sessionId) setRunning(running, true);
-	}
+	await submitMessageRecord(record);
 }
 
 async function abortRun() {
 	if (!sessionId) return;
+	const targetSessionId = sessionId;
+	const record = activeSubmissions.get(targetSessionId);
+	if (record) {
+		record.cancelRequested = true;
+		persistSubmissions(targetSessionId);
+		if (!record.submitted) {
+			record.controller?.abort();
+			setRunning(false, true);
+			if (!inputEl.value.trim()) restoreSubmissionDraft(record);
+			return;
+		}
+	}
 	sendBtn.disabled = true;
 	sendBtn.querySelector("span").textContent = "停止中…";
 	try {
-		await api(`/api/sessions/${sessionId}/abort`, { method: "POST", body: "{}" });
+		await api(`/api/sessions/${targetSessionId}/abort`, { method: "POST", body: JSON.stringify(record ? { requestId: record.requestId } : {}) });
 	} catch (error) {
-		showError(error.message);
+		if (targetSessionId === sessionId) showError(error.message);
 	} finally {
-		if (running) {
-			sendBtn.disabled = false;
-			sendBtn.querySelector("span").textContent = "停止";
-		}
+		if (targetSessionId === sessionId) setRunning(running, true);
 	}
 }
 
@@ -3545,10 +3793,11 @@ modelSearchEl.addEventListener("input", filterModelOptions);
 
 async function loadModels() {
 	const request = ++modelsRequest;
-	const targetSessionId = sessionId;
 	try {
 		const models = await api("/api/models");
 		if (request !== modelsRequest) return;
+		const targetSessionId = sessionId;
+		const selected = modelSelectEl.value;
 		modelSelectEl.innerHTML = "";
 		const authed = models.filter((m) => m.hasAuth);
 		if (authed.length > 0) {
@@ -3564,6 +3813,7 @@ async function loadModels() {
 				const option = document.createElement("option");
 				option.value = `${m.provider}/${m.modelId}`;
 				option.textContent = m.label;
+				if (m.catalogSource) option.title = `目录来源：${({ discovered: "Google 账号发现", cache: "本机缓存", fallback: "内置备用" })[m.catalogSource] || m.catalogSource}；实际调用取决于账号权限与额度`;
 				group.appendChild(option);
 			}
 		} else {
@@ -3573,6 +3823,7 @@ async function loadModels() {
 			modelSelectEl.appendChild(option);
 		}
 		modelSelectEl.disabled = authed.length === 0;
+		if ([...modelSelectEl.options].some(option => option.value === selected)) modelSelectEl.value = selected;
 		filterModelOptions();
 		const history = targetSessionId ? await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null) : null;
 		if (request !== modelsRequest || targetSessionId !== sessionId) return;
@@ -3585,33 +3836,55 @@ async function loadModels() {
 modelSelectEl.addEventListener("change", async () => {
 	const value = modelSelectEl.value;
 	if (!value || !sessionId) return;
+	const targetSessionId = sessionId;
+	const request = ++modelChangeRequest;
+	modelSelectEl.disabled = true;
 	const [provider, ...rest] = value.split("/");
 	const modelId = rest.join("/");
 	try {
-		const result = await api(`/api/sessions/${sessionId}/model`, {
+		const result = await api(`/api/sessions/${targetSessionId}/model`, {
 			method: "POST",
 			body: JSON.stringify({ provider, modelId }),
 		});
+		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		if (result?.thinkingLevel) thinkingSelectEl.value = result.thinkingLevel;
 		syncThinkingOptions(result?.availableThinkingLevels);
 	} catch (error) {
+		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		showError(`切换模型失败：${error.message}`);
-		const history = await api(`/api/sessions/${sessionId}/history?limit=1`).catch(() => null);
+		const history = await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null);
+		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+		if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
 		syncThinkingOptions(history?.availableThinkingLevels);
+	} finally {
+		if (targetSessionId === sessionId && request === modelChangeRequest) modelSelectEl.disabled = !modelSelectEl.value;
 	}
 });
 
 thinkingSelectEl.addEventListener("change", async () => {
 	if (!sessionId) return;
+	const targetSessionId = sessionId;
+	const request = ++thinkingChangeRequest;
+	thinkingSelectEl.disabled = true;
 	try {
-		const result = await api(`/api/sessions/${sessionId}/thinking`, {
+		const result = await api(`/api/sessions/${targetSessionId}/thinking`, {
 			method: "POST",
 			body: JSON.stringify({ level: thinkingSelectEl.value }),
 		});
+		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
 		thinkingSelectEl.value = result.level;
+		confirmedThinkingLevel = result.level;
 	} catch (error) {
+		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
+		thinkingSelectEl.value = confirmedThinkingLevel;
 		showError(`切换思考等级失败：${error.message}`);
+		const history = await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null);
+		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
+		if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
+		syncThinkingOptions(history?.availableThinkingLevels);
+	} finally {
+		if (targetSessionId === sessionId && request === thinkingChangeRequest) thinkingSelectEl.disabled = false;
 	}
 });
 
@@ -3621,16 +3894,22 @@ thinkingSelectEl.addEventListener("change", async () => {
 
 /** 折叠“对话”和“文件”面板。 */
 document.querySelectorAll(".side-header").forEach((header) => {
+	enableKeyboardClick(header);
+	header.setAttribute("aria-expanded", "true");
 	header.addEventListener("click", () => {
 		const panel = $(header.dataset.panel);
 		if (!panel) return;
 		const collapsed = panel.classList.toggle("collapsed");
+		header.setAttribute("aria-expanded", String(!collapsed));
 		header.querySelector(".chevron").textContent = collapsed ? "▸" : "▾";
 	});
 });
 
 async function refreshCatalog() {
-	catalogCache = await api("/api/catalog");
+	const request = ++catalogRequest;
+	const catalog = await api("/api/catalog");
+	if (request !== catalogRequest) return;
+	catalogCache = catalog;
 	renderCatalog();
 	if (catalogCache.download?.running && !officeInstallTimer) {
 		officeInstallTimer = setInterval(() => void pollOfficeCliInstall(), 700);
@@ -3733,6 +4012,7 @@ function createCatalogIcon(kind, _icon, iconText, id = "") {
 function createCard(item, options) {
 	const card = document.createElement("article");
 	card.className = "catalog-card";
+	card.dataset.itemId = item.id;
 	card.appendChild(createCatalogIcon(options.kind, options.icon, options.iconText, item.id));
 	const main = document.createElement("div");
 	main.className = "catalog-card-main";
@@ -3971,6 +4251,7 @@ function renderSkills(query) {
 
 function renderCatalog() {
 	if (!catalogCache) return;
+	if (catalogViewEl.hidden) return;
 	const toolsMode = catalogMode === "tools";
 	catalogTitleEl.textContent = toolsMode ? "工具" : "技能";
 	catalogSubtitleEl.textContent = toolsMode
@@ -4007,11 +4288,15 @@ async function installCodeDevelopment(button) {
 }
 
 async function pollCodeDevelopmentInstall() {
+	const pollKey = `pollCodeDevelopmentInstall`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api("/api/tools/code-development/progress");
 		if (catalogCache) catalogCache.codeDevelopmentDownload = progress;
 		if (progress.running) {
-			renderCatalog();
+			updateCatalogProgress();
 			return;
 		}
 		clearInterval(codeDevelopmentInstallTimer);
@@ -4030,6 +4315,8 @@ async function pollCodeDevelopmentInstall() {
 		codeDevelopmentInstallTimer = null;
 		showError(`读取代码开发插件安装进度失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function installOfficeCli(button) {
@@ -4049,11 +4336,15 @@ async function installOfficeCli(button) {
 }
 
 async function pollOfficeCliInstall() {
+	const pollKey = `pollOfficeCliInstall`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api("/api/officecli/progress");
 		if (catalogCache) catalogCache.download = progress;
 		if (progress.running) {
-			renderCatalog();
+			updateCatalogProgress();
 			return;
 		}
 		clearInterval(officeInstallTimer);
@@ -4071,6 +4362,8 @@ async function pollOfficeCliInstall() {
 		officeInstallTimer = null;
 		showError(`读取 OfficeCLI 安装进度失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function installRedTeam(button) {
@@ -4090,11 +4383,15 @@ async function installRedTeam(button) {
 }
 
 async function pollRedTeamInstall() {
+	const pollKey = `pollRedTeamInstall`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api("/api/tools/redteam/progress");
 		if (catalogCache) catalogCache.redteamDownload = progress;
 		if (progress.running) {
-			renderCatalog();
+			updateCatalogProgress();
 			return;
 		}
 		clearInterval(redTeamInstallTimer);
@@ -4114,6 +4411,8 @@ async function pollRedTeamInstall() {
 		redTeamInstallTimer = null;
 		showError(`读取红队引擎安装进度失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function installManagedTool(tool, button) {
@@ -4134,6 +4433,10 @@ async function installManagedTool(tool, button) {
 }
 
 async function pollManagedToolInstall(id) {
+	const pollKey = `pollManagedToolInstall:${id}`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api(`/api/tools/${id}/progress`);
 		if (catalogCache) {
@@ -4141,7 +4444,7 @@ async function pollManagedToolInstall(id) {
 			catalogCache.toolProgress[id] = progress;
 		}
 		if (progress.running) {
-			renderCatalog();
+			updateCatalogProgress();
 			return;
 		}
 		const timer = managedInstallTimers.get(id);
@@ -4163,6 +4466,8 @@ async function pollManagedToolInstall(id) {
 		managedInstallTimers.delete(id);
 		showError(`读取工具安装进度失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function installOfficeCliSkill(skill, button) {
@@ -4225,7 +4530,7 @@ function currentDevelopmentTool() {
 async function refreshDevelopmentDetail() {
 	await refreshCatalog();
 	const tool = currentDevelopmentTool();
-	if (tool && !drawerEl.hidden) openToolDetail(tool);
+	if (tool && !drawerEl.hidden && drawerEl.dataset.toolId === "code-development") openToolDetail(tool);
 }
 
 async function startGithubLogin(button) {
@@ -4244,12 +4549,16 @@ async function startGithubLogin(button) {
 }
 
 async function pollGithubLogin() {
+	const pollKey = `pollGithubLogin`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api("/api/tools/code-development/github/progress");
 		const tool = currentDevelopmentTool();
 		if (tool) tool.githubProgress = progress;
 		if (progress.running) {
-			if (tool && !drawerEl.hidden && drawerTitleEl.textContent.includes("代码开发")) openToolDetail(tool);
+			if (tool && !drawerEl.hidden && drawerEl.dataset.toolId === "code-development") openToolDetail(tool);
 			return;
 		}
 		clearInterval(githubLoginTimer);
@@ -4262,6 +4571,8 @@ async function pollGithubLogin() {
 		githubLoginTimer = null;
 		showError(`读取 GitHub 登录状态失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function logoutGithub(button) {
@@ -4293,13 +4604,17 @@ async function installDevelopmentComponent(component, button) {
 }
 
 async function pollDevelopmentComponent(id) {
+	const pollKey = `pollDevelopmentComponent:${id}`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	try {
 	try {
 		const progress = await api(`/api/tools/code-development/components/${id}/progress`);
 		const component = currentDevelopmentTool()?.components?.find((item) => item.id === id);
 		if (component) component.progress = progress;
 		if (progress.running) {
 			const tool = currentDevelopmentTool();
-			if (tool && !drawerEl.hidden && drawerTitleEl.textContent.includes("代码开发")) openToolDetail(tool);
+			if (tool && !drawerEl.hidden && drawerEl.dataset.toolId === "code-development") openToolDetail(tool);
 			return;
 		}
 		const timer = developmentComponentTimers.get(id);
@@ -4314,6 +4629,8 @@ async function pollDevelopmentComponent(id) {
 		developmentComponentTimers.delete(id);
 		showError(`读取开发环境安装进度失败：${error.message}`);
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 async function uninstallDevelopmentComponent(component, button) {
@@ -4346,6 +4663,7 @@ function appendCodeDevelopmentDetails(tool) {
 	githubDesc.textContent = "浏览器登录后，可克隆、提交、推送、创建仓库和拉取请求。";
 	githubMain.append(githubName, githubDesc);
 	const githubButton = document.createElement("button");
+	githubButton.dataset.action = "github-login";
 	githubButton.className = tool.github?.loggedIn ? "secondary-btn small danger" : "primary-btn small";
 	githubButton.textContent = tool.githubProgress?.running
 		? "等待浏览器确认…"
@@ -4392,6 +4710,7 @@ function appendCodeDevelopmentDetails(tool) {
 		desc.textContent = component.description;
 		main.append(name, desc);
 		const button = document.createElement("button");
+		button.dataset.action = `component-${component.id}`;
 		button.className = component.installed ? "secondary-btn small danger" : "primary-btn small";
 		button.textContent = component.progress?.running ? "安装中…" : component.installed ? "卸载" : "安装";
 		button.disabled = component.progress?.running === true;
@@ -4413,6 +4732,10 @@ function appendCodeDevelopmentDetails(tool) {
 }
 
 function openToolDetail(tool) {
+	const sameDetail = drawerEl.dataset.toolId === tool.id;
+	const scrollTop = sameDetail ? drawerContentEl.scrollTop : 0;
+	const focusedAction = sameDetail && drawerEl.contains(document.activeElement) ? document.activeElement.dataset.action : null;
+	drawerEl.dataset.toolId = tool.id;
 	drawerTitleEl.textContent = tool.displayName;
 	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
@@ -4489,9 +4812,7 @@ function openToolDetail(tool) {
 		use.textContent = "开始使用";
 		use.addEventListener("click", () => {
 			closeCatalog();
-			inputEl.value = `请使用「${tool.displayName}」处理这个任务：`;
-			resizeComposerInput();
-			inputEl.focus();
+			insertComposerText(`请使用「${tool.displayName}」处理这个任务：`);
 		});
 		actions.appendChild(use);
 		if (tool.id === "web-search") {
@@ -4516,9 +4837,23 @@ function openToolDetail(tool) {
 		drawerContentEl.appendChild(actions);
 	}
 	drawerEl.hidden = false;
+	drawerContentEl.scrollTop = scrollTop;
+	if (focusedAction) drawerContentEl.querySelector(`[data-action="${CSS.escape(focusedAction)}"]`)?.focus({ preventScroll: true });
+}
+
+function updateCatalogProgress() {
+	for (const tool of catalogCache?.tools || []) {
+		const state = installUi(tool);
+		for (const button of document.querySelectorAll(`[data-install-tool-id="${CSS.escape(tool.id)}"]`)) {
+			button.disabled = state.installing;
+			button.textContent = state.installing ? state.installText : tool.id === "web-search" ? "启用" : "安装";
+			button.title = state.installTitle;
+		}
+	}
 }
 
 function openSkillDetail(skill, group) {
+	delete drawerEl.dataset.toolId;
 	drawerTitleEl.textContent = skill.displayName;
 	drawerContentEl.innerHTML = "";
 	const meta = document.createElement("div");
@@ -4565,9 +4900,7 @@ function openSkillDetail(skill, group) {
 		use.textContent = "用此技能开始任务";
 		use.addEventListener("click", () => {
 			closeCatalog();
-			inputEl.value = `请使用「${skill.displayName}」技能，帮我完成：`;
-			resizeComposerInput();
-			inputEl.focus();
+			insertComposerText(`请使用「${skill.displayName}」技能，帮我完成：`);
 		});
 		actions.appendChild(use);
 		drawerContentEl.appendChild(actions);
@@ -4686,11 +5019,22 @@ async function loadWorkspaceState() {
 }
 
 /** 把当前浏览目录设为工作区 */
-/** 工作区切换后：重建会话（旧会话 cwd 固化无法迁移），提示迁移结果 */
-async function afterWorkspaceChanged(result) {
+/** 默认工作区切换后创建新对话；在请求期间已切换到的对话继续保留。 */
+async function afterWorkspaceChanged(result, requestedNavigation = sessionNavigation) {
+	if (requestedNavigation !== sessionNavigation) {
+		await loadWorkspaceState();
+		showInfo("默认工作区已更新，将用于之后创建的对话");
+		return;
+	}
+	const navigation = ++sessionNavigation;
+	saveComposerDraft();
+	disconnectSSE();
+	closeFilePreview();
 	await closeOfficePreview();
+	if (navigation !== sessionNavigation) return;
 	await loadWorkspaceState();
 	await loadFsRoots();
+	if (navigation !== sessionNavigation) return;
 	const migratedNote = result.migrated > 0 ? `，已从旧工作区迁移 ${result.migrated} 个文件` : "";
 	if (result.sessionReset) {
 		localStorage.removeItem(SESSION_KEY);
@@ -4698,9 +5042,13 @@ async function afterWorkspaceChanged(result) {
 		clearMessages();
 		lastSeq = -1;
 		await ensureSession();
+		if (navigation !== sessionNavigation) return;
+		restoreComposerDraft();
 		connectSSE();
+		void loadSessions();
 		showInfo(`工作区已切换${migratedNote}，会话已重建，现在在新工作区工作`);
 	} else {
+		connectSSE();
 		showInfo(`工作区已设为 ${result.path}${migratedNote}`);
 	}
 }
@@ -4711,9 +5059,10 @@ fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 		return;
 	}
 	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
+	const navigation = sessionNavigation;
 	try {
 		const result = await api("/api/workspace", { method: "POST", body: JSON.stringify({ path: currentFsPath }) });
-		await afterWorkspaceChanged(result);
+		await afterWorkspaceChanged(result, navigation);
 	} catch (error) {
 		showError(`设置工作区失败：${error.message}`);
 	}
@@ -4722,14 +5071,16 @@ fsSetWorkspaceBtnEl.addEventListener("click", async () => {
 /** 设置弹窗：保存工作区 */
 workspaceSaveBtnEl.addEventListener("click", async () => {
 	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
+	const navigation = sessionNavigation;
+	const value = workspaceInputEl.value;
 	workspaceSaveBtnEl.disabled = true;
 	try {
 		const result = await api("/api/workspace", {
 			method: "POST",
-			body: JSON.stringify({ path: workspaceInputEl.value.trim() }),
+			body: JSON.stringify({ path: value.trim() }),
 		});
-		workspaceInputEl.value = "";
-		await afterWorkspaceChanged(result);
+		if (workspaceInputEl.value === value) workspaceInputEl.value = "";
+		await afterWorkspaceChanged(result, navigation);
 	} catch (error) {
 		showError(`保存工作区失败：${error.message}`);
 	} finally {
@@ -4743,11 +5094,54 @@ async function chooseDirectoryInto(input) {
 		showInfo("当前为网页模式，请直接输入文件夹完整路径");
 		return;
 	}
-	const path = await window.piDesktop.chooseDirectory();
-	if (path) input.value = path;
+	try {
+		const path = await window.piDesktop.chooseDirectory();
+		if (path) { input.value = path; input.dispatchEvent(new Event("input", { bubbles: true })); }
+	} catch (error) { showError(`选择文件夹失败：${error.message}`); }
 }
 
 workspaceBrowseBtnEl.addEventListener("click", () => void chooseDirectoryInto(workspaceInputEl));
+
+let workspaceCopyPreview = null;
+let workspaceCopyRequest = 0;
+for (const id of ["workspace-copy-source", "workspace-copy-target"]) $(id).addEventListener("input", () => {
+	workspaceCopyRequest++;
+	workspaceCopyPreview = null;
+	$("workspace-copy-run").hidden = true;
+	$("workspace-copy-status").textContent = "目录已改变，请重新检查复制内容";
+});
+$("workspace-copy-preview").addEventListener("click", async () => {
+	const request = ++workspaceCopyRequest;
+	workspaceCopyPreview = null;
+	$("workspace-copy-run").hidden = true;
+	const button = $("workspace-copy-preview");
+	button.disabled = true;
+	$("workspace-copy-status").textContent = "正在检查文件和目标目录…";
+	try {
+		const result = await api("/api/settings/workspace/preview", { method: "POST", body: JSON.stringify({ source: $("workspace-copy-source").value.trim(), target: $("workspace-copy-target").value.trim() }) });
+		if (request !== workspaceCopyRequest) return;
+		const conflicts = result.conflicts || [];
+		$("workspace-copy-status").textContent = `${result.files} 个文件 · ${formatSize(result.totalBytes)}${conflicts.length ? `；请先处理：${conflicts.slice(0, 5).join("；")}` : "；目标为空，可以复制，源文件保留"}`;
+		if (!conflicts.length) { workspaceCopyPreview = result; $("workspace-copy-run").hidden = false; }
+	} catch (error) { if (request === workspaceCopyRequest) $("workspace-copy-status").textContent = `检查失败：${error.message}`; }
+	finally { button.disabled = false; }
+});
+$("workspace-copy-run").addEventListener("click", async () => {
+	const preview = workspaceCopyPreview;
+	if (!preview) return;
+	const button = $("workspace-copy-run");
+	button.disabled = true;
+	try {
+		const result = await api("/api/settings/workspace/copy", { method: "POST", body: JSON.stringify({ source: preview.source, target: preview.target, revision: preview.revision }) });
+		workspaceCopyPreview = null;
+		button.hidden = true;
+		$("workspace-copy-status").textContent = `已复制 ${result.copiedFiles} 个文件到 ${result.target}；源文件保留，工作区设置未改变`;
+	} catch (error) {
+		workspaceCopyPreview = null;
+		button.hidden = true;
+		$("workspace-copy-status").textContent = `复制未完成：${error.message}。请重新检查内容后再试`;
+	} finally { button.disabled = false; }
+});
 
 async function loadStorageState() {
 	try {
@@ -4860,6 +5254,7 @@ function createFsSearchRow(entry) {
 	row.dataset.type = "file";
 	row.dataset.name = entry.name;
 	row.draggable = true;
+	enableKeyboardClick(row, () => void openFilePreview(entry.path, entry.name, "file"));
 	row.title = "双击预览；可拖入对话或拖到桌面";
 	const icon = document.createElement("span");
 	icon.className = "fs-icon";
@@ -4895,6 +5290,7 @@ function createFsRow(directory, entry) {
 	row.dataset.type = entry.type;
 	row.dataset.name = entry.name;
 	row.draggable = entry.type === "file";
+	enableKeyboardClick(row, () => { if (entry.type === "dir") void loadFsDir(row.dataset.path); else void previewFsFile(row); });
 	row.title = entry.type === "dir" ? "双击打开" : "双击预览；可拖入对话或拖到桌面";
 	const icon = document.createElement("span");
 	icon.className = "fs-icon";
@@ -4954,20 +5350,22 @@ fsSearchClearEl.addEventListener("click", () => {
 
 async function copyDroppedFilesToCurrentDirectory(dataTransfer) {
 	if (!currentFsPath) return;
+	const destination = currentFsPath;
+	const files = [...(dataTransfer.files || [])];
 	const source = dataTransfer.getData(LOCAL_FILE_DRAG_TYPE);
 	try {
 		if (source) {
 			await api("/api/fs/copy", {
 				method: "POST",
-				body: JSON.stringify({ source, destination: currentFsPath }),
+				body: JSON.stringify({ source, destination }),
 			});
 		} else {
-			for (const file of dataTransfer.files ?? []) {
+			for (const file of files) {
 				const localPath = window.piDesktop?.getFilePath?.(file) || "";
 				if (localPath) {
 					await api("/api/fs/copy", {
 						method: "POST",
-						body: JSON.stringify({ source: localPath, destination: currentFsPath }),
+						body: JSON.stringify({ source: localPath, destination }),
 					});
 				} else {
 					await api("/api/fs/import", {
@@ -4975,14 +5373,14 @@ async function copyDroppedFilesToCurrentDirectory(dataTransfer) {
 						body: JSON.stringify({
 							name: file.name,
 							dataBase64: await fileToBase64(file),
-							destination: currentFsPath,
+							destination,
 						}),
 					});
 				}
 			}
 		}
-		await loadFsDir(currentFsPath);
-		showInfo("文件已复制到当前文件夹（file_copy）");
+		if (currentFsPath === destination) await loadFsDir(destination);
+		showInfo(`文件已复制到 ${destination}`);
 	} catch (error) {
 		showError(`复制文件失败：${error.message}`);
 	}
@@ -5041,22 +5439,27 @@ function base64ObjectUrl(base64, mimeType) {
 	return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
 
-function closeFilePreview() {
+function closeFilePreview(invalidate = true) {
+	if (invalidate) previewRequest++;
 	previewModalEl.hidden = true;
 	previewFile = null;
 	releasePreviewObjectUrl();
 }
 
 async function openFilePreview(path, name, source = "file") {
+	const request = ++previewRequest;
+	const targetSessionId = sessionId;
 	try {
 		if (isOfficeFilePath(path)) {
-			await openOfficePreview(path, source);
+			await openOfficePreview(path, source, request);
 			return;
 		}
 		const shownName = name || path.split(/[\\/]/).pop() || "文件预览";
-		if (source !== "message-attachment" && isTextPreviewPath(path) && (await openCodeEditor(path, shownName))) return;
+		if (source !== "message-attachment" && isTextPreviewPath(path) && (await openCodeEditor(path, shownName, request))) return;
+		if (request !== previewRequest || targetSessionId !== sessionId) return;
 		if (/\.pdf$/i.test(path)) {
 			if (!catalogCache) catalogCache = await api("/api/catalog");
+			if (request !== previewRequest || targetSessionId !== sessionId) return;
 			const token = apiToken();
 			const rawUrl = `/api/fs/raw?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
 			const pdfJsInstalled = catalogCache?.tools?.some((tool) => tool.id === "pdfjs" && tool.installed);
@@ -5073,6 +5476,7 @@ async function openFilePreview(path, name, source = "file") {
 		}
 		if (isTextPreviewPath(path)) {
 			const file = await api(`/api/fs/text?path=${encodeURIComponent(path)}`);
+			if (request !== previewRequest || targetSessionId !== sessionId) return;
 			previewFile = { path, name: shownName, mimeType: file.mimeType, size: file.size, isImage: false };
 			previewTitleEl.textContent = `${shownName} · ${file.encoding}`;
 			previewContentEl.innerHTML = "";
@@ -5084,6 +5488,7 @@ async function openFilePreview(path, name, source = "file") {
 			return;
 		}
 		const file = await api(`/api/fs/read?path=${encodeURIComponent(path)}`);
+		if (request !== previewRequest || targetSessionId !== sessionId) return;
 		previewFile = {
 			path,
 			name: shownName,
@@ -5108,6 +5513,7 @@ async function openFilePreview(path, name, source = "file") {
 		}
 		previewModalEl.hidden = false;
 	} catch (error) {
+		if (request !== previewRequest || targetSessionId !== sessionId) return;
 		showError(`读取文件失败：${error.message}`);
 	}
 }
@@ -5135,8 +5541,7 @@ previewAttachBtnEl.addEventListener("click", async () => {
 	if (!previewFile) return;
 	const file = previewFile;
 	if (file.dataBase64) {
-		pendingAttachments.push({ ...file });
-		renderAttachments();
+		if (!enqueueAttachment({ ...file })) return;
 		closeFilePreview();
 		showInfo("已添加到对话附件");
 		return;
@@ -5227,8 +5632,8 @@ document.addEventListener("keydown", (event) => {
 
 function openExternalUrl(url) {
 	if (!/^https?:\/\//i.test(url || "")) return;
-	if (window.piDesktop?.openExternal) window.piDesktop.openExternal(url);
-	else window.open(url, "_blank", "noopener");
+	if (window.piDesktop?.openExternal) return window.piDesktop.openExternal(url);
+	return window.open(url, "_blank", "noopener");
 }
 
 function renderCodexOAuthStatus(status) {
@@ -5259,11 +5664,19 @@ function renderCodexOAuthStatus(status) {
 }
 
 async function loadCodexOAuthSection() {
+	const pollKey = `loadCodexOAuthSection`;
+	if (activePolls.has(pollKey)) return;
+	activePolls.add(pollKey);
+	const generation = codexOAuthGeneration;
 	try {
-		renderCodexOAuthStatus(await api("/api/oauth/openai-codex/status"));
+	try {
+		const status = await api("/api/oauth/openai-codex/status");
+		if (generation === codexOAuthGeneration) renderCodexOAuthStatus(status);
 	} catch (error) {
-		codexOAuthStatusEl.textContent = `读取失败：${error.message}`;
+		if (generation === codexOAuthGeneration) codexOAuthStatusEl.textContent = `读取失败：${error.message}`;
 	}
+
+	} finally { activePolls.delete(pollKey); }
 }
 
 codexOAuthLoginBtnEl.addEventListener("click", async () => {
@@ -5273,6 +5686,7 @@ codexOAuthLoginBtnEl.addEventListener("click", async () => {
 		return;
 	}
 	codexOAuthLoginBtnEl.disabled = true;
+	codexOAuthGeneration++;
 	codexOAuthStatusEl.textContent = "正在申请设备码…";
 	try {
 		const status = await api("/api/oauth/openai-codex/start", { method: "POST", body: "{}" });
@@ -5289,6 +5703,7 @@ codexOAuthLoginBtnEl.addEventListener("click", async () => {
 codexOAuthLogoutBtnEl.addEventListener("click", async () => {
 	if (!window.confirm("退出 Codex 订阅登录？\n已保存的 openai-codex OAuth 凭据会从当前 Pi 客户端删除。")) return;
 	codexOAuthLogoutBtnEl.disabled = true;
+	codexOAuthGeneration++;
 	try {
 		renderCodexOAuthStatus(await api("/api/oauth/openai-codex", { method: "DELETE" }));
 		await loadModels();
@@ -5307,8 +5722,11 @@ codexOAuthCodeEl.addEventListener("click", () => {
 });
 
 async function loadKeysSection() {
+	const request = ++keysRequest;
 	try {
 		const [keys, models] = await Promise.all([api("/api/keys"), api("/api/models")]);
+		if (request !== keysRequest) return;
+		const selected = keyProviderEl.value;
 		const providers = new Map(models.map((m) => [m.provider, m.label.split(" · ")[0]]));
 		// Brave 联网检索不是模型服务，但 Key 同样保存在这里；即使尚未保存也始终可选。
 		providers.set("brave-web-search", "Brave 联网检索");
@@ -5328,6 +5746,7 @@ async function loadKeysSection() {
 			}
 			keyProviderEl.appendChild(option);
 		}
+		if ([...keyProviderEl.options].some(option => option.value === selected)) keyProviderEl.value = selected;
 		renderKeyList(keys);
 	} catch (error) {
 		keyListEl.textContent = `加载失败：${error.message}`;
@@ -5386,7 +5805,7 @@ keyAddBtnEl.addEventListener("click", async () => {
 	keyAddBtnEl.disabled = true;
 	try {
 		await api("/api/keys", { method: "POST", body: JSON.stringify({ provider, key }) });
-		keyInputEl.value = "";
+		if (keyInputEl.value.trim() === key && keyProviderEl.value === provider) keyInputEl.value = "";
 		showInfo(`已添加 ${provider}，模型列表已刷新`);
 		await loadKeysSection();
 		await loadModels();
@@ -5398,10 +5817,14 @@ keyAddBtnEl.addEventListener("click", async () => {
 });
 
 function resetCustomModelForm() {
+	customModelRevision++;
+	customModelDiscovery++;
 	customModelProviderIdEl.value = "";
 	customModelNameEl.value = "";
 	customModelBaseUrlEl.value = "";
 	customModelApiKeyEl.value = "";
+	customModelNoAuthEl.checked = false;
+	customModelApiKeyEl.disabled = false;
 	customModelIdEl.value = "";
 	customModelOptionsEl.innerHTML = "";
 	customModelContextEl.value = "128000";
@@ -5415,10 +5838,17 @@ function resetCustomModelForm() {
 }
 
 function editCustomModel(entry) {
+	customModelRevision++;
+	customModelDiscovery++;
+	customModelOptionsEl.replaceChildren();
+	customModelConnectionStateEl.textContent = "尚未测试此连接";
+	customModelConnectionStateEl.dataset.state = "idle";
 	customModelProviderIdEl.value = entry.providerId;
 	customModelNameEl.value = entry.name;
 	customModelBaseUrlEl.value = entry.baseUrl;
 	customModelApiKeyEl.value = "";
+	customModelNoAuthEl.checked = entry.authMode === "none";
+	customModelApiKeyEl.disabled = customModelNoAuthEl.checked;
 	customModelIdEl.value = entry.modelId;
 	customModelContextEl.value = String(entry.contextWindow);
 	customModelMaxTokensEl.value = String(entry.maxTokens);
@@ -5444,7 +5874,7 @@ function renderCustomModelList(entries) {
 		name.title = entry.baseUrl;
 		const detail = document.createElement("span");
 		detail.className = "key-masked";
-		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.reasoning ? " · 推理等级" : ""}${entry.hasKey ? "" : " · 缺少 Key"}`;
+		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.reasoning ? " · 推理等级" : ""}${entry.authMode === "none" ? " · 无需鉴权" : entry.hasKey ? "" : " · 缺少 Key"}`;
 		const edit = document.createElement("button");
 		edit.className = "secondary-btn small";
 		edit.type = "button";
@@ -5491,6 +5921,8 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 		return;
 	}
 	customModelDiscoverBtnEl.disabled = true;
+	const revision = customModelRevision;
+	const request = ++customModelDiscovery;
 	customModelDiscoverBtnEl.textContent = "正在测试…";
 	customModelConnectionStateEl.textContent = "正在连接服务并读取模型…";
 	customModelConnectionStateEl.dataset.state = "running";
@@ -5499,10 +5931,12 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 			method: "POST",
 			body: JSON.stringify({
 				baseUrl,
-				apiKey: customModelApiKeyEl.value.trim(),
+				apiKey: customModelNoAuthEl.checked ? "" : customModelApiKeyEl.value.trim(),
+				authMode: customModelNoAuthEl.checked ? "none" : "api_key",
 				providerId: customModelProviderIdEl.value,
 			}),
 		});
+		if (revision !== customModelRevision || request !== customModelDiscovery) return;
 		customModelOptionsEl.innerHTML = "";
 		for (const modelId of result.models) {
 			const option = document.createElement("option");
@@ -5514,6 +5948,7 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 		customModelConnectionStateEl.dataset.state = "ok";
 		showInfo(`已读取 ${result.models.length} 个模型${result.models.length ? "，可在模型 ID 中选择" : ""}`);
 	} catch (error) {
+		if (revision !== customModelRevision || request !== customModelDiscovery) return;
 		customModelConnectionStateEl.textContent = `连接失败 · ${error.message}`;
 		customModelConnectionStateEl.dataset.state = "error";
 		showError(`读取模型失败：${error.message}`);
@@ -5525,15 +5960,17 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 
 customModelSaveBtnEl.addEventListener("click", async () => {
 	const editing = Boolean(customModelProviderIdEl.value);
+	const revision = customModelRevision;
 	customModelSaveBtnEl.disabled = true;
 	try {
-		await api("/api/custom-models", {
+		const result = await api("/api/custom-models", {
 			method: "POST",
 			body: JSON.stringify({
 				providerId: customModelProviderIdEl.value || undefined,
 				name: customModelNameEl.value,
 				baseUrl: customModelBaseUrlEl.value,
-				apiKey: customModelApiKeyEl.value,
+				apiKey: customModelNoAuthEl.checked ? "" : customModelApiKeyEl.value,
+				authMode: customModelNoAuthEl.checked ? "none" : "api_key",
 				modelId: customModelIdEl.value,
 				contextWindow: customModelContextEl.value,
 				maxTokens: customModelMaxTokensEl.value,
@@ -5541,9 +5978,9 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 				vision: customModelVisionEl.checked,
 			}),
 		});
-		resetCustomModelForm();
+		if (revision === customModelRevision) resetCustomModelForm();
 		await Promise.all([loadCustomModelsSection(), loadKeysSection(), loadModels()]);
-		showInfo(editing ? "自定义模型已更新" : "自定义模型已添加，可在聊天区模型列表中选择");
+		showInfo(result.runtimePending ? "自定义模型已保存，重新启动 Pi 后生效" : editing ? "自定义模型已更新" : "自定义模型已添加，可在聊天区模型列表中选择");
 	} catch (error) {
 		showError(`保存失败：${error.message}`);
 	} finally {
@@ -5552,6 +5989,17 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 });
 
 customModelCancelBtnEl.addEventListener("click", resetCustomModelForm);
+for (const element of [customModelNameEl, customModelBaseUrlEl, customModelApiKeyEl, customModelNoAuthEl, customModelIdEl, customModelContextEl, customModelMaxTokensEl, customModelReasoningEl, customModelVisionEl]) {
+	element.addEventListener("input", () => {
+		customModelRevision++;
+		customModelApiKeyEl.disabled = customModelNoAuthEl.checked;
+		if (element === customModelBaseUrlEl || element === customModelApiKeyEl || element === customModelNoAuthEl) {
+			customModelOptionsEl.replaceChildren();
+			customModelConnectionStateEl.textContent = "连接信息已更改，请重新测试";
+			customModelConnectionStateEl.dataset.state = "idle";
+		}
+	});
+}
 
 async function loadVersionSection() {
 	try {
@@ -5585,7 +6033,7 @@ githubTokenSaveBtnEl.addEventListener("click", async () => {
 	}
 	try {
 		await api("/api/app/github-token", { method: "POST", body: JSON.stringify({ token }) });
-		githubTokenInputEl.value = "";
+		if (githubTokenInputEl.value.trim() === token) githubTokenInputEl.value = "";
 		showInfo("GitHub Token 已保存");
 		await loadVersionSection();
 	} catch (error) {
@@ -5665,6 +6113,24 @@ updateRetryBtnEl.addEventListener("click", async () => {
 	}
 });
 
+$("diagnostics-export-btn").addEventListener("click", async () => {
+	const button = $("diagnostics-export-btn");
+	button.disabled = true;
+	try {
+		const diagnostics = await api("/api/app/diagnostics");
+		const url = URL.createObjectURL(new Blob([JSON.stringify(diagnostics, null, 2)], { type: "application/json" }));
+		const link = document.createElement("a");
+		link.href = url;
+		link.download = "pi-diagnostics.json";
+		link.click();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+	} catch (error) {
+		showError(`诊断导出失败：${error.message}`);
+	} finally {
+		button.disabled = false;
+	}
+});
+
 updateRunBtnEl.addEventListener("click", async () => {
 	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	saveComposerDraft();
@@ -5680,12 +6146,16 @@ updateRunBtnEl.addEventListener("click", async () => {
 		return;
 	}
 	const timer = setInterval(async () => {
+		if (activePolls.has("app-update")) return;
+		activePolls.add("app-update");
 		let progress;
 		try {
 			progress = await api("/api/app/update-progress");
 		} catch {
 			// 更新安装期间后端退出会导致轮询暂时失败：保持遮罩等待重启即可。
 			return;
+		} finally {
+			activePolls.delete("app-update");
 		}
 		if (progress.running && progress.phase === "downloading") {
 			const total = progress.totalBytes ?? 0;
@@ -5742,7 +6212,10 @@ async function autoCheckUpdate() {
 // 启动
 // ---------------------------------------------------------------------------
 
-(async function init() {
+async function init() {
+	if (initializing) return;
+	initializing = true;
+	$("conn-retry").disabled = true;
 	try {
 		await Promise.all([loadModels(), loadSessions()]);
 		await ensureSession();
@@ -5760,9 +6233,25 @@ async function autoCheckUpdate() {
 		]);
 		// 右侧工作台默认关闭；智能体运行命令或用户使用快捷键时再打开，避免挤占对话空间。
 		void autoCheckUpdate();
+		$("conn-retry").hidden = true;
 	} catch (error) {
 		showError(`初始化失败：${error.message}`);
 		connStateEl.textContent = "未连接";
 		connStateEl.classList.add("disconnected");
+		$("conn-retry").hidden = false;
+	} finally {
+		initializing = false;
+		$("conn-retry").disabled = false;
 	}
-})();
+}
+
+$("conn-retry").addEventListener("click", () => { disconnectSSE(); void init(); });
+for (const modal of [settingsModalEl, previewModalEl, updateOverlayEl]) new MutationObserver(() => {
+	syncBrowserNativeVisibility();
+	if (modal === previewModalEl && !modal.hidden && !modal.contains(document.activeElement)) previewCloseEl.focus();
+}).observe(modal, { attributes: true, attributeFilter: ["hidden"] });
+window.addEventListener("resize", () => {
+	if (!codeEditorPaneEl.hidden) applyCodeEditorWidth(codeEditorPaneEl.style.width.replace("px", ""));
+	if (!workbenchSideEl.hidden) applyWorkbenchSideWidth(workbenchSideEl.style.width.replace("px", ""));
+});
+void init();

@@ -19,6 +19,7 @@ export interface AntigravityOAuthStatus {
 	promptId?: string;
 	message?: string;
 	error?: string;
+	expiresAt?: number;
 }
 
 const IDLE: AntigravityOAuthStatus = {
@@ -56,7 +57,7 @@ export class AntigravityOAuthCoordinator {
 		if (!current.available || current.connected || this.loginPromise) return current;
 		const controller = new AbortController();
 		this.controller = controller;
-		this.state = { ...IDLE, phase: "starting", message: "正在准备 Google 登录" };
+		this.state = { ...IDLE, phase: "starting", message: "正在准备 Google 登录", expiresAt: Date.now() + 5 * 60_000 };
 		let notifyReady = () => {};
 		const ready = new Promise<void>((resolve) => {
 			notifyReady = resolve;
@@ -169,6 +170,7 @@ export class AntigravityOAuthCoordinator {
 
 	cancel(): void {
 		this.controller?.abort();
+		this.state = { ...IDLE };
 	}
 
 	async stop(): Promise<AntigravityOAuthStatus> {

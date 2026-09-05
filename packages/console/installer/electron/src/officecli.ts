@@ -9,10 +9,21 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	createReadStream,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { DATA_DIR, PACKAGE_ROOT } from "./paths.ts";
+import { runToolProcess } from "./tool-process.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -128,13 +139,15 @@ async function fetchLatestRelease(): Promise<ReleaseInfo | null> {
 }
 
 /** 运行 officecli --version，5 秒超时；返回版本串（已去空白），不可用返回 null */
-async function probeInstalledVersion(): Promise<string | null> {
+async function probeInstalledVersion(signal?: AbortSignal): Promise<string | null> {
+	signal?.throwIfAborted();
 	if (!existsSync(binaryPath())) return null;
 	try {
-		const { stdout } = await execFileAsync(binaryPath(), ["--version"], { timeout: VERSION_TIMEOUT_MS });
+		const { stdout } = await runToolProcess(binaryPath(), ["--version"], { timeoutMs: VERSION_TIMEOUT_MS, signal });
 		const match = stdout.trim().match(/(\d+\.\d+\.\d+(?:[-+.\w]*)?)/);
 		return match ? match[1] : stdout.trim().slice(0, 40) || null;
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		return null;
 	}
 }
@@ -183,7 +196,7 @@ export async function getStatus(): Promise<OfficeCliStatus> {
 
 export interface DownloadProgress {
 	running: boolean;
-	phase: "idle" | "downloading" | "verifying" | "replacing";
+	phase: "idle" | "downloading" | "verifying" | "replacing" | "activating";
 	receivedBytes: number;
 	totalBytes: number | null;
 	error: string | null;
@@ -198,13 +211,17 @@ let progress: DownloadProgress = {
 	error: null,
 	version: null,
 };
+let finalizeInstall: () => Promise<void> | void = () => {};
+
+export function registerInstallFinalizer(finalizer: () => Promise<void> | void): void {
+	finalizeInstall = finalizer;
+}
 
 export function getDownloadProgress(): DownloadProgress {
 	return { ...progress };
 }
 
 async function sha256OfFile(path: string): Promise<string> {
-	const { createReadStream } = await import("node:fs");
 	const hash = createHash("sha256");
 	await new Promise<void>((resolve, reject) => {
 		const stream = createReadStream(path);
@@ -256,7 +273,6 @@ export async function downloadLatest(): Promise<void> {
 			: (asset?.size ?? null);
 		progress.totalBytes = totalBytes;
 
-		const { createWriteStream } = await import("node:fs");
 		await new Promise<void>((resolve, reject) => {
 			const writer = createWriteStream(tempPath);
 			const reader = res.body!.getReader();
@@ -309,6 +325,9 @@ export async function downloadLatest(): Promise<void> {
 		const record: VersionRecord = { version, downloadedAt: new Date().toISOString(), sha256: expected };
 		writeFileSync(RECORD_FILE, `${JSON.stringify(record, null, "\t")}\n`, "utf8");
 		if (existsSync(DISABLED_FILE)) unlinkSync(DISABLED_FILE);
+		progress.phase = "activating";
+		ensureBinaryOnProcessPath();
+		await finalizeInstall();
 
 		progress = {
 			running: false,
@@ -361,26 +380,31 @@ export function uninstall(): OfficeCliUninstallResult {
 }
 
 /** 二进制是否存在且能跑（供包工具在调用前给出明确错误） */
-export async function isBinaryReady(): Promise<boolean> {
-	return (await probeInstalledVersion()) !== null;
+export async function isBinaryReady(signal?: AbortSignal): Promise<boolean> {
+	return (await probeInstalledVersion(signal)) !== null;
 }
 
 /** 供包工具使用的运行入口：execFile 数组传参，cwd = 会话工作目录 */
-export async function runOfficeCli(args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {
-	if (!(await isBinaryReady())) {
+export async function runOfficeCli(
+	args: string[],
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<{ stdout: string; stderr: string }> {
+	signal?.throwIfAborted();
+	if (!(await isBinaryReady(signal))) {
 		throw new Error("OfficeCLI 未安装，请在页面点击下载");
 	}
 	try {
-		const { stdout, stderr } = await execFileAsync(binaryPath(), args, {
+		const { stdout, stderr } = await runToolProcess(binaryPath(), args, {
 			cwd,
-			timeout: 120_000,
+			timeoutMs: 120_000,
 			maxBuffer: 20 * 1024 * 1024,
-			windowsHide: true,
+			signal,
 		});
 		return { stdout: truncate(stdout), stderr: truncate(stderr) };
 	} catch (error) {
 		const err = error as { stdout?: string; stderr?: string; message?: string; killed?: boolean };
-		if (err.killed) throw new Error("OfficeCLI 执行超时（120 秒）");
+		if (signal?.aborted) throw new Error("OfficeCLI 操作已取消");
 		const detail = [err.stdout, err.stderr, err.message].filter(Boolean).join("\n").trim();
 		throw new Error(detail || "OfficeCLI 执行失败");
 	}

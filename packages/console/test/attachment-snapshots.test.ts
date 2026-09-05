@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	deleteAttachmentSnapshots,
+	getAttachmentReference,
 	resolveAttachmentSnapshots,
 	saveAttachmentSnapshot,
 } from "../src/attachment-snapshots.ts";
@@ -22,6 +23,25 @@ afterEach(() => {
 });
 
 describe("消息附件原始快照", () => {
+	it("manifests recover the latest index entry while stable references preserve earlier originals", () => {
+		const dataDir = mkdtempSync(join(tmpdir(), "pi-attachment-manifests-"));
+		temporaryDirectories.push(dataDir);
+		const sessionId = "01234567-89ab-cdef-0123-456789abcdef";
+		const first = saveAttachmentSnapshot(dataDir, sessionId, "uploads/a.txt", "a.txt", Buffer.from("first"));
+		const reference = getAttachmentReference(dataDir, sessionId, first);
+		const latest = saveAttachmentSnapshot(dataDir, sessionId, "uploads/a.txt", "a.txt", Buffer.from("latest"));
+		const directory = join(dataDir, "attachment-snapshots", sessionId);
+		writeFileSync(join(directory, "index.json"), "damaged");
+		writeFileSync(join(directory, "index.json.bak"), "damaged too");
+		expect(resolveAttachmentSnapshots(dataDir, sessionId, ["uploads/a.txt", reference])).toEqual([latest, first]);
+		writeFileSync(first, "tampered");
+		expect(() => resolveAttachmentSnapshots(dataDir, sessionId, [reference])).toThrow("校验失败");
+		expect(() => resolveAttachmentSnapshots(dataDir, sessionId, [`${reference}/unexpected`])).toThrow(
+			"不属于当前会话",
+		);
+		rmSync(latest);
+		expect(() => resolveAttachmentSnapshots(dataDir, sessionId, ["uploads/a.txt"])).toThrow("原始附件缺失");
+	});
 	it("损坏索引从有效备份恢复并保留损坏原文", () => {
 		const dataDir = mkdtempSync(join(tmpdir(), "pi-attachment-recovery-"));
 		temporaryDirectories.push(dataDir);

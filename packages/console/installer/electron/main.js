@@ -218,13 +218,16 @@ listenTrusted("pi:file-drag-start", (event, path) => {
 });
 
 handleTrusted("pi:api-token", () => process.env.PI_CONSOLE_TOKEN);
-handleTrusted("pi:browser-open", (_event, url) => agentBrowser?.open(typeof url === "string" ? url : undefined));
+handleTrusted("pi:browser-open", (_event, url) => {
+	if (typeof url === "string" && url) agentBrowser?.takeUserControl();
+	return agentBrowser?.open(typeof url === "string" ? url : undefined);
+});
 handleTrusted("pi:browser-hide", () => agentBrowser?.hide());
 handleTrusted("pi:browser-state", () => agentBrowser?.state());
-handleTrusted("pi:browser-navigate", (_event, url) => agentBrowser?.navigate(String(url ?? "")));
-handleTrusted("pi:browser-back", () => agentBrowser?.back());
-handleTrusted("pi:browser-forward", () => agentBrowser?.forward());
-handleTrusted("pi:browser-reload", () => agentBrowser?.reload());
+handleTrusted("pi:browser-navigate", (_event, url) => { agentBrowser?.takeUserControl(); return agentBrowser?.navigate(String(url ?? "")); });
+handleTrusted("pi:browser-back", () => { agentBrowser?.takeUserControl(); return agentBrowser?.back(); });
+handleTrusted("pi:browser-forward", () => { agentBrowser?.takeUserControl(); return agentBrowser?.forward(); });
+handleTrusted("pi:browser-reload", () => { agentBrowser?.takeUserControl(); return agentBrowser?.reload(); });
 handleTrusted("pi:browser-devtools", () => agentBrowser?.toggleDevtools());
 handleTrusted("pi:browser-pick-element", () => agentBrowser?.pickElement());
 handleTrusted("pi:browser-screenshot", async () => {

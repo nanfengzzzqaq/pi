@@ -126,13 +126,13 @@ const targetParameters = {
 	),
 };
 
-export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
+export function instantiateAgentBrowserTools(cwd: string, getSessionId: () => string = () => cwd): ToolDefinition[] {
+	let snapshotVersion: number | undefined;
 	const browser = () => {
 		const runtime = getAgentBrowserRuntime();
-		runtime.setDownloadDirectory(cwd);
 		return runtime;
 	};
-	return [
+	const tools: ToolDefinition[] = [
 		defineTool({
 			name: "browser_navigate",
 			label: "打开网页",
@@ -296,4 +296,29 @@ export function instantiateAgentBrowserTools(cwd: string): ToolDefinition[] {
 			},
 		}),
 	];
+	return tools.map((tool) => ({
+		...tool,
+		executionMode: "sequential",
+		execute: async (id, params, signal, onUpdate, context) => {
+			signal?.throwIfAborted();
+			const runtime = browser();
+			return runtime.runWithSession(
+				{ sessionId: getSessionId(), workspace: cwd, signal, allowNavigation: tool.name === "browser_navigate" },
+				async () => {
+					const pageVersion = runtime.state().pageVersion;
+					if (
+						["browser_click", "browser_hover", "browser_type", "browser_upload"].includes(tool.name) &&
+						snapshotVersion !== pageVersion
+					) {
+						throw new Error("页面已变化或尚未检查，请先获取当前页面快照再操作");
+					}
+					const output = await tool.execute(id, params, signal, onUpdate, context);
+					signal?.throwIfAborted();
+					if (tool.name === "browser_snapshot") snapshotVersion = runtime.state().pageVersion;
+					if (tool.name === "browser_navigate") snapshotVersion = undefined;
+					return output;
+				},
+			);
+		},
+	}));
 }

@@ -49,6 +49,7 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
+import { abortableWait } from "../utils/abortable-wait.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
@@ -242,6 +243,8 @@ export interface ExtensionBindings {
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
+	/** Cancels authentication/preflight as well as the active agent run. */
+	signal?: AbortSignal;
 	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
 	expandPromptTemplates?: boolean;
 	/** Image attachments */
@@ -1286,15 +1289,32 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const signal = options?.signal;
+		const onAbort = () => {
+			this.abortCompaction();
+			void this.abort().catch(() => undefined);
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await this._promptWithPreflight(text, options);
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	private async _promptWithPreflight(text: string, options?: PromptOptions): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
+		const signal = options?.signal;
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			signal?.throwIfAborted();
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
+				signal?.throwIfAborted();
 				if (handled) {
 					// Extension command executed, no prompt to send
 					preflightResult?.(true);
@@ -1318,6 +1338,7 @@ export class AgentSession {
 					options?.source ?? "interactive",
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
+				signal?.throwIfAborted();
 				if (inputResult.action === "handled") {
 					preflightResult?.(true);
 					return;
@@ -1365,7 +1386,8 @@ export class AgentSession {
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await abortableWait(this._modelRuntime.checkAuth(this.model.provider), signal)) !== undefined;
+			signal?.throwIfAborted();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -1382,7 +1404,8 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+				await this._checkCompaction(lastAssistant, false, signal);
+				signal?.throwIfAborted();
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1412,6 +1435,7 @@ export class AgentSession {
 				this._baseSystemPrompt,
 				this._baseSystemPromptOptions,
 			);
+			signal?.throwIfAborted();
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
@@ -1445,6 +1469,7 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
+		signal?.throwIfAborted();
 		await this._runAgentPrompt(messages, {
 			toolChoice: options?.toolChoice,
 			toolChoiceAfterToolResult: options?.toolChoiceAfterToolResult,
@@ -2112,6 +2137,7 @@ export class AgentSession {
 					willRetry: false,
 					signal: this._compactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
+				this._compactionAbortController.signal.throwIfAborted();
 
 				if (result?.cancel) {
 					throw new Error("Compaction cancelled");
@@ -2260,7 +2286,11 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		signal?: AbortSignal,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -2297,7 +2327,7 @@ export class AgentSession {
 			// Case 2: the response completed successfully. Compact, but do not retry because
 			// agent.continue() cannot continue from a completed assistant response.
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return await this._runAutoCompaction("overflow", false, signal);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -2329,7 +2359,7 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			return await this._runAutoCompaction("overflow", willRetry, signal);
 		}
 
 		// Case 3: threshold compaction without retry.
@@ -2361,7 +2391,7 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return await this._runAutoCompaction("threshold", false, signal);
 		}
 		return false;
 	}
@@ -2376,17 +2406,32 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		signal?: AbortSignal,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 		let fromExtension = false;
+		const controller = new AbortController();
+		this._autoCompactionAbortController = controller;
+		const onAbort = () => controller.abort(signal?.reason);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
 
 		try {
 			if (!this.model) {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			controller.signal.throwIfAborted();
+			const {
+				model: requestModel,
+				apiKey,
+				headers,
+				env,
+			} = await abortableWait(this._getSummarizationRequestAuth(this.model), controller.signal);
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2396,7 +2441,6 @@ export class AgentSession {
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2411,6 +2455,7 @@ export class AgentSession {
 					willRetry,
 					signal: this._autoCompactionAbortController.signal,
 				})) as SessionBeforeCompactResult | undefined;
+				controller.signal.throwIfAborted();
 
 				if (extensionResult?.cancel) {
 					this._emit({
@@ -2450,6 +2495,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
+				controller.signal.throwIfAborted();
 				const compactResult = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
@@ -2533,23 +2579,25 @@ export class AgentSession {
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			const aborted = controller.signal.aborted;
 			if (started) {
-				const formattedErrorMessage =
-					reason === "overflow"
+				const formattedErrorMessage = aborted
+					? undefined
+					: reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted,
 					willRetry: false,
 					errorMessage: formattedErrorMessage,
 				});
 				await this._emitSessionCompactFailed({
 					reason,
 					errorMessage: formattedErrorMessage,
-					aborted: false,
+					aborted,
 					willRetry: false,
 					fromExtension,
 				});
@@ -2557,6 +2605,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			signal?.removeEventListener("abort", onAbort);
 		}
 	}
 

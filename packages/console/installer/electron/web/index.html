@@ -21,6 +21,7 @@
 		</div>
 		<span class="topbar-divider" aria-hidden="true"></span>
 		<span id="conn-state" class="conn-state" role="status" aria-live="polite">连接中…</span>
+		<button id="conn-retry" class="secondary-btn small" type="button" hidden>重试连接</button>
 		<div class="topbar-right">
 			<button id="workbench-btn" class="secondary-btn small topbar-action" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 4.5h13v11h-13zM11.5 4.5v11M4 8h7"></path></svg><span>工作台</span></button>
 			<button id="agent-browser-btn" class="secondary-btn small topbar-action" type="button" title="打开客户端独立浏览器（agent_browser）"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg><span>浏览器</span></button>
@@ -135,6 +136,7 @@
 					<div id="indicator" class="indicator" hidden>思考中…</div>
 
 					<footer class="composer">
+						<div id="message-recovery" class="message-recovery" role="status" aria-live="polite" hidden></div>
 						<div class="attachments" id="attachments" hidden></div>
 						<div class="composer-row">
 							<div class="composer-input-box">
@@ -310,6 +312,7 @@
 						</div>
 						<div id="side-browser-loading" class="agent-browser-loading" hidden></div>
 						<div class="agent-browser-contextbar">
+							<button id="side-browser-claim" class="secondary-btn small" type="button">在此对话接管</button>
 							<button id="side-browser-pick" class="secondary-btn small" type="button" title="在网页中点选元素，并把元素信息加入当前输入框">选取元素</button>
 							<button id="side-browser-screenshot" class="secondary-btn small" type="button" title="保存当前网页截图">保存截图</button>
 							<details class="browser-tools-menu">
@@ -401,6 +404,13 @@
 					<button id="workspace-save-btn">保存</button>
 				</div>
 				<div class="workspace-current" id="workspace-current">当前：未设置（默认工作区）</div>
+				<details class="workspace-copy-section">
+					<summary>复制旧工作区文件</summary>
+					<p class="modal-hint">切换工作区不会自动移动文件。需要时可将旧目录完整复制到一个空目录，原文件保留。</p>
+					<div class="key-add-row"><input id="workspace-copy-source" aria-label="源工作区" placeholder="源文件夹完整路径"><input id="workspace-copy-target" aria-label="目标工作区" placeholder="目标空文件夹完整路径"></div>
+					<div class="model-form-actions"><button id="workspace-copy-preview" type="button">检查复制内容</button><button id="workspace-copy-run" type="button" hidden>确认复制</button></div>
+					<div id="workspace-copy-status" class="workspace-current" role="status"></div>
+				</details>
 			</section>
 
 			<section class="modal-section settings-page" data-settings-page="advanced" hidden>
@@ -463,6 +473,7 @@
 					<button id="custom-model-discover-btn" class="secondary-btn" type="button">测试并读取模型</button>
 				</div>
 				<div id="custom-model-connection-state" class="model-connection-state">尚未测试连接</div>
+				<label class="modal-hint"><input id="custom-model-no-auth" type="checkbox"> 此服务无需 API Key（例如本机模型服务）</label>
 				<div class="key-add-row model-capabilities-row">
 					<input type="number" id="custom-model-context" min="1" step="1" value="128000" placeholder="上下文长度">
 					<input type="number" id="custom-model-max-tokens" min="1" step="1" value="16384" placeholder="最大输出长度">
@@ -489,6 +500,7 @@
 					<button id="update-check-btn">检查更新</button>
 					<button id="update-run-btn" hidden>立即更新</button>
 					<button id="update-retry-btn" hidden>重新安装</button>
+					<button id="diagnostics-export-btn" class="secondary-btn" type="button">导出诊断信息</button>
 				</div>
 				<div id="update-status" class="update-status"></div>
 				<div class="download-bar-wrap" id="update-progress" hidden>

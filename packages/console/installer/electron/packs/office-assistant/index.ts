@@ -19,11 +19,8 @@ function ok(stdout: string, stderr: string): TextResult {
 	return { content: [{ type: "text", text: text || "(无输出)" }], details: {} };
 }
 
-function fail(error: unknown): TextResult {
-	return {
-		content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-		details: {},
-	};
+function fail(error: unknown): never {
+	throw error instanceof Error ? error : new Error(String(error));
 }
 
 /** 把 Record<string,string> 展开成重复的 --prop k=v 参数 */
@@ -71,12 +68,12 @@ export default function definePack(ctx: PackContext) {
 				force: Type.Optional(Type.Boolean({ description: "覆盖已存在的文件" })),
 				locale: Type.Optional(Type.String({ description: "区域标签，如 zh-CN、en-US" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["create", params.file];
 					if (params.force) args.push("--force");
 					if (params.locale) args.push("--locale", params.locale);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -101,7 +98,7 @@ export default function definePack(ctx: PackContext) {
 				),
 				out: Type.Optional(Type.String({ description: "输出文件路径（screenshot/pdf 模式保存用）" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["view", params.file, params.mode];
 					if (params.page) args.push("--page", params.page);
@@ -110,7 +107,7 @@ export default function definePack(ctx: PackContext) {
 					if (params.maxLines !== undefined) args.push("--max-lines", String(params.maxLines));
 					if (params.range) args.push("--range", params.range);
 					if (params.out) args.push("--out", params.out);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -126,11 +123,11 @@ export default function definePack(ctx: PackContext) {
 				depth: Type.Optional(Type.Integer({ description: "子节点下钻深度，默认 1" })),
 				asJson: Type.Optional(Type.Boolean({ description: "以 JSON 输出" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["get", params.file, params.path ?? "/", "--depth", String(params.depth ?? 1)];
 					if (params.asJson) args.push("--json");
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -148,13 +145,13 @@ export default function definePack(ctx: PackContext) {
 				compact: Type.Optional(Type.Boolean({ description: "紧凑单行输出" })),
 				asJson: Type.Optional(Type.Boolean({ description: "以 JSON 输出" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["query", params.file, params.selector];
 					if (params.find) args.push("--find", params.find);
 					if (params.compact) args.push("--compact");
 					if (params.asJson) args.push("--json");
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -173,14 +170,14 @@ export default function definePack(ctx: PackContext) {
 				index: Type.Optional(Type.Integer({ description: "插入位置（0 基），缺省追加到末尾" })),
 				from: Type.Optional(Type.String({ description: "从已有元素路径复制" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["add", params.file, params.parent];
 					if (params.type) args.push("--type", params.type);
 					args.push(...propArgs(params.props));
 					if (params.index !== undefined) args.push("--index", String(params.index));
 					if (params.from) args.push("--from", params.from);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -198,12 +195,12 @@ export default function definePack(ctx: PackContext) {
 				find: Type.Optional(Type.String({ description: "查找文本（在该节点内）" })),
 				replace: Type.Optional(Type.String({ description: "替换文本，配合 find 使用" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["set", params.file, params.path, ...propArgs(params.props)];
 					if (params.find) args.push("--find", params.find);
 					if (params.replace !== undefined) args.push("--replace", params.replace);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -218,11 +215,11 @@ export default function definePack(ctx: PackContext) {
 				path: Type.String({ description: "要删除的元素 DOM 路径" }),
 				shift: Type.Optional(Type.String({ description: "Excel 单元格删除后填补方向：left | up" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["remove", params.file, params.path];
 					if (params.shift) args.push("--shift", params.shift);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -239,13 +236,13 @@ export default function definePack(ctx: PackContext) {
 				after: Type.Optional(Type.String({ description: "移动到该兄弟元素之后" })),
 				before: Type.Optional(Type.String({ description: "移动到该兄弟元素之前" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["move", params.file, params.path];
 					if (params.to) args.push("--to", params.to);
 					if (params.after) args.push("--after", params.after);
 					if (params.before) args.push("--before", params.before);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -260,9 +257,9 @@ export default function definePack(ctx: PackContext) {
 				path1: Type.String({ description: "第一个元素 DOM 路径" }),
 				path2: Type.String({ description: "第二个元素 DOM 路径" }),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
-					return ok(...(await runOfficeCli(["swap", params.file, params.path1, params.path2], root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(["swap", params.file, params.path1, params.path2], root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -279,11 +276,11 @@ export default function definePack(ctx: PackContext) {
 					description: "命令对象数组，每项含 command 动词 + 对应参数字段",
 				}),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const json = JSON.stringify(params.commands);
 					return ok(
-						...(await runOfficeCli(["batch", params.file, "--commands", json], root()).then((r) => [r.stdout, r.stderr] as const)),
+						...(await runOfficeCli(["batch", params.file, "--commands", json], root(), signal).then((r) => [r.stdout, r.stderr] as const)),
 					);
 				} catch (error) {
 					return fail(error);
@@ -299,10 +296,10 @@ export default function definePack(ctx: PackContext) {
 				parentPath: Type.String({ description: "目标工作表路径，如 /Sheet1" }),
 				sourceFile: Type.String({ description: "CSV/TSV 源文件路径" }),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					return ok(
-						...(await runOfficeCli(["import", params.file, params.parentPath, params.sourceFile], root()).then((r) => [r.stdout, r.stderr] as const)),
+						...(await runOfficeCli(["import", params.file, params.parentPath, params.sourceFile], root(), signal).then((r) => [r.stdout, r.stderr] as const)),
 					);
 				} catch (error) {
 					return fail(error);
@@ -319,11 +316,11 @@ export default function definePack(ctx: PackContext) {
 				data: Type.String({ description: "JSON 数据字符串或 .json 文件路径" }),
 				force: Type.Optional(Type.Boolean({ description: "覆盖已存在的输出文件" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["merge", params.template, params.output, "--data", params.data];
 					if (params.force) args.push("--force");
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}
@@ -339,13 +336,13 @@ export default function definePack(ctx: PackContext) {
 				verb: Type.Optional(Type.String({ description: "add | set | get | query | remove" })),
 				element: Type.Optional(Type.String({ description: "元素名，如 paragraph、table、shape" })),
 			}),
-			execute: async (_id, params) => {
+			execute: async (_id, params, signal) => {
 				try {
 					const args = ["help"];
 					if (params.format) args.push(params.format);
 					if (params.verb) args.push(params.verb);
 					if (params.element) args.push(params.element);
-					return ok(...(await runOfficeCli(args, root()).then((r) => [r.stdout, r.stderr] as const)));
+					return ok(...(await runOfficeCli(args, root(), signal).then((r) => [r.stdout, r.stderr] as const)));
 				} catch (error) {
 					return fail(error);
 				}

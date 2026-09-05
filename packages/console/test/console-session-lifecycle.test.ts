@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,8 +14,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionIndex } from "../src/session-index.ts";
-import { disposeSessionBeforeDelete } from "../src/session-lifecycle.ts";
+import * as customModels from "../src/custom-models.ts";
+import { RequestLedger } from "../src/request-ledger.ts";
+import { readSessionIndexFile, type SessionIndex, writeSessionIndexFile } from "../src/session-index.ts";
+import { abortTrackedSessionPrompt, disposeSessionBeforeDelete } from "../src/session-lifecycle.ts";
 
 const directories: string[] = [];
 const activeSessions: AgentSession[] = [];
@@ -38,7 +41,19 @@ const handler = source.statements.find(
 );
 if (!handler) throw new Error("Console API handler is missing");
 const routeScript = new Script(
-	`${ts.transpileModule(handler.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText}\nhandleApi;`,
+	`${
+		ts.transpileModule(
+			source.statements
+				.filter(
+					(statement) =>
+						ts.isFunctionDeclaration(statement) &&
+						["handleApi", "completeSessionDeletion"].includes(statement.name?.text ?? ""),
+				)
+				.map((statement) => statement.getText(source))
+				.join("\n"),
+			{ compilerOptions: { target: ts.ScriptTarget.ES2022 } },
+		).outputText
+	}\nhandleApi;`,
 );
 const reloadHandler = source.statements.find(
 	(statement): statement is ts.FunctionDeclaration =>
@@ -118,15 +133,30 @@ async function fixture() {
 		modelChange: null as Promise<void> | null,
 	};
 	const sessions = new Map([[cs.sessionId, cs]]);
-	let index: SessionIndex = {
+	const index: SessionIndex = {
 		fixture: { cwd: directory, sessionFile: session.sessionFile, title: "fixture", createdAt: 1, updatedAt: 1 },
 	};
+	const indexPath = join(directory, "sessions-index.json");
+	writeSessionIndexFile(indexPath, index);
+	const readSessionIndex = () => readSessionIndexFile(indexPath);
+	const writeSessionIndex = vi.fn((next: SessionIndex) => writeSessionIndexFile(indexPath, next));
+	const requestLedger = new RequestLedger(directory, "fixture-process");
+	const pendingSkillReloads = new Set<string>();
+	const readBodyJson = vi.fn(async (request: { body?: unknown }): Promise<unknown> => request.body ?? {});
 	const updateSessionTitle = vi.fn();
 	const broadcast = vi.fn();
 	const execute = routeScript.runInNewContext({
 		Error,
+		randomUUID,
+		AbortController,
+		existsSync,
+		requestLedger,
+		pendingSkillReloads,
+		hasActiveDataWork: () => false,
+		MAX_TOTAL_FILE_BYTES: 50 * 1024 * 1024,
 		modelRuntime: runtime,
-		readBodyJson: async (request: { body?: unknown }) => request.body,
+		customModels,
+		readBodyJson,
 		getOrRestoreSession: async (id: string) => sessions.get(id) ?? null,
 		sendJson: (response: ResponseCapture, status: number, body: unknown) => {
 			response.status = status;
@@ -140,14 +170,15 @@ async function fixture() {
 		appendAttachmentAnnotation: (text: string) => text,
 		updateSessionTitle,
 		prepareTurnCapabilities: () => ({}),
+		releaseTurnCapabilities: vi.fn(),
+		reloadInstalledSkillsInSessions: vi.fn(),
 		packSummaries: () => [],
 		THINKING_LEVELS: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
 		disposeSessionBeforeDelete,
+		abortTrackedSessionPrompt,
 		sessions,
-		readSessionIndex: () => index,
-		writeSessionIndex: (next: SessionIndex) => {
-			index = next;
-		},
+		readSessionIndex,
+		writeSessionIndex,
 		unlinkSync,
 		deleteAttachmentSnapshots: vi.fn(),
 		DATA_DIR: directory,
@@ -167,7 +198,9 @@ async function fixture() {
 		await execute({ method }, response, new URL(path, "http://127.0.0.1"), path);
 		return response;
 	};
-	const reloadSkills = reloadScript.runInNewContext({ sessions, console }) as () => Promise<number>;
+	const reloadSkills = reloadScript.runInNewContext({ sessions, console, pendingSkillReloads }) as (
+		onlyPending?: boolean,
+	) => Promise<number>;
 	return {
 		session,
 		runtime,
@@ -180,6 +213,11 @@ async function fixture() {
 		reloadSkills,
 		updateSessionTitle,
 		broadcast,
+		readBodyJson,
+		readSessionIndex,
+		writeSessionIndex,
+		requestLedger,
+		pendingSkillReloads,
 	};
 }
 
@@ -198,6 +236,72 @@ function holdAuth(runtime: ModelRuntime, fail = false) {
 }
 
 describe("Console session route lifecycle", () => {
+	it("cancels stalled authentication without waiting for the authentication result or starting a late turn", async () => {
+		const item = await fixture();
+		vi.spyOn(item.runtime, "hasConfiguredAuth").mockReturnValue(false);
+		const auth = holdAuth(item.runtime);
+		const agentPrompt = vi.spyOn(item.session.agent, "prompt");
+		expect(
+			(await item.request("POST", "messages", { text: "Cancel during auth", requestId: "cancel-auth" })).status,
+		).toBe(202);
+		await vi.waitFor(() => expect(auth.check).toHaveBeenCalled());
+		expect((await item.request("POST", "abort", { requestId: "cancel-auth" })).status).toBe(200);
+		expect(item.requestLedger.read("fixture", "cancel-auth")?.status).toBe("cancelled");
+		expect(agentPrompt).not.toHaveBeenCalled();
+		auth.release();
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+		expect(agentPrompt).not.toHaveBeenCalled();
+	});
+
+	it("an identical message retry never starts a second prompt", async () => {
+		const item = await fixture();
+		const prompt = vi.spyOn(item.session, "prompt").mockResolvedValue(undefined);
+		const body = { text: "Only once", requestId: "retry-once" };
+		expect((await item.request("POST", "messages", body)).status).toBe(202);
+		expect((await item.request("POST", "messages", body)).status).toBe(200);
+		expect(prompt).toHaveBeenCalledOnce();
+		expect((await item.request("POST", "messages", { ...body, text: "Changed" })).status).toBe(409);
+	});
+
+	it("rejects an upload that finishes reading after deletion, before writing any attachment", async () => {
+		const item = await fixture();
+		let finish = (_value: unknown) => {};
+		item.readBodyJson.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const upload = item.request("POST", "files", {});
+		await vi.waitFor(() => expect(item.readBodyJson).toHaveBeenCalled());
+		expect((await item.request("DELETE")).status).toBe(200);
+		finish({ files: [{ name: "late.txt", dataBase64: "bGF0ZQ==" }] });
+		expect((await upload).status).toBe(409);
+		expect(existsSync(join(item.session.sessionManager.getCwd(), "uploads"))).toBe(false);
+	});
+
+	it("an index failure before deletion preserves the transcript and live session", async () => {
+		const item = await fixture();
+		item.writeSessionIndex.mockImplementationOnce(() => {
+			throw new Error("disk failure");
+		});
+		await expect(item.request("DELETE")).rejects.toThrow("disk failure");
+		expect(existsSync(item.session.sessionFile!)).toBe(true);
+		expect(item.cs.deleting).toBe(false);
+		expect(item.readSessionIndex().fixture.deletionRequestedAt).toBeUndefined();
+	});
+
+	it("reloads skills once a busy session becomes idle", async () => {
+		const item = await fixture();
+		const reload = vi.spyOn(item.session, "reload").mockResolvedValue();
+		item.cs.modelChange = Promise.resolve();
+		expect(await item.reloadSkills()).toBe(0);
+		expect(item.pendingSkillReloads.has("fixture")).toBe(true);
+		item.cs.modelChange = null;
+		expect(await item.reloadSkills(true)).toBe(1);
+		expect(await item.reloadSkills(true)).toBe(0);
+		expect(reload).toHaveBeenCalledOnce();
+	});
 	for (const state of ["activePrompt", "modelChange", "deleting"] as const) {
 		it(`reports ${state} as busy and protects it from tool uninstall and skill reload`, async () => {
 			const item = await fixture();

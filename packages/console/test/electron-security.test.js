@@ -31,7 +31,7 @@ function fixture(token) {
 	const handlers = new Map();
 	const listeners = new Map();
 	const browser = Object.fromEntries(
-		["open", "hide", "state", "navigate", "back", "forward", "reload", "toggleDevtools", "pickElement", "screenshot", "setBounds"].map(
+		["open", "hide", "state", "navigate", "back", "forward", "reload", "toggleDevtools", "pickElement", "screenshot", "setBounds", "takeUserControl"].map(
 			(name) => [name, vi.fn(() => (name === "state" ? { title: "fixture" } : undefined))],
 		),
 	);

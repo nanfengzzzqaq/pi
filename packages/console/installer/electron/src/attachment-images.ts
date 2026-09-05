@@ -1,9 +1,11 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { resolveAttachmentSnapshots } from "./attachment-snapshots.ts";
+import { MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES } from "./file-limits.ts";
 
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-const MAX_TOTAL_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_IMAGE_BYTES = MAX_ATTACHMENT_BYTES;
+const MAX_TOTAL_IMAGE_BYTES = MAX_TOTAL_ATTACHMENT_BYTES;
 
 /** Only this session's snapshots or files under its working uploads directory may become image input. */
 export function resolveAttachmentImages(dataDir: string, sessionId: string, cwd: string, value: unknown) {
@@ -23,7 +25,10 @@ export function resolveAttachmentImages(dataDir: string, sessionId: string, cwd:
 			!IMAGE_TYPES.has(reference.mimeType)
 		)
 			throw new Error("图片附件格式不受支持");
-		const path = realpathSync(resolve(cwd, reference.path));
+		const referencePath = reference.path.startsWith("pi-attachment:")
+			? resolveAttachmentSnapshots(dataDir, sessionId, [reference.path])[0]
+			: reference.path;
+		const path = realpathSync(resolve(cwd, referencePath));
 		const key = process.platform === "win32" ? path.toLowerCase() : path;
 		if (
 			!roots.some((root) => {

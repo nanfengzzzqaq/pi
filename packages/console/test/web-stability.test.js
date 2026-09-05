@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createContext, runInContext } from "node:vm";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,11 +12,11 @@ function declaration(name) {
 function editorFixture() {
   const element = () => ({ hidden: true, textContent: "", innerHTML: "", classList: { toggle() {}, remove() {} } });
   const context = createContext({
-    codeEditor: null, codeEditorFile: null, codeEditorDirty: false, codeEditorPreviewing: false, codeEditorOpenRequest: 0,
+    codeEditor: null, codeEditorFile: null, codeEditorDirty: false, codeEditorPreviewing: false, codeEditorOpenRequest: 0, previewRequest: 0,
     catalogCache: { tools: [{ id: "code-development", installed: true }] },
     window: { confirm: () => true }, localStorage: { getItem: () => null }, document: { documentElement: { dataset: {} } },
     CODE_EDITOR_WIDTH_KEY: "fixture", currentFsPath: null, showInfo: vi.fn(), showError: vi.fn(),
-    closeOfficePreview: vi.fn(), closeCatalog: vi.fn(), suspendSidePanel: vi.fn(), restoreSidePanel: vi.fn(),
+    closeFilePreview: vi.fn(), closeOfficePreview: vi.fn(), closeCatalog: vi.fn(), suspendSidePanel: vi.fn(), restoreSidePanel: vi.fn(),
     applyCodeEditorWidth: vi.fn(), setCodeEditorFocus: vi.fn(), codeLanguage: () => "text",
     codeEditorPaneEl: element(), codeEditorResizerEl: element(), codeEditorTitleEl: element(), codeEditorStatusEl: element(),
     codeEditorPathEl: element(), codeEditorStageEl: element(), codeEditorMarkdownPreviewEl: element(), codeEditorPreviewEl: element(),
@@ -33,6 +34,26 @@ function editorFixture() {
   return context;
 }
 
+function sendFixture() {
+  const values = new Map();
+  const app = createContext({
+    sessionId: "first", running: false, pendingAttachments: [],
+    pendingMessageSessions: new Set(), attachmentReads: new Map(), draftAttachments: new Map(),
+    activeSubmissions: new Map(), recoverableSubmissions: new Map(), deletedSessions: new Set(),
+    crypto: { randomUUID }, AbortController,
+    inputEl: { value: "first draft", focus() {} }, errorBarEl: {},
+    sendBtn: { disabled: false, querySelector: () => ({ textContent: "" }) },
+    localStorage: { getItem: key => values.get(key), setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) },
+    resizeComposerInput() {}, clearActivity() {}, updateActivityOverview() {}, setIndicator() {},
+    renderAttachments() {}, renderMessageRecovery() {}, showError: vi.fn(), showInfo: vi.fn(), loadSessions() {}, refreshFromHistory: vi.fn(), redactSensitiveDisplayText: text => text,
+    appendMessage: () => ({ el: { closest: () => ({ remove() {} }) } }),
+    api: async path => path.includes("/requests/") ? { status: "unknown" } : { ok: true, status: "accepted" },
+  });
+  app.setRunning = value => { app.running = value; };
+  runInContext(["saveComposerDraft", "submissionRecords", "persistSubmissions", "forgetSubmission", "restoreSubmissionDraft", "inspectSubmission", "retrySubmission", "submitMessageRecord", "sendMessage", "abortRun", "enqueueAttachment"].map(declaration).join("\n"), app);
+  return { app, values };
+}
+
 afterEach(() => vi.useRealTimers());
 describe("Console interaction regressions", () => {
   it("does not activate an older session switch after a newer one finishes", async () => {
@@ -41,6 +62,7 @@ describe("Console interaction regressions", () => {
     const app = createContext({
       sessionId: "initial", sessionNavigation: 0, historyRequest: 0, historyDisplayLimit: 100, lastStreamEpoch: null,
       saveComposerDraft() {}, restoreComposerDraft() {}, disconnectSSE() {}, connectSSE() {}, clearMessages() {},
+      closeFilePreview() {}, modelChangeRequest: 0, thinkingChangeRequest: 0, modelSelectEl: { value: "model" }, thinkingSelectEl: {},
       setRunning() {}, localStorage: { setItem() {} }, SESSION_KEY: "fixture", lastSeq: -1,
       closeOfficePreview: () => ++closes === 1 ? new Promise(resolve => { finishFirstClose = resolve; }) : Promise.resolve(),
       ensureSession: async () => {}, loadSessions: async () => {}, pollContext: async () => {}, showError: vi.fn(),
@@ -96,6 +118,17 @@ describe("Console interaction regressions", () => {
     expect(app.codeEditorFile.sha256).toBe("B");
     expect(app.codeEditorDirty).toBe(true);
   });
+  it("does not replace the editor when a later ordinary preview is requested during loading", async () => {
+    const app = editorFixture();
+    await app.openCodeEditor("A.txt", "A.txt");
+    let complete;
+    app.api = () => new Promise(resolve => { complete = resolve; });
+    const opening = app.openCodeEditor("B.txt", "B.txt");
+    app.previewRequest++;
+    complete({ text: "B", sha256: "B" });
+    await opening;
+    expect(app.codeEditorFile.path).toBe("A.txt");
+  });
   it("keeps the old document named correctly while loading and preserves edits when switching is cancelled", async () => {
     const app = editorFixture();
     await app.openCodeEditor("A.txt", "A.txt");
@@ -122,21 +155,12 @@ describe("Console interaction regressions", () => {
     expect(app.codeEditorDirty).toBe(true);
   });
   it.each([false, true])("preserves another session draft after a delayed send (failure=%s)", async fail => {
-    const values = new Map();
-    const sentAttachment = { name: "first.txt" };
+    const { app } = sendFixture();
+    const sentAttachment = { name: "first.txt", size: 1, dataBase64: "YQ==" };
     const newAttachment = { name: "second.txt" };
     let complete;
-    const app = createContext({
-      sessionId: "first", running: false, pendingAttachments: [sentAttachment],
-      pendingMessageSessions: new Set(), attachmentReads: new Map(), draftAttachments: new Map(),
-      inputEl: { value: "first draft", focus() {} }, errorBarEl: {},
-      localStorage: { getItem: key => values.get(key), setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) },
-      resizeComposerInput() {}, clearActivity() {}, updateActivityOverview() {}, setRunning() {}, setIndicator() {},
-      renderAttachments() {}, showError() {}, loadSessions() {}, redactSensitiveDisplayText: text => text,
-      appendMessage: () => ({ el: { closest: () => ({ remove() {} }) } }),
-      api: path => path.endsWith("/files") ? Promise.resolve({ files: ["uploads/first.txt"] }) : new Promise((resolve, reject) => { complete = () => fail ? reject(new Error("offline")) : resolve({}); }),
-    });
-    runInContext(["saveComposerDraft", "sendMessage"].map(declaration).join("\n"), app);
+    app.pendingAttachments = [sentAttachment];
+    app.api = path => path.endsWith("/files") ? Promise.resolve({ files: ["uploads/first.txt"] }) : path.includes("/requests/") ? Promise.resolve({ status: "unknown" }) : new Promise((resolve, reject) => { complete = () => fail ? reject(new Error("offline")) : resolve({ status: "accepted" }); });
     const sending = app.sendMessage();
     await vi.waitFor(() => expect(typeof complete).toBe("function"));
     app.sessionId = "second";
@@ -146,8 +170,50 @@ describe("Console interaction regressions", () => {
     await sending;
     expect(app.inputEl.value).toBe("second draft");
     expect(app.pendingAttachments).toEqual([newAttachment]);
-    expect(values.get("pi-console-draft:first")).toBe(fail ? "first draft" : undefined);
+    expect(app.submissionRecords("first").map(record => record.originalInput)).toEqual(fail ? ["first draft"] : []);
     expect(app.pendingMessageSessions.size).toBe(0);
+  });
+  it("preserves a failed request independently from the next draft and reuses its UUID on retry", async () => {
+    const { app, values } = sendFixture();
+    let rejectSend; const bodies = [];
+    app.api = (path, options) => path.includes("/requests/") ? Promise.resolve({status:"unknown"}) : (bodies.push(JSON.parse(options.body)), new Promise((_resolve,reject) => { rejectSend=reject; }));
+    const sending=app.sendMessage();
+    app.inputEl.value="next draft"; app.saveComposerDraft();
+    rejectSend(new Error("offline")); await sending;
+    expect(app.inputEl.value).toBe("next draft");
+    expect(values.get("pi-console-draft:first")).toBe("next draft");
+    const record=app.submissionRecords()[0];
+    expect(record.originalInput).toBe("first draft");
+    expect(record.retryAllowed).toBe(true);
+    app.api=async (path,options) => path.includes("/requests/") ? {status:"unknown"} : (bodies.push(JSON.parse(options.body)),{status:"accepted"});
+    await app.retrySubmission(record);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].requestId).toBe(bodies[1].requestId);
+    expect(app.inputEl.value).toBe("next draft");
+  });
+  it("never submits messages after cancelling an upload, even when the upload resolves successfully", async () => {
+    const { app }=sendFixture(); let finish; const paths=[];
+    app.pendingAttachments=[{name:"a.txt",size:1,dataBase64:"YQ=="}];
+    app.api=(path)=>{paths.push(path); return new Promise(resolve=>{finish=resolve;});};
+    const sending=app.sendMessage(); await app.abortRun(); finish({files:["uploads/a.txt"]}); await sending;
+    expect(paths).toEqual(["/api/sessions/first/files"]);
+    expect(app.submissionRecords()[0].phase).toBe("cancelled");
+    expect(app.inputEl.value).toBe("first draft");
+    expect(app.running).toBe(false);
+  });
+  it("does not retry uncertain or accepted requests and blocks restoration until an uncertain outcome is checked", async () => {
+    const { app }=sendFixture();
+    app.api=async ()=>{throw new Error("offline");};
+    await app.sendMessage();
+    const record=app.submissionRecords()[0];
+    expect(record.phase).toBe("uncertain");
+    app.restoreSubmissionDraft(record);
+    expect(app.inputEl.value).toBe("");
+    app.api=vi.fn(async ()=>({status:"accepted"}));
+    await app.retrySubmission(record);
+    expect(app.api).toHaveBeenCalledTimes(1);
+    expect(app.api.mock.calls[0][0]).toContain("/requests/");
+    expect(app.submissionRecords()).toHaveLength(0);
   });
   it("does not send composition Enter but sends a normal Enter", () => {
     const statement = tree.statements.find(node => node.getText(tree).startsWith('inputEl.addEventListener("keydown"'));

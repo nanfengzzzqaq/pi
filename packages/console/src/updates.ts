@@ -172,6 +172,7 @@ export function cleanupStaleUpdateFiles(maxAgeMs = 7 * 24 * 60 * 60 * 1000, upda
 			try {
 				const stats = statSync(file);
 				if (!stats.isFile() || file === pendingFile) continue;
+				if (resolve(file).toLocaleLowerCase("en-US") === pendingSetupKey) continue;
 				const managedInstaller = /^Pi.*-Setup-.*\.exe$/iu.test(name);
 				const obsoleteInstaller = managedInstaller && resolve(file).toLocaleLowerCase("en-US") !== pendingSetupKey;
 				const obsoleteHelper = name === "apply-update.cmd" || name === "apply-update.ps1";

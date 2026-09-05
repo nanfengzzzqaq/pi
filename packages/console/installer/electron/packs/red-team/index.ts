@@ -15,29 +15,25 @@
  */
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import type { PackContext } from "../../src/packs.ts";
 import { DATA_DIR } from "../../src/paths.ts";
+import { createConsoleCredentials } from "../../src/credentials.ts";
+import { awaitInstall, getLocalStatus, promptfooBin, startInstall } from "../../src/redteam.ts";
+import { runToolProcess, ToolProcessError } from "../../src/tool-process.ts";
 
 type TextResult = AgentToolResult<unknown>;
 
-const INSTALL_DIR = join(DATA_DIR, "redteam");
-const VERSION_RECORD = join(INSTALL_DIR, "promptfoo-version.json");
-const DEFAULT_VERSION = "0.122.0";
 const MAX_OUTPUT = 8000;
 
 function ok(text: string): TextResult {
 	return { content: [{ type: "text", text: text || "(无输出)" }], details: {} };
 }
 
-function fail(error: unknown): TextResult {
-	return {
-		content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-		details: {},
-	};
+function fail(error: unknown): never {
+	throw error instanceof Error ? error : new Error(String(error));
 }
 
 function truncate(s: string): string {
@@ -45,47 +41,12 @@ function truncate(s: string): string {
 	return `...(前面已截断)...\n${s.slice(-MAX_OUTPUT)}`;
 }
 
-/** 校验版本号/包名类字符串，防注入（仅允许安全字符） */
-const SAFE_SPEC = /^[@\w.\-/]+$/;
 
 interface ExecResult {
 	stdout: string;
 	stderr: string;
 	code: number | string | null;
 	errorMessage: string;
-}
-
-function exec(
-	file: string,
-	args: string[],
-	options: { cwd: string; timeoutMs: number; env?: Record<string, string>; shell?: boolean },
-): Promise<ExecResult> {
-	// shell 模式（win32 调 npm.cmd）下参数经 cmd.exe 解析，含空格/特殊字符的参数必须加引号
-	const finalArgs = options.shell
-		? args.map((a) => (/[\s&|<>^"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-		: args;
-	return new Promise((resolve) => {
-		execFile(
-			file,
-			finalArgs,
-			{
-				cwd: options.cwd,
-				timeout: options.timeoutMs,
-				shell: options.shell ?? false,
-				env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", ...options.env },
-				windowsHide: true,
-				maxBuffer: 16 * 1024 * 1024,
-			},
-			(error, stdout, stderr) => {
-				resolve({
-					stdout: String(stdout ?? ""),
-					stderr: String(stderr ?? ""),
-					code: error ? ((error as { code?: number | string | null }).code ?? null) : 0,
-					errorMessage: error?.message ?? "",
-				});
-			},
-		);
-	});
 }
 
 function commandFailure(command: string, result: ExecResult): TextResult | null {
@@ -118,48 +79,39 @@ function yamlScalar(value: string): string {
 	return JSON.stringify(value);
 }
 
-function npmCommand(): string {
-	return process.platform === "win32" ? "npm.cmd" : "npm";
+export async function resolveRedteamCredentials(refs: Record<string, string> = {}, authPath = join(DATA_DIR, "agent", "auth.json")): Promise<Record<string, string>> {
+  const keys = await createConsoleCredentials(authPath).apiKeys();
+  const env: Record<string, string> = {};
+  for (const [name, provider] of Object.entries(refs)) {
+    if (!/^[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)$/.test(name) || !/^[a-z0-9][a-z0-9._-]{0,100}$/i.test(provider)) throw new Error("凭据引用格式无效：请填写环境变量名与设置中的服务名");
+    const key = keys[provider];
+    if (!key) throw new Error("请先在设置中配置服务 " + provider + " 的 API Key");
+    env[name] = key;
+  }
+  return env;
 }
 
-/** 定位已安装的 promptfoo CLI 入口（bin 指向的 js 文件） */
-function promptfooBin(): string | null {
-	const pkgPath = join(INSTALL_DIR, "node_modules", "promptfoo", "package.json");
-	if (!existsSync(pkgPath)) return null;
-	try {
-		const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-		const bin = typeof pkg.bin === "string" ? pkg.bin : Object.values(pkg.bin ?? {})[0];
-		if (typeof bin !== "string") return null;
-		const abs = join(INSTALL_DIR, "node_modules", "promptfoo", bin);
-		return existsSync(abs) ? abs : null;
-	} catch {
-		return null;
-	}
+async function runPromptfoo(args: string[], opts: { cwd: string; timeoutMs: number; credentialRefs?: Record<string, string>; env?: Record<string, string>; signal?: AbortSignal }): Promise<ExecResult | null> {
+  opts.signal?.throwIfAborted();
+  const bin = promptfooBin();
+  if (!bin) return null;
+  const credentialEnv = await resolveRedteamCredentials(opts.credentialRefs);
+  const secrets = Object.values(credentialEnv).filter(Boolean);
+  const redact = (text: string) => secrets.reduce((value, secret) => value.split(secret).join("[REDACTED]"), text);
+  try {
+    const output = await runToolProcess(process.execPath, [bin, ...args], { cwd: opts.cwd, timeoutMs: opts.timeoutMs, signal: opts.signal, env: { ...process.env, ELECTRON_RUN_AS_NODE: "1", ...opts.env, ...credentialEnv } });
+    return { stdout: redact(output.stdout), stderr: redact(output.stderr), code: 0, errorMessage: "" };
+  } catch (error) {
+    if (opts.signal?.aborted) throw new Error("红队操作已取消");
+    if (error instanceof ToolProcessError) return { stdout: redact(error.stdout), stderr: redact(error.stderr), code: error.code, errorMessage: redact(error.message) };
+    throw new Error(redact(error instanceof Error ? error.message : String(error)));
+  }
 }
 
-function installedVersion(): string | null {
-	try {
-		const rec = JSON.parse(readFileSync(VERSION_RECORD, "utf8"));
-		return typeof rec.version === "string" ? rec.version : null;
-	} catch {
-		return null;
-	}
-}
-
-/** 跑 promptfoo CLI；未安装返回 null */
-async function runPromptfoo(
-	args: string[],
-	opts: { cwd: string; timeoutMs: number; env?: Record<string, string> },
-): Promise<ExecResult | null> {
-	const bin = promptfooBin();
-	if (!bin) return null;
-	return exec(process.execPath, [bin, ...args], opts);
-}
-
-const ENV_PARAM = Type.Optional(
+const CREDENTIAL_REFS_PARAM = Type.Optional(
 	Type.Record(Type.String(), Type.String(), {
 		description:
-			"注入子进程的环境变量（如 DEEPSEEK_API_KEY、OPENAI_API_KEY、目标系统的 key）。不会写入磁盘。",
+			"凭据引用：环境变量名映射到设置中已配置的服务名，例如 {OPENAI_API_KEY: openai}。只填写服务名，不填写密钥。",
 	}),
 );
 
@@ -180,39 +132,16 @@ export default function definePack(ctx: PackContext) {
 					Type.String({ description: "install 时指定版本号，默认 0.122.0；update 忽略此参数" }),
 				),
 			}),
-			execute: async (_toolCallId, { action, version }) => {
-				if (action === "status") {
-					const bin = promptfooBin();
-					const ver = installedVersion();
-					const npmCheck = await exec(npmCommand(), ["--version"], {
-						cwd: root(),
-						timeoutMs: 15_000,
-						shell: process.platform === "win32",
-					});
-					const lines = [
-						`promptfoo：${bin ? `已安装（版本记录 ${ver ?? "未知"}）` : "未安装"}`,
-						`安装目录：${INSTALL_DIR}`,
-						`npm：${npmCheck.code === 0 ? `可用（v${npmCheck.stdout.trim()}）` : "不可用，安装需要本机有 Node.js 环境"}`,
-					];
-					return ok(lines.join("\n"));
-				}
-				const spec = action === "update" ? "promptfoo@latest" : `promptfoo@${version || DEFAULT_VERSION}`;
-				if (!SAFE_SPEC.test(spec)) return fail(new Error("版本号包含非法字符"));
-				mkdirSync(INSTALL_DIR, { recursive: true });
-				const r = await exec(npmCommand(), ["install", "--prefix", INSTALL_DIR, spec, "--no-fund", "--no-audit"], {
-					cwd: root(),
-					timeoutMs: 15 * 60 * 1000,
-					shell: process.platform === "win32",
-				});
-				if (r.code !== 0 || !promptfooBin()) {
-					return fail(new Error(`安装失败（exit ${r.code}）：\n${truncate(r.stderr || r.stdout)}`));
-				}
-				// 记录实际安装版本
-				const verProbe = await runPromptfoo(["--version"], { cwd: root(), timeoutMs: 30_000 });
-				const actual = verProbe?.stdout.trim().split("\n").pop() || "unknown";
-				writeFileSync(VERSION_RECORD, JSON.stringify({ version: actual, spec, installedAt: new Date().toISOString() }));
-				return ok(`promptfoo 安装完成：${actual}\n位置：${INSTALL_DIR}`);
-			},
+			execute: async (_toolCallId, { action, version }, signal) => {
+        signal?.throwIfAborted();
+        if (action === "status") {
+          const status = await getLocalStatus();
+          return ok("promptfoo：" + (status.installed ? "已安装" : "未安装") + "（" + (status.version ?? "未知") + "）\n安装目录：" + status.path + "\nnpm：" + (status.npmAvailable ? "可用" : "不可用"));
+        }
+        if (!startInstall(action === "update", { signal, version })) throw new Error("红队引擎安装已在进行中，请等待当前任务完成");
+        const progress = await awaitInstall();
+        return ok("promptfoo 安装完成：" + progress.version);
+      },
 		},
 		{
 			name: "redteam_plugins",
@@ -225,18 +154,18 @@ export default function definePack(ctx: PackContext) {
 					}),
 				),
 			}),
-			execute: async (_toolCallId, { kind }) => {
+			execute: async (_toolCallId, { kind }, signal) => {
 				const want = kind ?? "all";
 				const sections: string[] = [];
 				if (want === "plugins" || want === "all") {
-					const r = await runPromptfoo(["redteam", "plugins", "--ids-only"], { cwd: root(), timeoutMs: 60_000 });
+					const r = await runPromptfoo(["redteam", "plugins", "--ids-only"], { cwd: root(), timeoutMs: 60_000, signal });
 					if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 					const failure = commandFailure("读取攻击插件", r);
 					if (failure) return failure;
 					sections.push(`【攻击插件】\n${r.stdout.trim()}`);
 				}
 				if (want === "strategies" || want === "all") {
-					const r = await runPromptfoo(["redteam", "generate", "--help"], { cwd: root(), timeoutMs: 60_000 });
+					const r = await runPromptfoo(["redteam", "generate", "--help"], { cwd: root(), timeoutMs: 60_000, signal });
 					if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 					const failure = commandFailure("读取投递策略", r);
 					if (failure) return failure;
@@ -312,20 +241,20 @@ ${list(selectedStrategies, "    ")}
 		{
 			name: "redteam_generate",
 			label: "生成攻击样本",
-			description: "只生成攻击样本（redteam generate），不执行。适合先人工审查样本质量。需要攻击模型的 API key（通过 env 参数传入）。",
+			description: "只生成攻击样本（redteam generate），不执行。适合先人工审查样本质量。需要攻击模型的 API key（在设置保存，通过 credentialRefs 引用）。",
 			parameters: Type.Object({
 				config: Type.Optional(Type.String({ description: "配置文件名，默认 promptfooconfig.yaml" })),
 				disableRemoteGeneration: Type.Optional(
-					Type.Boolean({ description: "强制攻击生成走本地攻击模型而非 promptfoo 云端，默认 true（数据不出本机）" }),
+					Type.Boolean({ description: "禁用 promptfoo 托管生成，改用配置的攻击模型，默认 true；若该模型是云服务，仍会向其发送请求" }),
 				),
-				env: ENV_PARAM,
+				credentialRefs: CREDENTIAL_REFS_PARAM,
 			}),
-			execute: async (_toolCallId, { config, disableRemoteGeneration, env }) => {
-				const envVars = { ...env };
+			execute: async (_toolCallId, { config, disableRemoteGeneration, credentialRefs }, signal) => {
+				const envVars: Record<string, string> = {};
 				if (disableRemoteGeneration ?? true) envVars.PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = "true";
 				const args = ["redteam", "generate"];
 				if (config) args.push("-c", config);
-				const r = await runPromptfoo(args, { cwd: root(), timeoutMs: 20 * 60 * 1000, env: envVars });
+				const r = await runPromptfoo(args, { cwd: root(), timeoutMs: 20 * 60 * 1000, env: envVars, credentialRefs, signal });
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 				const failure = commandFailure("生成攻击样本", r);
 				if (failure) return failure;
@@ -336,21 +265,22 @@ ${list(selectedStrategies, "    ")}
 			name: "redteam_run",
 			label: "执行红队扫描",
 			description:
-				"完整红队扫描（redteam run）：生成攻击样本并对目标执行，输出通过率摘要。耗时较长（几十分钟级），期间目标系统会收到真实攻击请求。需要攻击模型 key，target 若是云端模型也需对应 key（env 参数传入）。",
+				"完整红队扫描（redteam run）：生成攻击样本并对目标执行，输出通过率摘要。耗时较长（几十分钟级），期间目标系统会收到真实攻击请求。需要攻击模型 key，target 若是云端模型也需对应 key（通过 credentialRefs 引用）。",
 			parameters: Type.Object({
 				config: Type.Optional(Type.String({ description: "配置文件名，默认 promptfooconfig.yaml" })),
 				maxConcurrency: Type.Optional(Type.Number({ description: "并发数，默认 4；目标较弱时调低" })),
 				disableRemoteGeneration: Type.Optional(
-					Type.Boolean({ description: "强制攻击生成走本地攻击模型，默认 true" }),
+					Type.Boolean({ description: "禁用 promptfoo 托管生成，使用配置的攻击模型；云模型仍会收到请求，默认 true" }),
 				),
 				timeoutMinutes: Type.Optional(Type.Number({ description: "超时分钟数，默认 60" })),
-				env: ENV_PARAM,
+				credentialRefs: CREDENTIAL_REFS_PARAM,
 			}),
 			execute: async (
 				_toolCallId,
-				{ config, maxConcurrency, disableRemoteGeneration, timeoutMinutes, env },
+				{ config, maxConcurrency, disableRemoteGeneration, timeoutMinutes, credentialRefs },
+				signal,
 			) => {
-				const envVars = { ...env };
+				const envVars: Record<string, string> = {};
 				if (disableRemoteGeneration ?? true) envVars.PROMPTFOO_DISABLE_REDTEAM_REMOTE_GENERATION = "true";
 				const args = ["redteam", "run"];
 				if (config) args.push("-c", config);
@@ -358,7 +288,7 @@ ${list(selectedStrategies, "    ")}
 				const r = await runPromptfoo(args, {
 					cwd: root(),
 					timeoutMs: (timeoutMinutes ?? 60) * 60 * 1000,
-					env: envVars,
+					env: envVars, credentialRefs, signal,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 				const failure = commandFailure("执行红队扫描", r);
@@ -373,13 +303,13 @@ ${list(selectedStrategies, "    ")}
 			description: "列出最近的评估/红队运行记录（promptfoo list evals），含时间、通过率和结果 ID。",
 			parameters: Type.Object({
 				limit: Type.Optional(Type.Number({ description: "显示最近几条，默认 10" })),
-				env: ENV_PARAM,
+				credentialRefs: CREDENTIAL_REFS_PARAM,
 			}),
-			execute: async (_toolCallId, { limit, env }) => {
+			execute: async (_toolCallId, { limit, credentialRefs }, signal) => {
 				const r = await runPromptfoo(["list", "evals", "-n", String(limit ?? 10)], {
 					cwd: root(),
 					timeoutMs: 60_000,
-					env,
+					credentialRefs, signal,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 				const failure = commandFailure("读取历史评估结果", r);
@@ -398,9 +328,9 @@ ${list(selectedStrategies, "    ")}
 				noCache: Type.Optional(Type.Boolean({ description: "禁用缓存，默认 false" })),
 				maxConcurrency: Type.Optional(Type.Number({ description: "并发数" })),
 				timeoutMinutes: Type.Optional(Type.Number({ description: "超时分钟数，默认 30" })),
-				env: ENV_PARAM,
+				credentialRefs: CREDENTIAL_REFS_PARAM,
 			}),
-			execute: async (_toolCallId, { config, output, noCache, maxConcurrency, timeoutMinutes, env }) => {
+			execute: async (_toolCallId, { config, output, noCache, maxConcurrency, timeoutMinutes, credentialRefs }, signal) => {
 				const args = ["eval", "-c", config];
 				if (output) args.push("-o", output);
 				if (noCache) args.push("--no-cache");
@@ -408,7 +338,7 @@ ${list(selectedStrategies, "    ")}
 				const r = await runPromptfoo(args, {
 					cwd: root(),
 					timeoutMs: (timeoutMinutes ?? 30) * 60 * 1000,
-					env,
+					credentialRefs, signal,
 				});
 				if (!r) return fail(new Error("promptfoo 未安装，请先 redteam_setup install"));
 				const failure = commandFailure("运行模型评估", r);

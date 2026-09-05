@@ -10,6 +10,7 @@ import { statSync } from "node:fs";
 import { basename, dirname, extname, resolve } from "node:path";
 import { promisify } from "node:util";
 import { binaryPath, isBinaryReady } from "./officecli.ts";
+import { terminateToolProcess } from "./tool-process.ts";
 
 const execFileAsync = promisify(execFile);
 const WATCH_START_TIMEOUT_MS = 15_000;
@@ -33,6 +34,9 @@ interface OfficePreviewSession extends OfficePreviewInfo {
 const sessionsById = new Map<string, OfficePreviewSession>();
 const sessionIdsByPath = new Map<string, string>();
 const startsByPath = new Map<string, Promise<OfficePreviewInfo>>();
+const startControllers = new Map<string, AbortController>();
+const previewChildren = new Set<ChildProcessWithoutNullStreams>();
+let stoppingAll = false;
 
 function pathKey(filePath: string): string {
 	const absolute = resolve(filePath);
@@ -61,8 +65,10 @@ export function parseOfficePreviewPort(output: string): number | null {
 	return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : null;
 }
 
-async function startNewPreview(filePath: string, key: string): Promise<OfficePreviewInfo> {
-	if (!(await isBinaryReady())) throw new Error("OfficeCLI 未安装，请先在工具页安装");
+async function startNewPreview(filePath: string, key: string, signal: AbortSignal): Promise<OfficePreviewInfo> {
+	signal.throwIfAborted();
+	if (!(await isBinaryReady(signal))) throw new Error("OfficeCLI 未安装，请先在工具页安装");
+	signal.throwIfAborted();
 
 	const absolute = resolve(filePath);
 	if (!isOfficePreviewPath(absolute)) throw new Error("实时预览仅支持 .docx、.xlsx 和 .pptx 文件");
@@ -72,8 +78,11 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 	const child = spawn(binaryPath(), ["watch", absolute, "--port", "0"], {
 		cwd: dirname(absolute),
 		windowsHide: true,
+		detached: process.platform !== "win32",
 		stdio: "pipe",
 	});
+	previewChildren.add(child);
+	child.once("close", () => previewChildren.delete(child));
 	child.stdout.setEncoding("utf8");
 	child.stderr.setEncoding("utf8");
 
@@ -84,7 +93,8 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 		const timer = setTimeout(() => {
 			if (settled) return;
 			settled = true;
-			child.kill();
+			terminateToolProcess(child);
+			signal.removeEventListener("abort", abort);
 			rejectStart(new Error("OfficeCLI 实时预览启动超时"));
 		}, WATCH_START_TIMEOUT_MS);
 
@@ -94,6 +104,7 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 			if (!error && port !== null) {
 				settled = true;
 				clearTimeout(timer);
+				signal.removeEventListener("abort", abort);
 				child.stdout.off("data", onData);
 				child.stderr.off("data", onData);
 				session = {
@@ -113,6 +124,7 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 			if (error) {
 				settled = true;
 				clearTimeout(timer);
+				signal.removeEventListener("abort", abort);
 				const detail = output.trim();
 				rejectStart(new Error(detail ? `${error.message}\n${detail}` : error.message));
 			}
@@ -122,6 +134,12 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 			output = `${output}${String(chunk)}`.slice(-WATCH_OUTPUT_LIMIT);
 			finish();
 		};
+		const abort = () => {
+			finish(new Error("Office 预览启动已取消"));
+			terminateToolProcess(child);
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		if (signal.aborted) abort();
 
 		child.stdout.on("data", onData);
 		child.stderr.on("data", onData);
@@ -138,6 +156,7 @@ async function startNewPreview(filePath: string, key: string): Promise<OfficePre
 
 /** 启动预览；同一文件已有存活预览时直接复用。 */
 export async function startOfficePreview(filePath: string): Promise<OfficePreviewInfo> {
+	if (stoppingAll) throw new Error("正在关闭 Office 预览，请稍后重试");
 	const key = pathKey(filePath);
 	const existingId = sessionIdsByPath.get(key);
 	const existing = existingId ? sessionsById.get(existingId) : undefined;
@@ -146,7 +165,12 @@ export async function startOfficePreview(filePath: string): Promise<OfficePrevie
 	const pending = startsByPath.get(key);
 	if (pending) return await pending;
 
-	const start = startNewPreview(filePath, key).finally(() => startsByPath.delete(key));
+	const controller = new AbortController();
+	startControllers.set(key, controller);
+	const start = startNewPreview(filePath, key, controller.signal).finally(() => {
+		startsByPath.delete(key);
+		startControllers.delete(key);
+	});
 	startsByPath.set(key, start);
 	return await start;
 }
@@ -166,19 +190,35 @@ export async function stopOfficePreview(id: string): Promise<boolean> {
 	} catch {
 		// 预览进程可能已退出；下面统一做兜底清理。
 	}
-	if (session.child.exitCode === null) session.child.kill();
+	if (session.child.exitCode === null) {
+		const closed = new Promise<void>((resolveClosed) => session.child.once("close", () => resolveClosed()));
+		terminateToolProcess(session.child);
+		await closed;
+	}
 	return true;
 }
 
 export async function stopAllOfficePreviews(): Promise<void> {
-	await Promise.all([...sessionsById.keys()].map((id) => stopOfficePreview(id)));
+	stoppingAll = true;
+	try {
+		const pending = [...startsByPath.values()];
+		const closing = [...previewChildren]
+			.filter((child) => child.exitCode === null)
+			.map((child) => new Promise<void>((resolveClosed) => child.once("close", () => resolveClosed())));
+		for (const controller of startControllers.values()) controller.abort();
+		await Promise.allSettled(pending);
+		await Promise.all([...sessionsById.keys()].map((id) => stopOfficePreview(id)));
+		for (const child of previewChildren) terminateToolProcess(child);
+		await Promise.all(closing);
+	} finally {
+		stoppingAll = false;
+	}
 }
 
 /** 进程退出阶段不能再等待异步命令，只结束仍存活的 watch 子进程。 */
 export function terminateAllOfficePreviewsNow(): void {
-	for (const session of sessionsById.values()) {
-		if (session.child.exitCode === null) session.child.kill();
-	}
+	for (const controller of startControllers.values()) controller.abort();
+	for (const child of previewChildren) terminateToolProcess(child);
 	sessionsById.clear();
 	sessionIdsByPath.clear();
 }

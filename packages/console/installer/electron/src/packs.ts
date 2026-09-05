@@ -5,10 +5,11 @@
  * 核心只认识通用的 activation/toolGroups 字段，不判断 Office 或其他具体业务。
  * 新增能力时把触发词、文件扩展名和工具分组写进 pack.json 即可。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getShellConfig, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { readDurableJson, writeDurableJson } from "./durable-json.ts";
 import { DATA_DIR } from "./paths.ts";
 import { isPrivateBashAvailable, isWindowsPowerShellAvailable } from "./windows-tools.ts";
 
@@ -16,6 +17,7 @@ import { isPrivateBashAvailable, isWindowsPowerShellAvailable } from "./windows-
 export interface PackContext {
 	/** 解析“本次调用所属会话”的工作目录 */
 	getWorkspaceRoot(): string;
+	getSessionId?(): string;
 	/** 兼容旧能力包的元工具；新能力包优先使用 pack.json 的通用激活规则。 */
 	activatePack?: (packName: string) => void;
 }
@@ -130,18 +132,18 @@ function stringArray(value: unknown): string[] {
 		.filter(Boolean);
 }
 
-function readMountedState(): string[] {
-	try {
-		const raw = JSON.parse(readFileSync(MOUNTED_PACKS_FILE, "utf8")) as unknown;
-		return stringArray(raw);
-	} catch {
-		return [];
-	}
+function parseMountedState(value: unknown): string[] {
+	if (!Array.isArray(value) || !value.every((name) => typeof name === "string" && name.trim()))
+		throw new Error("能力启用记录格式无效");
+	return [...new Set(value as string[])];
 }
 
-function persistMountedState(): void {
-	mkdirSync(DATA_DIR, { recursive: true });
-	writeFileSync(MOUNTED_PACKS_FILE, `${JSON.stringify(mountedPackNames, null, "\t")}\n`, "utf8");
+function readMountedState(): string[] {
+	return readDurableJson(MOUNTED_PACKS_FILE, parseMountedState, () => []);
+}
+
+function persistMountedState(next: string[]): void {
+	writeDurableJson(MOUNTED_PACKS_FILE, next, parseMountedState, () => []);
 }
 
 function findPack(name: string): LoadedPack | undefined {
@@ -354,17 +356,30 @@ function selectCoreCapabilities(normalizedText: string): CapabilityMatch[] {
 }
 
 /** 根据会话绑定的助手和本轮文字，在本地选择最小工具组；不请求模型，不消耗 token。 */
-export function selectCapabilities(text: string, enabledPackNames: Iterable<string>): CapabilityMatch[] {
+export function selectCapabilities(
+	text: string,
+	enabledPackNames: Iterable<string>,
+	previousMatches: CapabilityMatch[] = [],
+): CapabilityMatch[] {
 	const normalizedText = text.toLocaleLowerCase("zh-CN");
+	const enabled = new Set(enabledPackNames);
+	const hasExtension = (extension: string): boolean => {
+		let index = normalizedText.indexOf(extension);
+		while (index !== -1) {
+			if (!/[a-z0-9_]/i.test(normalizedText[index + extension.length] ?? "")) return true;
+			index = normalizedText.indexOf(extension, index + 1);
+		}
+		return false;
+	};
 	const matches: CapabilityMatch[] = [];
-	for (const packName of enabledPackNames) {
+	for (const packName of enabled) {
 		const pack = findPack(packName);
 		const activation = pack?.info.activation;
 		if (!pack || !activation) continue;
 		let score = 0;
 		const reasons: string[] = [];
 		for (const extension of activation.extensions) {
-			if (!normalizedText.includes(extension)) continue;
+			if (!hasExtension(extension)) continue;
 			score += 4;
 			reasons.push(`发现文件类型 ${extension}`);
 		}
@@ -387,7 +402,7 @@ export function selectCapabilities(text: string, enabledPackNames: Iterable<stri
 				: fullPackToolNames(packName);
 		let selectedSkillGroups = pack.info.skillGroups.filter(
 			(group) =>
-				group.extensions.some((extension) => normalizedText.includes(extension)) ||
+				group.extensions.some(hasExtension) ||
 				group.keywords.some((keyword) => normalizedText.includes(keyword.toLocaleLowerCase("zh-CN"))),
 		);
 		if (selectedSkillGroups.length === 0) {
@@ -408,6 +423,21 @@ export function selectCapabilities(text: string, enabledPackNames: Iterable<stri
 		});
 	}
 	matches.push(...selectCoreCapabilities(normalizedText));
+	if (
+		matches.length === 0 &&
+		/^(?:继续|接着|然后|再试|重试|刚才|上一步|把它|这个页面|这个文件|点击|保存|continue\b|retry\b)/iu.test(
+			normalizedText.trim(),
+		)
+	) {
+		return previousMatches
+			.filter((match) => enabled.has(match.packName))
+			.map((match) => ({
+				...match,
+				toolNames: [...match.toolNames],
+				skillNames: [...match.skillNames],
+				reasons: [...match.reasons, "延续当前任务"],
+			}));
+	}
 	return matches;
 }
 
@@ -434,15 +464,17 @@ export function isMountedPack(name: string): boolean {
 export function mountPack(name: string): boolean {
 	const pack = findPack(name);
 	if (!pack || mountedPackNames.includes(name)) return false;
-	mountedPackNames.push(name);
-	persistMountedState();
+	const next = [...mountedPackNames, name];
+	persistMountedState(next);
+	mountedPackNames = next;
 	return true;
 }
 
 export function unmountPack(name: string): boolean {
 	if (!mountedPackNames.includes(name)) return false;
-	mountedPackNames = mountedPackNames.filter((value) => value !== name);
-	persistMountedState();
+	const next = mountedPackNames.filter((value) => value !== name);
+	persistMountedState(next);
+	mountedPackNames = next;
 	return true;
 }
 

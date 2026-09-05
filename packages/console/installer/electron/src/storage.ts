@@ -12,6 +12,7 @@ import {
 	readdirSync,
 	readFileSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	rmdirSync,
 	rmSync,
@@ -19,7 +20,8 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { readDurableJson, writeDurableJson } from "./durable-json.ts";
 import { DATA_DIR, STORAGE_CONFIG_FILE } from "./paths.ts";
 
 export interface StorageMigrationResult {
@@ -38,6 +40,14 @@ function containsPath(parent: string, child: string): boolean {
 	const root = comparable(parent);
 	const candidate = comparable(child);
 	return candidate === root || candidate.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
+export function canonicalDestination(path: string): string {
+	const absolute = resolve(path);
+	if (existsSync(absolute)) return realpathSync(absolute);
+	const parent = dirname(absolute);
+	if (parent === absolute) throw new Error("目标目录无法解析");
+	return join(canonicalDestination(parent), basename(absolute));
 }
 
 /** File verification uses a fixed amount of memory even for large archives and session files. */
@@ -78,7 +88,7 @@ function verifyCopiedFile(source: string, destination: string): void {
 	}
 }
 
-function copyDirectory(source: string, destination: string, skipUpdateCache = false): number {
+export function copyVerifiedDirectory(source: string, destination: string, skipUpdateCache = false): number {
 	mkdirSync(destination, { recursive: true });
 	let copied = 0;
 	for (const entry of readdirSync(source, { withFileTypes: true })) {
@@ -86,7 +96,7 @@ function copyDirectory(source: string, destination: string, skipUpdateCache = fa
 		if (skipUpdateCache && entry.name === "update") continue;
 		const from = join(source, entry.name);
 		const to = join(destination, entry.name);
-		if (entry.isDirectory()) copied += copyDirectory(from, to);
+		if (entry.isDirectory()) copied += copyVerifiedDirectory(from, to);
 		else if (entry.isFile()) {
 			copyFileSync(from, to);
 			verifyCopiedFile(from, to);
@@ -94,6 +104,36 @@ function copyDirectory(source: string, destination: string, skipUpdateCache = fa
 		} else throw new Error(`数据目录包含不支持迁移的链接或特殊文件：${entry.name}`);
 	}
 	return copied;
+}
+
+function parsePreviousRoots(value: unknown): { roots: string[] } {
+	if (
+		!value ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		!("roots" in value) ||
+		!Array.isArray(value.roots) ||
+		value.roots.some((root) => typeof root !== "string" || !isAbsolute(root))
+	)
+		throw new Error("迁移映射格式无效");
+	return { roots: value.roots as string[] };
+}
+
+/** Map only absolute references previously inside a verified data root. */
+export function resolveMigratedDataPath(path: string, dataDir = DATA_DIR): string {
+	if (!isAbsolute(path)) return path;
+	const roots = readDurableJson(join(dataDir, "previous-data-roots.json"), parsePreviousRoots, () => ({
+		roots: [],
+	})).roots;
+	const previous = roots.sort((a, b) => b.length - a.length).find((root) => containsPath(root, path));
+	return previous
+		? resolve(
+				dataDir,
+				resolve(path)
+					.slice(resolve(previous).length)
+					.replace(/^[\\/]+/, ""),
+			)
+		: path;
 }
 
 function rewritePath(value: unknown, source: string, destination: string): unknown {
@@ -146,8 +186,8 @@ export function migrateDataDirectory(
 	sourcePath = DATA_DIR,
 	configFile = STORAGE_CONFIG_FILE,
 ): StorageMigrationResult {
-	const source = resolve(sourcePath);
-	const destination = resolve(targetPath.trim());
+	const source = existsSync(sourcePath) ? realpathSync(sourcePath) : resolve(sourcePath);
+	const destination = canonicalDestination(targetPath.trim());
 	if (!targetPath.trim()) throw new Error("请选择新的 Agent 数据目录");
 	if (comparable(source) === comparable(destination)) {
 		return { path: destination, previousPath: source, copiedFiles: 0, restartRequired: false };
@@ -164,17 +204,37 @@ export function migrateDataDirectory(
 		throw new Error("数据位置配置必须保存在新旧数据目录之外");
 	for (const name of ["sessions-index.json", "workspace.json"]) {
 		const path = join(source, name);
-		if (existsSync(path)) JSON.parse(readFileSync(path, "utf8"));
+		if (existsSync(path)) {
+			const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+			if (!value || typeof value !== "object" || Array.isArray(value))
+				throw new Error(`迁移元数据格式无效：${name}`);
+			if (name === "workspace.json" && !("path" in value && (value.path === null || typeof value.path === "string")))
+				throw new Error("工作区元数据格式无效");
+			if (
+				name === "sessions-index.json" &&
+				Object.values(value).some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry))
+			)
+				throw new Error("会话元数据格式无效");
+		}
 	}
 	mkdirSync(dirname(destination), { recursive: true });
 	const stage = join(dirname(destination), `.pi-migration-${randomUUID()}`);
 	let installed = false;
 	try {
-		const copiedFiles = copyDirectory(source, stage, true);
+		const copiedFiles = copyVerifiedDirectory(source, stage, true);
 		// Rewrite to the final destination, not the temporary staging directory.
 		rewriteJsonFile(join(stage, "sessions-index.json"), source, destination);
 		rewriteJsonFile(join(stage, "sessions-index.json.bak"), source, destination);
 		rewriteJsonFile(join(stage, "workspace.json"), source, destination);
+		const previous = readDurableJson(join(source, "previous-data-roots.json"), parsePreviousRoots, () => ({
+			roots: [],
+		}));
+		writeDurableJson(
+			join(stage, "previous-data-roots.json"),
+			{ roots: [...new Set([...previous.roots, source])] },
+			parsePreviousRoots,
+			() => ({ roots: [] }),
+		);
 		// rmdir is intentionally non-recursive: files created during copying prevent the switch.
 		if (existsSync(destination)) rmdirSync(destination);
 		renameSync(stage, destination);

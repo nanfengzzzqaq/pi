@@ -1,14 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("electron", () => ({
-	WebContentsView: class {},
-	session: {
-		fromPartition: () => ({ on: () => {} }),
-	},
-}));
-
-import { AgentBrowserController } from "../installer/electron/browser-controller.js";
+import { AgentBrowserController } from "./browser-controller-fixture.js";
 
 function fakeWebContents(getUrl) {
 	const contents = new EventEmitter();

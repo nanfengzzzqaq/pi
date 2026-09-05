@@ -48,6 +48,9 @@
 			"description": "新建文档、批量生成、导入数据或合并模板",
 			"tools": [
 				"office_create",
+				"office_view",
+				"office_get",
+				"office_query",
 				"office_add",
 				"office_set",
 				"office_batch",

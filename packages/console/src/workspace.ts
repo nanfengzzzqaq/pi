@@ -1,123 +1,101 @@
-/**
- * 工作区设置：用户可自行指定会话的工作目录（Agent 读写文件的根）。
- *
- * - 持久化到 <DATA_DIR>/workspace.json
- * - 设置了工作区后：新会话的 cwd = 工作区目录（多会话共享同一工作区），
- *   文件管理器的浏览根也包含工作区
- * - 未设置时回退默认：<DATA_DIR>/workspaces/<sessionId>
- * - 切换工作区时，把旧活动目录（旧自定义工作区 + 默认 workspaces 内容）
- *   递归合并到新工作区，避免"文件落在 C 盘"式的错位
- */
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+/** Selecting a workspace never moves files. Copying requires a separate, current preview. */
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { readDurableJson, writeDurableJson } from "./durable-json.ts";
 import { DATA_DIR } from "./paths.ts";
+import { canonicalDestination, copyVerifiedDirectory } from "./storage.ts";
 
 const WORKSPACE_FILE = join(DATA_DIR, "workspace.json");
-
+function parseWorkspace(value: unknown): { path: string | null } {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("工作区配置格式无效");
+	const entry = value as { path?: unknown };
+	if (entry.path !== null && (typeof entry.path !== "string" || !entry.path.trim()))
+		throw new Error("工作区配置格式无效");
+	return { path: entry.path as string | null };
+}
 export function getWorkspacePath(): string | null {
-	try {
-		const raw = JSON.parse(readFileSync(WORKSPACE_FILE, "utf8")) as { path?: unknown };
-		if (typeof raw?.path === "string" && raw.path.trim()) return raw.path;
-	} catch {
-		/* 不存在或损坏 */
-	}
-	return null;
+	return readDurableJson(WORKSPACE_FILE, parseWorkspace, () => ({ path: null })).path;
 }
-
-/** 递归合并 src 到 dest：目录逐项拷贝，目标已存在的同名文件保留目标侧 */
-function mergeDir(src: string, dest: string): number {
-	let migrated = 0;
-	if (!existsSync(dest)) mkdirSync(dest, { recursive: true });
-	for (const entry of readdirSync(src, { withFileTypes: true })) {
-		const from = join(src, entry.name);
-		const to = join(dest, entry.name);
-		try {
-			if (entry.isDirectory()) {
-				migrated += mergeDir(from, to);
-			} else if (!existsSync(to)) {
-				copyFileSync(from, to);
-				migrated++;
-			}
-		} catch {
-			/* 单个文件失败不阻断整体迁移 */
-		}
-	}
-	return migrated;
-}
-
-/**
- * 默认 workspaces 源的迁移：把每个会话子目录的**内容**平铺合并到目标根，
- * 不保留 UUID 目录层（避免迁移后文件埋在 workspaces/<uuid>/ 子目录里）。
- * 目标已有同名目录时改为合并进该目录。
- */
-function mergeWorkspacesFlat(src: string, dest: string): number {
-	let migrated = 0;
-	for (const entry of readdirSync(src, { withFileTypes: true })) {
-		const from = join(src, entry.name);
-		const to = join(dest, entry.name);
-		try {
-			if (entry.isDirectory()) {
-				if (existsSync(to) && statSync(to).isDirectory()) {
-					migrated += mergeDir(from, to);
-				} else {
-					migrated += mergeDir(from, dest);
-				}
-			} else if (!existsSync(to)) {
-				copyFileSync(from, to);
-				migrated++;
-			}
-		} catch {
-			/* 跳过单个失败项 */
-		}
-	}
-	return migrated;
-}
-
 export interface WorkspaceResult {
 	path: string;
-	/** 迁移的文件数（含目录内文件） */
 	migrated: number;
 }
-
-/**
- * 设置工作区并迁移旧活动目录内容。
- * path 为空串表示清除工作区（回到默认，不迁移）。
- */
 export function setWorkspacePath(path: string): WorkspaceResult {
-	if (!path.trim()) {
-		mkdirSync(DATA_DIR, { recursive: true });
-		writeFileSync(WORKSPACE_FILE, `${JSON.stringify({ path: null }, null, "\t")}\n`, "utf8");
-		return { path: "", migrated: 0 };
-	}
-	const abs = resolve(path.trim());
-	if (!existsSync(abs)) throw new Error(`路径不存在：${abs}`);
-	if (!statSync(abs).isDirectory()) throw new Error(`路径不是目录：${abs}`);
-
-	// 迁移源：旧自定义工作区（保留结构）+ 默认 workspaces（平铺合并，用户在 C 盘留下的文件）
-	const oldCustom = getWorkspacePath();
-	const defaultWorkspaces = join(DATA_DIR, "workspaces");
-	let migrated = 0;
-	if (oldCustom && oldCustom !== abs && existsSync(oldCustom)) {
-		if (abs.startsWith(`${oldCustom}\\`) || abs.startsWith(`${oldCustom}/`)) {
-			/* 目标在旧工作区内部，跳过避免递归复制 */
-		} else {
-			migrated += mergeDir(oldCustom, abs);
-		}
-	}
-	if (existsSync(defaultWorkspaces) && defaultWorkspaces !== abs) {
-		if (abs.startsWith(`${defaultWorkspaces}\\`) || abs.startsWith(`${defaultWorkspaces}/`)) {
-			/* 同上 */
-		} else {
-			migrated += mergeWorkspacesFlat(defaultWorkspaces, abs);
-		}
-	}
-
-	mkdirSync(DATA_DIR, { recursive: true });
-	writeFileSync(WORKSPACE_FILE, `${JSON.stringify({ path: abs }, null, "\t")}\n`, "utf8");
-	return { path: abs, migrated };
+	const selected = path.trim() ? realpathSync(resolve(path.trim())) : null;
+	if (selected && !statSync(selected).isDirectory()) throw new Error("工作区路径不是目录");
+	writeDurableJson(WORKSPACE_FILE, { path: selected }, parseWorkspace, () => ({ path: null }));
+	return { path: selected ?? "", migrated: 0 };
 }
-
 export function workspaceExists(): boolean {
 	const path = getWorkspacePath();
 	return path !== null && existsSync(path);
+}
+
+export interface WorkspaceCopyPreview {
+	source: string;
+	target: string;
+	files: number;
+	totalBytes: number;
+	conflicts: string[];
+	revision: string;
+}
+export function previewWorkspaceCopy(sourcePath: string, targetPath: string): WorkspaceCopyPreview {
+	if (!sourcePath.trim() || !targetPath.trim()) throw new Error("请选择来源和目标目录");
+	const source = realpathSync(resolve(sourcePath));
+	if (!statSync(source).isDirectory()) throw new Error("来源不是目录");
+	const target = canonicalDestination(targetPath);
+	const key = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value);
+	const prefix = (value: string) => (value.endsWith(sep) ? key(value) : `${key(value)}${sep}`);
+	if (key(source) === key(target) || key(source).startsWith(prefix(target)) || key(target).startsWith(prefix(source)))
+		throw new Error("来源与目标不能相同或互相包含");
+	const conflicts = existsSync(target)
+		? statSync(target).isDirectory()
+			? readdirSync(target)
+			: ["目标不是目录"]
+		: [];
+	const entries: string[] = [];
+	let files = 0;
+	let totalBytes = 0;
+	const walk = (directory: string): void => {
+		for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) =>
+			a.name.localeCompare(b.name),
+		)) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				entries.push(JSON.stringify([relative(source, path), "directory"]));
+				walk(path);
+			} else if (entry.isFile()) {
+				const stat = statSync(path);
+				files++;
+				totalBytes += stat.size;
+				entries.push(JSON.stringify([relative(source, path), stat.size, stat.mtimeMs, stat.ctimeMs]));
+			} else throw new Error(`来源含有链接或特殊文件，无法安全复制：${entry.name}`);
+		}
+	};
+	walk(source);
+	const revision = createHash("sha256")
+		.update(JSON.stringify([source, target, entries, conflicts]))
+		.digest("hex");
+	return { source, target, files, totalBytes, conflicts, revision };
+}
+export function copyWorkspaceFiles(sourcePath: string, targetPath: string, expectedRevision: string) {
+	const preview = previewWorkspaceCopy(sourcePath, targetPath);
+	if (!expectedRevision || preview.revision !== expectedRevision) throw new Error("复制来源或目标已变化，请重新预览");
+	if (preview.conflicts.length) throw new Error("目标目录必须为空，已有文件不会覆盖");
+	const stage = join(dirname(preview.target), `.pi-workspace-copy-${randomUUID()}`);
+	let installed = false;
+	try {
+		mkdirSync(dirname(preview.target), { recursive: true });
+		mkdirSync(stage);
+		const copiedFiles = copyVerifiedDirectory(preview.source, stage);
+		if (previewWorkspaceCopy(sourcePath, targetPath).revision !== expectedRevision)
+			throw new Error("复制期间来源或目标发生变化，请重新预览");
+		if (existsSync(preview.target)) rmdirSync(preview.target);
+		renameSync(stage, preview.target);
+		installed = true;
+		return { source: preview.source, target: preview.target, copiedFiles };
+	} finally {
+		if (!installed && existsSync(stage)) rmSync(stage, { recursive: true });
+	}
 }

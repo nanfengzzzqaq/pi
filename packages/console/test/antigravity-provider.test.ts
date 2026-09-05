@@ -127,17 +127,47 @@ describe("bundled Antigravity provider", () => {
 			await runtime.refresh({ allowNetwork: false, providers: ["antigravity"] });
 			expect(runtime.getModels("antigravity").every((model) => model.id.startsWith("gemini-"))).toBe(true);
 			expect(fetchMock).not.toHaveBeenCalled();
-			const refresh = createAntigravityModelRefresher(runtime);
-			expect(await refresh()).toBeGreaterThan(5);
+			const refresh = createAntigravityModelRefresher(runtime, join(directory, "console-catalog.json"));
+			expect(await refresh()).toBe(4);
 			expect(fetchMock).toHaveBeenCalled();
 			const models = runtime.getModels("antigravity").map((model) => model.id);
 			expect(models).toEqual(
 				expect.arrayContaining(["gemini-3.5-flash", "claude-sonnet-4-6", "claude-opus-4-6", "gpt-oss-120b"]),
 			);
-			expect(readFileSync(join(directory, "catalog.json"), "utf8")).toContain("gpt-oss-120b");
+			expect(readFileSync(join(directory, "console-catalog.json"), "utf8")).toContain("gpt-oss-120b");
+			expect(models).not.toContain("gemini-3.8-flash");
+			expect(refresh.status()).toMatchObject({
+				source: "discovered",
+				refreshStatus: "success",
+				discoveredModelIds: expect.arrayContaining(models),
+			});
 			fetchMock.mockRejectedValue(new Error("offline"));
-			await refresh();
+			await expect(refresh()).rejects.toThrow("模型目录刷新未完成");
+			expect(refresh.status().refreshStatus).toBe("failed");
 			expect(runtime.getModels("antigravity").map((model) => model.id)).toEqual(models);
+			const callsBeforeReload = fetchMock.mock.calls.length;
+			const nextLoader = new RoutedSkillResourceLoader({
+				cwd: directory,
+				agentDir: directory,
+				settingsManager: SettingsManager.inMemory(),
+				additionalExtensionPaths: isolatedAdapter(directory, true),
+			});
+			await nextLoader.reload();
+			const nextSession = await createAgentSession({
+				cwd: directory,
+				agentDir: directory,
+				modelRuntime: runtime,
+				resourceLoader: nextLoader,
+				settingsManager: SettingsManager.inMemory(),
+				sessionManager: SessionManager.inMemory(directory),
+			});
+			try {
+				refresh.initialize();
+				expect(runtime.getModels("antigravity").map((model) => model.id)).toEqual(models);
+				expect(fetchMock.mock.calls.length).toBe(callsBeforeReload);
+			} finally {
+				nextSession.session.dispose();
+			}
 			expect(runtime.isUsingOAuth("openai-codex")).toBe(true);
 		} finally {
 			session.dispose();

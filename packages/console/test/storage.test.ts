@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { migrateDataDirectory } from "../src/storage.ts";
+import { migrateDataDirectory, resolveMigratedDataPath } from "../src/storage.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fileSystem>();
@@ -93,6 +93,8 @@ describe("Agent 数据目录迁移", () => {
 		const rename = vi.mocked(fileSystem.renameSync).getMockImplementation()!;
 		vi.mocked(fileSystem.renameSync)
 			.mockImplementationOnce(rename)
+			.mockImplementationOnce(rename)
+			.mockImplementationOnce(rename)
 			.mockImplementationOnce(() => {
 				throw new Error("pointer is locked");
 			});
@@ -162,6 +164,12 @@ describe("Agent 数据目录迁移", () => {
 		expect(result.copiedFiles).toBe(2);
 		expect(index.one.cwd).toBe(join(destination, "workspaces", "one"));
 		expect(index.one.sessionFile).toBe(join(destination, "sessions", "one.jsonl"));
+		expect(resolveMigratedDataPath(join(source, "sessions", "one.jsonl"), destination)).toBe(
+			join(destination, "sessions", "one.jsonl"),
+		);
+		expect(resolveMigratedDataPath(join(root, "old-data-neighbor", "a.txt"), destination)).toBe(
+			join(root, "old-data-neighbor", "a.txt"),
+		);
 		expect(JSON.parse(readFileSync(config, "utf8"))).toEqual({ dataDir: destination });
 	});
 

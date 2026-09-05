@@ -23,6 +23,13 @@ function fakeBrowser(calls: string[], url = "https://example.com"): AgentBrowser
 		status: "网页已加载",
 	};
 	return {
+		runWithSession: async (context, operation) => {
+			context.signal?.throwIfAborted();
+			calls.push(`download:${context.workspace}`);
+			return operation();
+		},
+		claimSession: () => state,
+		takeUserControl: () => state,
 		setDownloadDirectory: (path) => calls.push(`download:${path}`),
 		open: async () => state,
 		hide: () => ({ ...state, open: false }),
@@ -429,8 +436,8 @@ describe("客户端浏览器工具", () => {
 		const packaged = readFileSync(join(import.meta.dirname, "..", "installer", "electron", "web", "app.js"), "utf8");
 		expect(source).toBe(packaged);
 		expect(source).toContain("function redactSensitiveDisplayText(value)");
-		expect(source).toContain("redactSensitiveDisplayText(text ||");
-		expect(source).toContain("attachmentsToSend.length");
+		expect(source).toContain("redactSensitiveDisplayText(record.text ||");
+		expect(source).toContain("record.attachmentCount");
 		expect(source).toContain("redactSensitiveDisplayText(\n\t\t\t\t\titem.text");
 	});
 

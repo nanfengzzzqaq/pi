@@ -1,5 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readDurableJson, writeDurableJson } from "./durable-json.ts";
 
 const FILE_VERSION = 2;
 const LEGACY_FILE_VERSION = 1;
@@ -16,6 +15,7 @@ export interface CustomModelDefinition {
 	maxTokens: number;
 	vision: boolean;
 	reasoning: boolean;
+	authMode?: "api_key" | "none";
 }
 
 interface CustomModelsFile {
@@ -31,6 +31,7 @@ export interface CustomModelInput {
 	maxTokens?: unknown;
 	vision?: unknown;
 	reasoning?: unknown;
+	authMode?: unknown;
 }
 
 function requiredText(value: unknown, label: string, maxLength: number): string {
@@ -78,6 +79,8 @@ export function isCustomProviderId(providerId: string): boolean {
 
 export function normalizeCustomModel(providerId: string, input: CustomModelInput): CustomModelDefinition {
 	if (!isCustomProviderId(providerId)) throw new Error("自定义模型服务标识无效");
+	if (input.authMode !== undefined && input.authMode !== "api_key" && input.authMode !== "none")
+		throw new Error("鉴权方式无效");
 	const contextWindow = positiveInteger(input.contextWindow, "上下文长度", DEFAULT_CONTEXT_WINDOW);
 	const maxTokens = positiveInteger(input.maxTokens, "最大输出长度", DEFAULT_MAX_TOKENS);
 	if (contextWindow > 4_000_000) throw new Error("上下文长度不能超过 4000000");
@@ -91,6 +94,7 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 		maxTokens,
 		vision: input.vision === true,
 		reasoning: input.reasoning === true,
+		...(input.authMode === "none" ? { authMode: "none" as const } : {}),
 	};
 }
 
@@ -118,27 +122,32 @@ function isDefinition(value: unknown): value is CustomModelDefinition {
 }
 
 export function loadCustomModels(filePath: string): CustomModelDefinition[] {
-	let raw: unknown;
-	try {
-		raw = JSON.parse(readFileSync(filePath, "utf8"));
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw new Error(`自定义模型配置读取失败：${error instanceof Error ? error.message : String(error)}`);
-	}
+	return readDurableJson(filePath, parseCustomModelsFile, () => ({ version: FILE_VERSION, models: [] })).models;
+}
+
+function parseCustomModelsFile(raw: unknown): CustomModelsFile {
 	if (typeof raw !== "object" || raw === null) throw new Error("自定义模型配置格式无效");
 	const file = raw as Partial<CustomModelsFile>;
 	if (!Array.isArray(file.models)) throw new Error("自定义模型配置格式无效");
-	if (file.version === FILE_VERSION && file.models.every(isDefinition)) return structuredClone(file.models);
+	if (file.version === FILE_VERSION && file.models.every(isDefinition))
+		return {
+			version: FILE_VERSION,
+			models: file.models.map((entry) => normalizeCustomModel(entry.providerId, entry)),
+		};
 	if (file.version === LEGACY_FILE_VERSION && file.models.every(isLegacyDefinition)) {
-		return file.models.map((definition) => ({ ...structuredClone(definition), reasoning: false }));
+		return {
+			version: FILE_VERSION,
+			models: file.models.map((definition) =>
+				normalizeCustomModel(definition.providerId, { ...definition, reasoning: false }),
+			),
+		};
 	}
 	throw new Error("自定义模型配置格式无效");
 }
 
-function writeCustomModels(filePath: string, models: CustomModelDefinition[]): void {
-	mkdirSync(dirname(filePath), { recursive: true });
+export function writeCustomModels(filePath: string, models: CustomModelDefinition[]): void {
 	const file: CustomModelsFile = { version: FILE_VERSION, models };
-	writeFileSync(filePath, `${JSON.stringify(file, null, "\t")}\n`, "utf8");
+	writeDurableJson(filePath, file, parseCustomModelsFile, () => ({ version: FILE_VERSION, models: [] }));
 }
 
 export function saveCustomModel(filePath: string, definition: CustomModelDefinition): void {

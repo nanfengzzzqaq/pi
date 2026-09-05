@@ -1,4 +1,5 @@
 import { WebContentsView, session } from "electron";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -47,15 +48,33 @@ export class AgentBrowserController {
 		this.isOpen = false;
 		this.bounds = { x: 0, y: 0, width: 0, height: 0 };
 		this.status = "浏览器已准备";
+		this.ownerSessionId = null;
+		this.ownershipEpoch = 0;
+		this.pageVersion = 0;
+		this.activeOperation = null;
+		this.operationStorage = new AsyncLocalStorage();
+		this.downloadOwners = new Map();
 		this.downloadDirectory = join(this.dataDir, "browser-downloads");
 		this.browserSession = session.fromPartition(BROWSER_PARTITION, { cache: true });
 		this.configureDownloads();
 	}
 
 	configureDownloads() {
+		this.browserSession.webRequest?.onBeforeRequest((details, callback) => {
+			if (details.webContentsId === this.view?.webContents.id) {
+				const owner = { directory: this.downloadDirectory, sessionId: this.ownerSessionId };
+				const previous = this.downloadOwners.get(details.url);
+				this.downloadOwners.set(details.url, previous === null || (previous && previous.directory !== owner.directory) ? null : owner);
+				if (this.downloadOwners.size > 2000) this.downloadOwners.delete(this.downloadOwners.keys().next().value);
+			}
+			callback({});
+		});
 		this.browserSession.on("will-download", (_event, item) => {
-			mkdirSync(this.downloadDirectory, { recursive: true });
-			const target = uniqueFilePath(this.downloadDirectory, item.getFilename());
+			const urls = item.getURLChain?.() ?? [item.getURL?.()];
+			const owner = urls.map((url) => this.downloadOwners.get(url)).find((value) => value !== undefined);
+			if (!owner) { item.cancel(); this.status = "下载来源无法确定，请在目标对话中重新下载"; this.emitState(); return; }
+			mkdirSync(owner.directory, { recursive: true });
+			const target = uniqueFilePath(owner.directory, item.getFilename());
 			item.setSavePath(target);
 			this.status = `正在下载：${item.getFilename()}`;
 			this.emitState();
@@ -64,6 +83,61 @@ export class AgentBrowserController {
 				this.emitState(state === "completed" ? { downloadPath: target } : {});
 			});
 		});
+	}
+
+	claimSession(sessionId, workspace) {
+		if (typeof sessionId !== "string" || !sessionId.trim() || typeof workspace !== "string" || !workspace.trim()) throw new Error("缺少浏览器会话信息");
+		this.activeOperation?.controller.abort();
+		this.ownerSessionId = sessionId;
+		this.downloadDirectory = workspace;
+		this.ownershipEpoch++;
+		this.pageVersion++;
+		return this.emitState();
+	}
+
+	takeUserControl() {
+		this.activeOperation?.controller.abort();
+		this.ownerSessionId = "user";
+		this.downloadDirectory = join(this.dataDir, "browser-downloads");
+		this.ownershipEpoch++;
+		this.pageVersion++;
+		return this.emitState();
+	}
+
+	async runWithSession(context, operation) {
+		context.signal?.throwIfAborted();
+		if (this.ownerSessionId === null) this.claimSession(context.sessionId, context.workspace);
+		if (this.ownerSessionId !== context.sessionId) throw new Error("浏览器由其他对话或用户控制，请在浏览器面板选择“在此对话接管”后重试");
+		if (this.activeOperation) throw new Error("浏览器操作仍在结束，请稍后重试");
+		const controller = new AbortController();
+		const signal = context.signal ? AbortSignal.any([context.signal, controller.signal]) : controller.signal;
+		this.activeOperation = { ...context, controller, signal, epoch: this.ownershipEpoch, version: this.pageVersion };
+		try {
+			this.assertOperation();
+			const result = await this.operationStorage.run(this.activeOperation, operation);
+			signal.throwIfAborted();
+			if (this.ownershipEpoch !== this.activeOperation.epoch) throw new Error("浏览器已交接，旧操作已停止");
+			return result;
+		} finally { this.activeOperation = null; }
+	}
+
+	assertOperation() {
+		const operation = this.operationStorage?.getStore();
+		if (!operation) return;
+		operation.signal.throwIfAborted();
+		if (operation.epoch !== this.ownershipEpoch || (!operation.allowNavigation && operation.version !== this.pageVersion)) throw new Error("浏览器页面或归属已变化，请重新获取页面快照");
+	}
+
+	async pause(milliseconds) {
+		this.assertOperation();
+		const signal = this.operationStorage?.getStore()?.signal;
+		await new Promise((resolvePause, rejectPause) => {
+			const abort = () => { clearTimeout(timer); rejectPause(new Error("浏览器操作已取消")); };
+			const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolvePause(); }, milliseconds);
+			signal?.addEventListener("abort", abort, { once: true });
+			if (signal?.aborted) abort();
+		});
+		this.assertOperation();
 	}
 
 	setDownloadDirectory(path) {
@@ -88,6 +162,10 @@ export class AgentBrowserController {
 		view.setBounds(this.bounds);
 		view.setVisible(this.isOpen);
 		const contents = view.webContents;
+		contents.on("did-start-navigation", (_event, _url, _inPlace, mainFrame) => {
+			if (mainFrame) { this.pageVersion++; this.emitState(); }
+		});
+		contents.on("before-input-event", () => { this.takeUserControl(); });
 		contents.setWindowOpenHandler(({ url }) => {
 			if (/^https?:\/\//i.test(url)) void contents.loadURL(url);
 			return { action: "deny" };
@@ -125,6 +203,8 @@ export class AgentBrowserController {
 		const contents = this.view && !this.view.webContents.isDestroyed() ? this.view.webContents : null;
 		const rawUrl = contents?.getURL() || "";
 		return {
+			ownerSessionId: this.ownerSessionId,
+			pageVersion: this.pageVersion,
 			open: this.isOpen,
 			url: rawUrl === EMPTY_PAGE ? "" : redactSensitiveUrl(rawUrl),
 			title: redactSensitiveText(cleanText(contents?.getTitle())),
@@ -166,6 +246,7 @@ export class AgentBrowserController {
 	}
 
 	async navigate(url) {
+		this.assertOperation();
 		const view = this.ensureView();
 		this.isOpen = true;
 		view.setVisible(true);
@@ -209,6 +290,7 @@ export class AgentBrowserController {
 	async pickElement() {
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		this.status = "请选择网页元素（browser_pick）";
 		this.emitState();
 		const picked = await view.webContents.executeJavaScript(`new Promise((resolve) => {
@@ -279,8 +361,10 @@ export class AgentBrowserController {
 	}
 
 	async snapshot(options) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		this.status = "正在获取页面状态（browser_snapshot）";
 		this.emitState();
 		const requested = typeof options === "number" ? { maxChars: options } : options ?? {};
@@ -491,6 +575,7 @@ export class AgentBrowserController {
 	}
 
 	async findAndRun(target, action) {
+		this.assertOperation();
 		const view = this.ensureView();
 		const actionToken = randomUUID();
 		const encodedTarget = JSON.stringify(target ?? {});
@@ -560,7 +645,11 @@ export class AgentBrowserController {
 					return candidates;
 				};
 				const occurrenceIndex = (locator) => Math.max(0, (Number(locator?.occurrence) || 1) - 1);
-				const resolveLocator = (locator, bases = roots) => locatorCandidates(locator, bases)[occurrenceIndex(locator)] || null;
+				const resolveLocator = (locator, bases = roots) => {
+					const matches = locatorCandidates(locator, bases);
+					if (matches.length > 1 && !locator?.occurrence) throw new Error('目标不唯一，请提供 ref、occurrence 或更精确的范围');
+					return matches[occurrenceIndex(locator)] || null;
+				};
 				const localScopeSelector = '[role="dialog"],[aria-modal="true"],[role="row"],tr,li,form,section,article,[class*="drawer"],[class*="modal"],[class*="item"],[class*="card"],[class*="detail"],[class*="field"],[class*="form-item"],[data-testid],[data-test]';
 				const overlayScopeSelector = '[role="dialog"],[aria-modal="true"],[class*="drawer"],[class*="modal"]';
 				const hasLocalScope = (candidate, wanted, boundary) => {
@@ -598,6 +687,7 @@ export class AgentBrowserController {
 					candidates = candidates.filter((candidate) => hasLocalScope(candidate, scopeTexts, withinElement));
 				}
 				let element = candidates[occurrenceIndex(target)] || null;
+				if (candidates.length > 1 && !target.occurrence) throw new Error('目标不唯一，请提供 ref、occurrence 或更精确的范围');
 				if (!element) throw new Error("没有找到目标元素，请先调用 browser_snapshot 获取最新 ref");
 
 				if (action.kind === 'click' || action.kind === 'hover') {
@@ -673,6 +763,7 @@ export class AgentBrowserController {
 				return { ok: false, error: error?.message || String(error) };
 			}
 		})()`, true);
+		this.assertOperation();
 		if (!response?.ok) throw new Error(response?.error || "页面操作失败");
 		if (response.pointer) {
 			const originalPoint = { x: response.pointer.x, y: response.pointer.y };
@@ -734,6 +825,7 @@ export class AgentBrowserController {
 						return { ok: false, error: error?.message || String(error) };
 					}
 				})()`, true);
+				this.assertOperation();
 				if (!verified?.ok) throw new Error(verified?.error || "可信鼠标目标复核失败");
 				return verified;
 			};
@@ -741,7 +833,7 @@ export class AgentBrowserController {
 				let verified = await verifyPointerTarget();
 				const point = verified.point;
 				view.webContents.sendInputEvent({ type: "mouseMove", ...point });
-				await new Promise((resolve) => setTimeout(resolve, response.pointer.kind === "hover" ? 100 : 40));
+				await this.pause(response.pointer.kind === "hover" ? 100 : 40);
 				if (response.pointer.kind === "click") {
 					verified = await verifyPointerTarget();
 					view.webContents.sendInputEvent({ type: "mouseDown", button: "left", clickCount: 1, ...point });
@@ -763,7 +855,9 @@ export class AgentBrowserController {
 	}
 
 	async click(target) {
+		this.assertOperation();
 		await this.open();
+		this.assertOperation();
 		this.status = "正在点击页面元素（browser_click）";
 		this.emitState();
 		const output = await this.findAndRun(target, { kind: "click" });
@@ -773,7 +867,9 @@ export class AgentBrowserController {
 	}
 
 	async hover(target) {
+		this.assertOperation();
 		await this.open();
+		this.assertOperation();
 		this.status = "正在悬浮页面元素（browser_hover）";
 		this.emitState();
 		const output = await this.findAndRun(target, { kind: "hover" });
@@ -783,7 +879,9 @@ export class AgentBrowserController {
 	}
 
 	async type(target, value, pressEnter, commit) {
+		this.assertOperation();
 		await this.open();
+		this.assertOperation();
 		this.status = "正在输入页面内容（browser_type）";
 		this.emitState();
 		const output = await this.findAndRun(target, { kind: "type", value, pressEnter, commit });
@@ -798,8 +896,10 @@ export class AgentBrowserController {
 	 * files: [{ name, mimeType, dataBase64 }]
 	 */
 	async uploadFiles(files, target, allowedOrigin) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		this.status = `正在上传 ${files.length} 个附件（browser_upload）`;
 		this.emitState();
 		const webContents = view.webContents;
@@ -836,6 +936,7 @@ export class AgentBrowserController {
 		};
 		webContents.on("did-start-navigation", onNavigation);
 		const assertSameDocument = () => {
+			this.assertOperation();
 			if (navigationStarted || webContents.isDestroyed() || webContents.getURL() !== startUrl) {
 				throw new Error("附件上传期间页面发生导航，已中止并清理待上传数据");
 			}
@@ -1090,8 +1191,10 @@ export class AgentBrowserController {
 	}
 
 	async scroll(direction, amount) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		const pixels = Math.max(100, Math.min(Number(amount) || 700, 5000));
 		const x = direction === "left" ? -pixels : direction === "right" ? pixels : 0;
 		const y = direction === "up" ? -pixels : direction === "down" ? pixels : 0;
@@ -1117,8 +1220,10 @@ export class AgentBrowserController {
 	}
 
 	async extract(selector, maxChars) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		const limit = Math.max(500, Math.min(Number(maxChars) || 8000, 20000));
 		const encodedSelector = JSON.stringify(selector || "");
 		const extracted = await view.webContents.executeJavaScript(`(() => {
@@ -1136,8 +1241,10 @@ export class AgentBrowserController {
 	}
 
 	async screenshot(path) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		const image = await view.webContents.capturePage();
 		writeFileSync(path, image.toPNG());
 		this.status = `网页截图已保存：${path}`;
@@ -1146,15 +1253,17 @@ export class AgentBrowserController {
 	}
 
 	async wait(milliseconds, text) {
+		this.assertOperation();
 		const view = this.ensureView();
 		await this.open();
+		this.assertOperation();
 		const timeout = Math.max(100, Math.min(Number(milliseconds) || 2000, 30000));
 		this.status = text ? `正在等待网页出现文字：${text}` : `正在等待网页 ${timeout} 毫秒`;
 		this.emitState();
 		const started = Date.now();
 		while (Date.now() - started < timeout) {
 			if (!text) {
-				await new Promise((resolve) => setTimeout(resolve, timeout));
+				await this.pause(timeout);
 				break;
 			}
 			const found = await view.webContents.executeJavaScript(`(document.body?.innerText || '').includes(${JSON.stringify(text)})`);
@@ -1163,7 +1272,7 @@ export class AgentBrowserController {
 				this.emitState();
 				return this.status;
 			}
-			await new Promise((resolve) => setTimeout(resolve, 250));
+			await this.pause(250);
 		}
 		if (text) throw new Error(`等待超时，页面中没有出现：${text}`);
 		this.status = "等待完成";

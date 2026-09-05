@@ -22,6 +22,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+	getAgentBrowserRuntime,
 	isAgentBrowserRuntimeAvailable,
 	redactSensitiveText,
 	vaultSensitiveUrlsInText,
@@ -30,8 +31,9 @@ import { AntigravityOAuthCoordinator } from "./antigravity-oauth.ts";
 import { extractFileReferences } from "./artifacts.ts";
 import { resolveAttachmentImages } from "./attachment-images.ts";
 import {
+	createAttachmentSnapshotResolver,
 	deleteAttachmentSnapshots,
-	resolveAttachmentSnapshots,
+	getAttachmentReference,
 	saveAttachmentSnapshot,
 } from "./attachment-snapshots.ts";
 import { bundledProviderExtensionPaths, createAntigravityModelRefresher } from "./bundled-providers.ts";
@@ -39,11 +41,14 @@ import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
 import { createConsoleCredentials } from "./credentials.ts";
+import { createCustomModelManager, registerCustomModel } from "./custom-model-manager.ts";
 import * as customModels from "./custom-models.ts";
 import { needsEventResync } from "./event-replay.ts";
+import { FILE_LIMITS, MAX_TEXT_REQUEST_BYTES } from "./file-limits.ts";
 import * as fsExplorer from "./fs.ts";
 import { HttpBodyError, readBodyJson } from "./http-body.ts";
 import { isAllowedLoopbackHost, isAllowedRequestOrigin, safeFileHeaders } from "./http-security.ts";
+import { InstallCompletion } from "./install-completion.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
@@ -71,6 +76,7 @@ import {
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
 import * as redteam from "./redteam.ts";
+import { RequestLedger } from "./request-ledger.ts";
 import { readSessionIndexFile, type SessionIndexEntry, writeSessionIndexFile } from "./session-index.ts";
 import {
 	abortTrackedSessionPrompt,
@@ -182,12 +188,16 @@ interface ConsoleSession {
 }
 
 const sessions = new Map<string, ConsoleSession>();
+const requestLedger = new RequestLedger(DATA_DIR, randomUUID());
+const pendingSkillReloads = new Set<string>();
+const installCompletion = new InstallCompletion();
 const restoringSessions = new Map<string, Promise<ConsoleSession | null>>();
 let pendingMutations = 0;
 let storageRestartRequired = false;
 
 function hasActiveDataWork(): boolean {
 	return (
+		installCompletion.busy ||
 		pendingMutations > 1 ||
 		restoringSessions.size > 0 ||
 		[...sessions.values()].some((cs) => cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting) ||
@@ -205,7 +215,7 @@ function hasActiveDataWork(): boolean {
 }
 
 const SENSITIVE_TOOL_FIELD =
-	/^(?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)$/i;
+	/^(?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)$|(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD)$/i;
 
 /**
  * 工具仍接收原始参数；只在 UI/SSE/历史展示边界创建脱敏副本。
@@ -269,6 +279,18 @@ function writeSessionIndex(index: Record<string, SessionIndexEntry>): void {
 	writeSessionIndexFile(SESSION_INDEX_FILE, index);
 }
 
+/** Deletion intent is committed before touching files. Failed cleanup remains retryable. */
+function completeSessionDeletion(sessionId: string): void {
+	const index = readSessionIndex();
+	const entry = index[sessionId];
+	if (!entry?.deletionRequestedAt) return;
+	if (entry.sessionFile && existsSync(entry.sessionFile)) unlinkSync(entry.sessionFile);
+	deleteAttachmentSnapshots(DATA_DIR, sessionId);
+	requestLedger.removeSession(sessionId);
+	delete index[sessionId];
+	writeSessionIndex(index);
+}
+
 function touchSessionIndex(
 	sessionId: string,
 	cwd: string,
@@ -295,17 +317,18 @@ function touchSessionIndex(
  */
 function activatePackForAllSessions(packName: string): boolean {
 	if (!listPacks().some((pack) => pack.name === packName)) return false;
-	const changed = mountPack(packName);
-	for (const cs of sessions.values()) {
-		cs.enabledPacks.add(packName);
-		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
-	}
-	const enabled = mountedPacks();
+	const enabled = [...new Set([...mountedPacks(), packName])];
 	const index = readSessionIndex();
 	for (const entry of Object.values(index)) {
 		entry.enabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...enabled])];
 	}
 	writeSessionIndex(index);
+	const changed = mountPack(packName);
+	for (const cs of sessions.values()) {
+		if (cs.deleting) continue;
+		cs.enabledPacks.add(packName);
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	}
 	return changed;
 }
 
@@ -315,32 +338,60 @@ function activateOfficeCliForAllSessions(): void {
 
 /** 从全部内存会话和持久化索引解除工具包；不会删除工具文件。 */
 function deactivatePackForAllSessions(packName: string): boolean {
-	const changed = unmountPack(packName);
-	for (const cs of sessions.values()) {
-		cs.enabledPacks.delete(packName);
-		cs.activePackTools.delete(packName);
-		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
-	}
 	const index = readSessionIndex();
 	for (const entry of Object.values(index)) {
 		entry.enabledPacks = (entry.enabledPacks ?? mountedPacks()).filter((name) => name !== packName);
 	}
 	writeSessionIndex(index);
+	const changed = unmountPack(packName);
+	for (const cs of sessions.values()) {
+		if (cs.deleting) continue;
+		cs.enabledPacks.delete(packName);
+		cs.activePackTools.delete(packName);
+		cs.session.setActiveToolsByName(effectiveToolNames(cs.enabledPacks, cs.activePackTools));
+	}
 	return changed;
 }
 
-async function reloadInstalledSkillsInSessions(): Promise<number> {
+async function reloadInstalledSkillsInSessions(onlyPending = false): Promise<number> {
 	let reloaded = 0;
 	for (const cs of sessions.values()) {
-		if (cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting) continue;
+		if (onlyPending && !pendingSkillReloads.has(cs.sessionId)) continue;
+		if (cs.deleting) continue;
+		pendingSkillReloads.add(cs.sessionId);
+		if (cs.session.isStreaming || cs.activePrompt || cs.modelChange) continue;
 		try {
-			await cs.session.reload();
+			const change = cs.session.reload();
+			cs.modelChange = change;
+			await change;
+			pendingSkillReloads.delete(cs.sessionId);
 			reloaded += 1;
 		} catch (error) {
 			console.warn(`会话 ${cs.sessionId} 刷新技能失败：${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			cs.modelChange = null;
 		}
 	}
 	return reloaded;
+}
+
+redteam.registerInstallFinalizer(async () => {
+	activatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
+	await reloadInstalledSkillsInSessions();
+});
+officecli.registerInstallFinalizer(async () => {
+	if (!(await officecli.isBinaryReady())) throw new Error("OfficeCLI 安装验证未完成");
+	officecli.ensureBinaryOnProcessPath();
+	activateOfficeCliForAllSessions();
+	await reloadInstalledSkillsInSessions();
+});
+
+try {
+	for (const [id, entry] of Object.entries(readSessionIndex())) {
+		if (entry.deletionRequestedAt) completeSessionDeletion(id);
+	}
+} catch {
+	console.warn("部分会话清理未完成，删除标记已保留；下次启动将重试");
 }
 
 /** 首条 user 消息作为会话标题 */
@@ -371,10 +422,19 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const credentials = createConsoleCredentials(AUTH_FILE);
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE, credentials: credentials.store });
-const refreshAntigravityModels = createAntigravityModelRefresher(modelRuntime);
+const customModelManager = createCustomModelManager(CUSTOM_MODELS_FILE, credentials, modelRuntime);
+const refreshAntigravityModels = createAntigravityModelRefresher(
+	modelRuntime,
+	join(DATA_DIR, "antigravity-console-catalog.json"),
+);
 try {
+	await customModelManager.recover();
 	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
-		modelRuntime.registerProvider(definition.providerId, customModels.toProviderConfig(definition));
+		try {
+			registerCustomModel(modelRuntime, definition);
+		} catch {
+			console.warn(`自定义模型 ${definition.providerId} 暂时不可用，请重新保存配置`);
+		}
 	}
 } catch (error) {
 	console.warn(`自定义模型配置加载失败：${error instanceof Error ? error.message : String(error)}`);
@@ -452,6 +512,7 @@ try {
 		sessionManager: SessionManager.inMemory(warmupCwd),
 	});
 	session.dispose();
+	refreshAntigravityModels.initialize();
 } catch (error) {
 	console.warn(`扩展预热失败（不影响内置 provider）：${error instanceof Error ? error.message : String(error)}`);
 }
@@ -606,35 +667,9 @@ function skillNamesForTurn(text: string, selectedCapabilities: CapabilityMatch[]
 	return [...new Set([...selectedCapabilities.flatMap((match) => match.skillNames), ...requestedSkillNames(text)])];
 }
 
-/**
- * capability_search 是本地确定性路由，不属于 Pi 原生消息；切换会话时按当时的用户消息重新生成，
- * 这样无需再次调用模型，也不会让实时执行过程在历史中消失。
- */
-function historicalCapabilityTrace(
-	session: AgentSession,
-	text: string,
-	timestamp: number,
-	enabledPacks: Set<string>,
-): CapabilityTrace {
-	const selectedCapabilities = selectCapabilities(text, enabledPacks);
-	const selectedTools = new Map<string, Set<string>>();
-	for (const match of selectedCapabilities) selectedTools.set(match.packName, new Set(match.toolNames));
-	const names = effectiveToolNames(enabledPacks, selectedTools);
-	const resourceLoader = session.resourceLoader as RoutedSkillResourceLoader;
-	return {
-		stepId: `history-capability-${timestamp}`,
-		stepName: "capability_search",
-		stepDisplayName: "查找可用能力（capability_search）",
-		enabledCapabilities: packSummaries(enabledPacks),
-		selectedCapabilities,
-		selectedSkills: availableSelectedSkills(resourceLoader, skillNamesForTurn(text, selectedCapabilities)),
-		...toolSnapshot(session, names),
-	};
-}
-
 function prepareTurnCapabilities(cs: ConsoleSession, text: string): CapabilityTrace {
 	cs.activePackTools.clear();
-	const selectedCapabilities = selectCapabilities(text, cs.enabledPacks);
+	const selectedCapabilities = selectCapabilities(text, cs.enabledPacks, cs.lastCapabilityTrace?.selectedCapabilities);
 	for (const match of selectedCapabilities) {
 		cs.activePackTools.set(match.packName, new Set(match.toolNames));
 	}
@@ -691,6 +726,7 @@ async function buildSession(
 	enabledPackNames: Iterable<string>,
 	modelOverride?: SessionModel,
 	sessionFile?: string,
+	consoleSessionId?: string,
 ): Promise<{
 	session: AgentSession;
 	sessionFile: string | undefined;
@@ -739,6 +775,7 @@ async function buildSession(
 			...instantiateWindowsTools({ getWorkspaceRoot: () => cwd }),
 			...instantiatePackTools({
 				getWorkspaceRoot: () => cwd,
+				getSessionId: () => consoleSessionId ?? sessionManager.getSessionId(),
 				activatePack: (packName) => {
 					if (!enabledPacks.has(packName)) return;
 					activePackTools.set(packName, new Set(fullPackToolNames(packName)));
@@ -767,6 +804,7 @@ async function buildSession(
 	}
 
 	const { session, modelFallbackMessage } = await createAgentSession(options);
+	refreshAntigravityModels.initialize();
 	sessionRef = session;
 
 	// 新会话只带原生工具；声明了通用激活规则的能力包等到本轮确实命中才注入。
@@ -783,6 +821,28 @@ async function buildSession(
 
 function subscribeConsoleSession(cs: ConsoleSession): void {
 	cs.session.subscribe((ev) => {
+		// This listener runs before AgentSession persists message_end. Reject the old
+		// env-based redteam contract before it can enter history or tool execution.
+		if (ev.type === "message_end" && ev.message.role === "assistant") {
+			for (const block of ev.message.content) {
+				if (
+					block.type === "toolCall" &&
+					/^(?:redteam_|eval_run$)/.test(block.name) &&
+					block.arguments &&
+					typeof block.arguments === "object" &&
+					block.arguments.env
+				) {
+					block.arguments.env = "[REDACTED: use credentialRefs]";
+				}
+			}
+		}
+		if (ev.type === "message_start" && ev.message.role === "user" && cs.lastCapabilityTrace) {
+			cs.session.sessionManager.appendCustomEntry("console-turn", {
+				userTimestamp: ev.message.timestamp,
+				requestId: cs.activePrompt?.requestId,
+				capabilityTrace: cs.lastCapabilityTrace,
+			});
+		}
 		if (ev.type === "turn_end") cs.lastUsage = (ev.message as { usage?: unknown }).usage ?? null;
 		if (ev.type === "agent_settled") releaseTurnCapabilities(cs);
 		const clientEvent = toClientEvent(ev);
@@ -798,7 +858,7 @@ async function createConsoleSession(
 	const workspacePath = workspace.getWorkspacePath();
 	const cwd = workspacePath ?? join(WORKSPACES_DIR, sessionId);
 	const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
-		await buildSession(cwd, enabledPackNames);
+		await buildSession(cwd, enabledPackNames, undefined, undefined, sessionId);
 
 	const cs: ConsoleSession = {
 		sessionId,
@@ -816,8 +876,13 @@ async function createConsoleSession(
 		activePrompt: null,
 		modelChange: null,
 	};
+	try {
+		touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
+	} catch (error) {
+		session.dispose();
+		throw error;
+	}
 	sessions.set(sessionId, cs);
-	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
 	subscribeConsoleSession(cs);
 
 	// 默认模型解析失败时（如未配置任何 Key），通过 SSE 告知前端
@@ -832,12 +897,12 @@ async function createConsoleSession(
 async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession | null> {
 	const index = readSessionIndex();
 	const entry = index[sessionId];
-	if (!entry) return null;
+	if (!entry || entry.deletionRequestedAt) return null;
 	try {
 		// 新工具模式下，已安装工具对所有会话可用；旧会话原有能力仍保留。
 		const restoredEnabledPacks = [...new Set([...(entry.enabledPacks ?? []), ...mountedPacks()])];
 		const { session, sessionFile, modelFallbackMessage, enabledPacks, activePackTools, resourceLoader } =
-			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile);
+			await buildSession(entry.cwd, restoredEnabledPacks, undefined, entry.sessionFile, sessionId);
 		const cs: ConsoleSession = {
 			sessionId,
 			session,
@@ -854,14 +919,19 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			activePrompt: null,
 			modelChange: null,
 		};
+		try {
+			touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
+		} catch (error) {
+			session.dispose();
+			throw error;
+		}
 		sessions.set(sessionId, cs);
-		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
 		subscribeConsoleSession(cs);
 		if (modelFallbackMessage) bufferAndBroadcast(cs, { type: "error", message: modelFallbackMessage });
 		return cs;
 	} catch (error) {
 		console.warn(`会话 ${sessionId} 恢复失败：${error instanceof Error ? error.message : String(error)}`);
-		return null;
+		throw new Error("会话暂时无法恢复，记录已保留，请重试或检查数据目录");
 	}
 }
 
@@ -888,9 +958,22 @@ interface HistoryItem {
 }
 
 /** 从 session.messages 生成消息快照（user/assistant 文本 + 工具调用记录），供页面刷新恢复 */
-function buildHistory(sessionId: string, session: AgentSession, enabledPacks: Set<string>): HistoryItem[] {
+function buildHistory(sessionId: string, session: AgentSession, start = 0): HistoryItem[] {
 	const items: HistoryItem[] = [];
-	for (const message of session.messages) {
+	const resolveAttachments = createAttachmentSnapshotResolver(DATA_DIR, sessionId);
+	const turnFacts = new Map<number, { requestId?: string; capabilityTrace?: unknown }>();
+	for (const entry of session.sessionManager.getEntries()) {
+		if (
+			entry.type !== "custom" ||
+			entry.customType !== "console-turn" ||
+			!entry.data ||
+			typeof entry.data !== "object"
+		)
+			continue;
+		const data = entry.data as { userTimestamp?: unknown; requestId?: string; capabilityTrace?: unknown };
+		if (typeof data.userTimestamp === "number") turnFacts.set(data.userTimestamp, data);
+	}
+	for (const message of session.messages.slice(start)) {
 		if (message.role === "user") {
 			let text: string;
 			let hasImage = false;
@@ -905,7 +988,7 @@ function buildHistory(sessionId: string, session: AgentSession, enabledPacks: Se
 				text = parts.join("\n");
 			}
 			const parsed = parseUserMessage(text);
-			const messageAttachments = resolveAttachmentSnapshots(DATA_DIR, sessionId, parsed.attachments);
+			const messageAttachments = resolveAttachments(parsed.attachments);
 			if (hasImage && parsed.attachments.length === 0) {
 				parsed.text = `${parsed.text}${parsed.text ? "\n" : ""}[图片]`;
 			}
@@ -915,7 +998,9 @@ function buildHistory(sessionId: string, session: AgentSession, enabledPacks: Se
 					text: redactSensitiveText(parsed.text),
 					attachments: messageAttachments,
 				};
-				item.capabilityTrace = historicalCapabilityTrace(session, text, message.timestamp, enabledPacks);
+				const facts = turnFacts.get(message.timestamp);
+				if (facts?.capabilityTrace) item.capabilityTrace = facts.capabilityTrace;
+				if (facts?.requestId) item.requestId = facts.requestId;
 				items.push(item);
 			}
 		} else if (message.role === "assistant") {
@@ -937,6 +1022,7 @@ function buildHistory(sessionId: string, session: AgentSession, enabledPacks: Se
 				)
 				.filter((call) => call !== undefined);
 			const item: HistoryItem = { role: "assistant", text: redactSensitiveText(text) };
+			item.model = { provider: message.provider, modelId: message.model };
 			if (toolCalls.length > 0) item.toolCalls = toolCalls;
 			item.usage = message.usage;
 			item.timestamp = message.timestamp;
@@ -1194,11 +1280,14 @@ async function buildCapabilityCatalog() {
 		],
 		download: officecli.getDownloadProgress(),
 		redteamDownload: redteam.getInstallProgress(),
-		codeDevelopmentDownload: codeDevelopment.getCodeDevelopmentProgress(),
+		codeDevelopmentDownload: installCompletion.progress(
+			"code-development",
+			codeDevelopment.getCodeDevelopmentProgress(),
+		),
 		toolProgress: Object.fromEntries(
 			(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).map((id) => [
 				id,
-				managedFileTools.getManagedToolProgress(id),
+				installCompletion.progress(id, managedFileTools.getManagedToolProgress(id)),
 			]),
 		),
 	};
@@ -1209,8 +1298,15 @@ async function buildCapabilityCatalog() {
 // ---------------------------------------------------------------------------
 
 /** 枚举全部 provider 的模型（含是否已配置鉴权），供前端模型选择器 */
-function listModels(): Array<{ provider: string; modelId: string; label: string; hasAuth: boolean }> {
-	const items: Array<{ provider: string; modelId: string; label: string; hasAuth: boolean }> = [];
+function listModels(): Array<{
+	provider: string;
+	modelId: string;
+	label: string;
+	hasAuth: boolean;
+	catalogSource?: string;
+}> {
+	const items: Array<{ provider: string; modelId: string; label: string; hasAuth: boolean; catalogSource?: string }> =
+		[];
 	for (const provider of modelRuntime.getProviders()) {
 		const hasAuth = modelRuntime.hasConfiguredAuth(provider.id);
 		for (const model of modelRuntime.getModels(provider.id)) {
@@ -1219,6 +1315,13 @@ function listModels(): Array<{ provider: string; modelId: string; label: string;
 				modelId: model.id,
 				label: `${provider.name ?? provider.id} · ${model.name ?? model.id}`,
 				hasAuth,
+				...(provider.id === "antigravity"
+					? {
+							catalogSource: refreshAntigravityModels.status().discoveredModelIds.includes(model.id)
+								? refreshAntigravityModels.status().source
+								: "fallback",
+						}
+					: {}),
 			});
 		}
 	}
@@ -1237,7 +1340,7 @@ async function listCustomModels() {
 	const keys = await credentials.apiKeys();
 	return customModels.loadCustomModels(CUSTOM_MODELS_FILE).map((definition) => ({
 		...definition,
-		hasKey: Object.hasOwn(keys, definition.providerId),
+		hasKey: definition.authMode !== "none" && Object.hasOwn(keys, definition.providerId),
 	}));
 }
 
@@ -1506,10 +1609,50 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 }
 
 async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pathname: string): Promise<void> {
+	if (req.method === "GET" && pathname === "/api/app/diagnostics") {
+		const index = Object.values(readSessionIndex());
+		const catalog = refreshAntigravityModels.status();
+		const update = updates.getUpdateProgress();
+		res.setHeader("Content-Disposition", 'attachment; filename="pi-diagnostics.json"');
+		sendJson(res, 200, {
+			formatVersion: 1,
+			createdAt: new Date().toISOString(),
+			appVersion: updates.APP_VERSION,
+			platform: process.platform,
+			architecture: process.arch,
+			nodeVersion: process.versions.node,
+			memory: { heapUsedBytes: process.memoryUsage().heapUsed, residentBytes: process.memoryUsage().rss },
+			sessions: {
+				total: index.filter((entry) => !entry.deletionRequestedAt).length,
+				loaded: sessions.size,
+				pendingDeletion: index.filter((entry) => entry.deletionRequestedAt).length,
+				running: [...sessions.values()].filter((cs) => cs.activePrompt || cs.session.isStreaming).length,
+			},
+			credentials: { invalidRecordCount: (await credentials.issues()).length },
+			models: {
+				providerCount: modelRuntime.getProviders().length,
+				antigravity: {
+					source: catalog.source,
+					refreshStatus: catalog.refreshStatus,
+					checkedAt: catalog.checkedAt,
+					discoveredCount: catalog.discoveredModelIds.length,
+				},
+			},
+			tools: {
+				installedPacks: mountedPacks(),
+				installationPending: installCompletion.busy,
+				skillReloadPending: pendingSkillReloads.size,
+			},
+			update: { running: update.running, phase: update.phase },
+			storageRestartRequired,
+		});
+		return;
+	}
 	// GET /api/sessions — 历史会话列表（左侧"对话"栏）
 	if (req.method === "GET" && pathname === "/api/sessions") {
 		const index = readSessionIndex();
 		const list = Object.entries(index)
+			.filter(([, entry]) => !entry.deletionRequestedAt)
 			.map(([id, entry]) => ({
 				id,
 				title: entry.title || "新对话",
@@ -1560,25 +1703,24 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/tools/code-development/install" && req.method === "POST") {
+		if (installCompletion.progress("code-development", codeDevelopment.getCodeDevelopmentProgress()).running) {
+			sendJson(res, 409, { error: "安装仍在进行中" });
+			return;
+		}
 		const started = codeDevelopment.startCodeDevelopmentInstall();
 		if (!started) {
 			sendJson(res, 409, { error: "代码开发插件安装已在进行中" });
 			return;
 		}
-		void (async () => {
-			while (codeDevelopment.getCodeDevelopmentProgress().running) {
-				await new Promise((resolvePromise) => setTimeout(resolvePromise, 750));
-			}
-			if (!codeDevelopment.getCodeDevelopmentProgress().error) {
-				activatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
-				await reloadInstalledSkillsInSessions();
-			}
-		})();
+		installCompletion.start("code-development", codeDevelopment.getCodeDevelopmentProgress, async () => {
+			activatePackForAllSessions(CODE_DEVELOPMENT_PACK_NAME);
+			await reloadInstalledSkillsInSessions();
+		});
 		sendJson(res, 202, { ok: true });
 		return;
 	}
 	if (pathname === "/api/tools/code-development/progress" && req.method === "GET") {
-		sendJson(res, 200, codeDevelopment.getCodeDevelopmentProgress());
+		sendJson(res, 200, installCompletion.progress("code-development", codeDevelopment.getCodeDevelopmentProgress()));
 		return;
 	}
 	if (pathname === "/api/tools/code-development/github" && req.method === "GET") {
@@ -1624,6 +1766,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		if (req.method === "DELETE" && !action) {
+			if (hasActiveDataWork()) {
+				sendJson(res, 409, { error: "请等待任务和安装完成后再卸载开发环境" });
+				return;
+			}
 			sendJson(res, 200, { ok: true, removed: await codeDevelopment.uninstallDeveloperComponent(id) });
 			return;
 		}
@@ -1683,12 +1829,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		// 异步下载，进度通过轮询 /api/officecli/progress 获取
-		void officecli.downloadLatest().then(async () => {
-			if (await officecli.isBinaryReady()) {
-				officecli.ensureBinaryOnProcessPath();
-				activateOfficeCliForAllSessions();
-			}
-		});
+		void officecli.downloadLatest();
 		sendJson(res, 202, { ok: true });
 		return;
 	}
@@ -1704,17 +1845,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		// 异步安装，进度通过轮询 /api/tools/redteam/progress 获取
 		const started = redteam.startInstall(false);
-		if (started) {
-			// 安装成功后把红队包绑定到全部会话（每轮仍按需命中最小工具组）
-			void (async () => {
-				while (redteam.getInstallProgress().running) {
-					await new Promise((resolve) => setTimeout(resolve, 1000));
-				}
-				if (!redteam.getInstallProgress().error) {
-					activatePackForAllSessions(redteam.REDTEAM_PACK_NAME);
-				}
-			})();
-		}
 		sendJson(res, 202, { ok: started });
 		return;
 	}
@@ -1725,23 +1855,26 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	const managedInstallMatch = pathname.match(/^\/api\/tools\/(pdfjs|sevenzip|ocr|libreoffice)\/install$/);
 	if (managedInstallMatch && req.method === "POST") {
 		const id = managedInstallMatch[1] as managedFileTools.ManagedToolId;
+		if (installCompletion.progress(id, managedFileTools.getManagedToolProgress(id)).running) {
+			sendJson(res, 409, { error: "安装仍在进行中" });
+			return;
+		}
 		const started = managedFileTools.startManagedToolInstall(id);
 		if (!started) {
 			sendJson(res, 409, { error: "安装已在进行中" });
 			return;
 		}
-		void (async () => {
-			while (managedFileTools.getManagedToolProgress(id).running) {
-				await new Promise((resolvePromise) => setTimeout(resolvePromise, 750));
-			}
-			if (!managedFileTools.getManagedToolProgress(id).error) {
+		installCompletion.start(
+			id,
+			() => managedFileTools.getManagedToolProgress(id),
+			async () => {
 				const packName = MANAGED_TOOL_PACKS[id];
 				if (packName) activatePackForAllSessions(packName);
 				if (id === "ocr" && managedFileTools.getManagedToolStatus("sevenzip").installed) {
 					activatePackForAllSessions("archive-files");
 				}
-			}
-		})();
+			},
+		);
 		sendJson(res, 202, { ok: true });
 		return;
 	}
@@ -1750,7 +1883,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		sendJson(
 			res,
 			200,
-			managedFileTools.getManagedToolProgress(managedProgressMatch[1] as managedFileTools.ManagedToolId),
+			installCompletion.progress(
+				managedProgressMatch[1],
+				managedFileTools.getManagedToolProgress(managedProgressMatch[1] as managedFileTools.ManagedToolId),
+			),
 		);
 		return;
 	}
@@ -1761,7 +1897,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		const runningSessionIds = [...sessions.values()]
 			.filter((cs) => cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting)
 			.map((cs) => cs.sessionId);
-		if (runningSessionIds.length > 0) {
+		if (runningSessionIds.length > 0 || hasActiveDataWork()) {
 			sendJson(res, 409, { error: "仍有会话正在运行，请等待任务完成或停止后再卸载工具" });
 			return;
 		}
@@ -1801,7 +1937,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		try {
-			const cs = typeof body.sessionId === "string" ? sessions.get(body.sessionId) : undefined;
+			const cs = typeof body.sessionId === "string" ? await getOrRestoreSession(body.sessionId) : undefined;
+			if (typeof body.sessionId === "string" && (!cs || cs.deleting)) {
+				sendJson(res, 404, { error: "预览所属会话已不存在" });
+				return;
+			}
 			const cwd = cs?.session.sessionManager.getCwd() ?? workspace.getWorkspacePath() ?? DATA_DIR;
 			const filePath = fsExplorer.resolveAllowedFilePath(resolve(cwd, body.path.trim()));
 			sendJson(res, 200, await officePreview.startOfficePreview(filePath));
@@ -1855,17 +1995,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-		if (!apiKey && !(await savedApiKey(providerId))) {
-			sendJson(res, 400, { error: "首次添加时请填写 API Key；无鉴权服务可填写任意占位值" });
-			return;
-		}
 		try {
 			const definition = customModels.normalizeCustomModel(providerId, body);
-			customModels.saveCustomModel(CUSTOM_MODELS_FILE, definition);
-			if (apiKey) await credentials.setApiKey(providerId, apiKey);
-			modelRuntime.registerProvider(providerId, customModels.toProviderConfig(definition));
-			await modelRuntime.refresh();
-			sendJson(res, 200, { ok: true, ...definition });
+			const result = await customModelManager.save(definition, apiKey || undefined);
+			sendJson(res, 200, { ok: true, ...result.definition, runtimePending: result.runtimePending });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -1875,14 +2008,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	if (customModelMatch && req.method === "DELETE") {
 		const providerId = decodeURIComponent(customModelMatch[1]);
 		try {
-			if (!customModels.removeCustomModel(CUSTOM_MODELS_FILE, providerId)) {
+			const result = await customModelManager.remove(providerId);
+			if (!result.removed) {
 				sendJson(res, 404, { error: "自定义模型不存在" });
 				return;
 			}
-			modelRuntime.unregisterProvider(providerId);
-			await credentials.deleteApiKey(providerId);
-			await modelRuntime.refresh();
-			sendJson(res, 200, { ok: true });
+			sendJson(res, 200, { ok: true, runtimePending: result.runtimePending });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -1909,14 +2040,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		if (pathname === "/api/oauth/antigravity/models/refresh" && req.method === "POST") {
 			try {
 				const count = await refreshAntigravityModels();
-				sendJson(res, 200, { count });
+				sendJson(res, 200, { count, catalog: refreshAntigravityModels.status() });
 			} catch (error) {
 				sendJson(res, 400, { error: error instanceof Error ? error.message : "模型目录刷新未完成，请重试" });
 			}
 			return;
 		}
 		if (pathname === "/api/oauth/antigravity/status" && req.method === "GET") {
-			sendJson(res, 200, antigravityOAuth.status());
+			sendJson(res, 200, { ...antigravityOAuth.status(), catalog: refreshAntigravityModels.status() });
 			return;
 		}
 		if (pathname === "/api/oauth/antigravity/start" && req.method === "POST") {
@@ -1967,6 +2098,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 404, { error: `未知的模型服务商：${body.provider}` });
 			return;
 		}
+		if (customModels.isCustomProviderId(body.provider)) {
+			const definition = customModels
+				.loadCustomModels(CUSTOM_MODELS_FILE)
+				.find((item) => item.providerId === body.provider);
+			if (!definition) {
+				sendJson(res, 404, { error: "自定义模型不存在" });
+				return;
+			}
+			const result = await customModelManager.save({ ...definition, authMode: "api_key" }, body.key.trim());
+			sendJson(res, 200, { ok: true, runtimePending: result.runtimePending });
+			return;
+		}
 		await credentials.setApiKey(body.provider, body.key.trim());
 		await modelRuntime.refresh();
 		sendJson(res, 200, { ok: true });
@@ -1975,6 +2118,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	const keyMatch = pathname.match(/^\/api\/keys\/([^/]+)$/);
 	if (keyMatch && req.method === "DELETE") {
 		const provider = decodeURIComponent(keyMatch[1]);
+		if (customModels.isCustomProviderId(provider)) {
+			const result = await customModelManager.clearApiKey(provider);
+			sendJson(
+				res,
+				result.removed ? 200 : 404,
+				result.removed ? { ok: true, runtimePending: result.runtimePending } : { error: "此模型没有已保存的 Key" },
+			);
+			return;
+		}
 		if (!(await credentials.deleteApiKey(provider))) {
 			sendJson(res, 404, { error: `${provider} 没有已保存的 Key` });
 			return;
@@ -1986,7 +2138,34 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 	// 工作区设置（用户可自行指定会话工作目录）
 	if (pathname === "/api/workspace" && req.method === "GET") {
-		sendJson(res, 200, { path: workspace.getWorkspacePath() });
+		sendJson(res, 200, { path: workspace.getWorkspacePath(), limits: FILE_LIMITS });
+		return;
+	}
+	if (
+		["/api/settings/workspace/preview", "/api/settings/workspace/copy"].includes(pathname) &&
+		req.method === "POST"
+	) {
+		const body = (await readBodyJson(req)) as { source?: unknown; target?: unknown; revision?: unknown };
+		if (typeof body.source !== "string" || typeof body.target !== "string") {
+			sendJson(res, 400, { error: "请选择来源和目标目录" });
+			return;
+		}
+		if (hasActiveDataWork()) {
+			sendJson(res, 409, { error: "请等待当前任务或安装完成后再复制工作区文件" });
+			return;
+		}
+		try {
+			const result = pathname.endsWith("/preview")
+				? workspace.previewWorkspaceCopy(body.source, body.target)
+				: workspace.copyWorkspaceFiles(
+						body.source,
+						body.target,
+						typeof body.revision === "string" ? body.revision : "",
+					);
+			sendJson(res, 200, result);
+		} catch (error) {
+			sendJson(res, 409, { error: error instanceof Error ? error.message : "工作区复制失败" });
+		}
 		return;
 	}
 	if (pathname === "/api/workspace" && req.method === "POST") {
@@ -2038,7 +2217,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	if (pathname === "/api/fs/list" && req.method === "GET") {
 		const path = url.searchParams.get("path") ?? "";
 		try {
-			sendJson(res, 200, { ...fsExplorer.getDirectoryInfo(path), entries: fsExplorer.listDir(path) });
+			sendJson(res, 200, { ...fsExplorer.getDirectoryInfo(path), entries: await fsExplorer.listDirAsync(path) });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -2107,7 +2286,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/fs/text" && req.method === "PUT") {
-		const body = (await readBodyJson(req, 12 * 1024 * 1024)) as {
+		const body = (await readBodyJson(req, MAX_TEXT_REQUEST_BYTES)) as {
 			path?: unknown;
 			text?: unknown;
 			expectedSha256?: unknown;
@@ -2221,9 +2400,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	}
 	const sessionId = match[1];
 	const action = match[2] ?? "";
+	if (!/^[a-zA-Z0-9_-]{1,80}$/.test(sessionId)) {
+		sendJson(res, 400, { error: "会话标识无效" });
+		return;
+	}
+	if (
+		req.method === "DELETE" &&
+		action === "" &&
+		!sessions.has(sessionId) &&
+		readSessionIndex()[sessionId]?.deletionRequestedAt
+	) {
+		completeSessionDeletion(sessionId);
+		sendJson(res, 200, { ok: true });
+		return;
+	}
 	const cs = await getOrRestoreSession(sessionId);
 	if (!cs) {
 		sendJson(res, 404, { error: "会话不存在，请刷新页面重新创建" });
+		return;
+	}
+	if (req.method === "GET" && /^requests\/[a-zA-Z0-9_-]{1,80}$/.test(action)) {
+		const requestId = action.slice("requests/".length);
+		const receipt = requestLedger.read(sessionId, requestId);
+		sendJson(res, 200, { requestId, status: receipt?.status ?? "unknown", error: receipt?.error });
 		return;
 	}
 
@@ -2237,11 +2436,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		// POST /api/sessions/:id/messages — 发送用户消息（支持 images）
 		case "POST messages": {
 			const body = (await readBodyJson(req)) as {
+				requestId?: unknown;
 				text?: unknown;
 				images?: unknown;
 				imageAttachments?: unknown;
 				attachments?: unknown;
 			};
+			const requestId = typeof body.requestId === "string" ? body.requestId : randomUUID();
+			if (!/^[a-zA-Z0-9_-]{1,80}$/.test(requestId)) {
+				sendJson(res, 400, { error: "请求标识无效" });
+				return;
+			}
 			const text = typeof body?.text === "string" ? body.text.trim() : "";
 			const attachments = Array.isArray(body?.attachments)
 				? body.attachments
@@ -2256,13 +2461,32 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "消息正文和附件不能同时为空" });
 				return;
 			}
-			if (cs.deleting) {
+			if (cs.deleting || sessions.get(sessionId) !== cs) {
 				sendJson(res, 409, { error: "当前会话正在删除，不能再提交消息" });
+				return;
+			}
+			const payload = { text, attachments, images: body.images, imageAttachments: body.imageAttachments };
+			if (requestLedger.read(sessionId, requestId)) {
+				try {
+					const { receipt } = requestLedger.accept(sessionId, requestId, payload);
+					sendJson(res, 200, { ok: true, requestId, status: receipt.status, error: receipt.error });
+				} catch (error) {
+					sendJson(res, 409, { error: error instanceof Error ? error.message : "请求内容不匹配" });
+				}
 				return;
 			}
 			if (cs.session.isStreaming || cs.activePrompt || cs.modelChange) {
 				sendJson(res, 409, { error: "当前正在运行或切换模型，请先停止或等待完成" });
 				return;
+			}
+			const currentModel = cs.session.model;
+			if (currentModel && customModels.isCustomProviderId(currentModel.provider)) {
+				const configured = modelRuntime.getModel(currentModel.provider, currentModel.id);
+				if (!configured) {
+					sendJson(res, 409, { error: "此自定义模型已删除或修改，请重新选择模型后再发送" });
+					return;
+				}
+				cs.session.agent.state.model = configured;
 			}
 			const images = parseImages(body.images);
 			if (Array.isArray(body.images) && !images) {
@@ -2293,27 +2517,62 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				redactSensitiveText(safeText) || attachments.map((path) => path.split(/[\\/]/).pop()).join("、"),
 			);
 			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
+			requestLedger.accept(sessionId, requestId, payload);
 			bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
 			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
-			sendJson(res, 202, { ok: true });
+			sendJson(res, 202, { ok: true, requestId, status: "accepted" });
 			let resolvePreflight: (success: boolean) => void = () => undefined;
 			const preflight = new Promise<boolean>((resolvePromise) => {
 				resolvePreflight = resolvePromise;
 			});
-			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve() };
+			const controller = new AbortController();
+			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve(), controller, requestId };
+			cs.activePrompt = activePrompt;
 			activePrompt.done = cs.session
-				.prompt(promptText, { images, preflightResult: resolvePreflight })
+				.prompt(promptText, {
+					images,
+					signal: controller.signal,
+					preflightResult: (accepted) => {
+						resolvePreflight(accepted);
+						if (accepted) requestLedger.finish(sessionId, requestId, "running");
+					},
+				})
+				.then(() => {
+					let failed = false;
+					for (let i = cs.session.messages.length - 1; i >= 0; i--) {
+						const message = cs.session.messages[i];
+						if (message.role === "assistant") {
+							failed = message.stopReason === "error";
+							break;
+						}
+					}
+					const status = controller.signal.aborted ? "cancelled" : failed ? "failed" : "completed";
+					const error = status === "failed" ? "模型未能完成请求，请查看本次回复中的错误" : undefined;
+					requestLedger.finish(sessionId, requestId, status, error);
+					bufferAndBroadcast(cs, { type: "request_status", requestId, status, error });
+				})
 				.catch((error) => {
 					releaseTurnCapabilities(cs);
+					const status = controller.signal.aborted ? "cancelled" : "failed";
+					const message = controller.signal.aborted
+						? "请求已停止"
+						: redactSensitiveText(error instanceof Error ? error.message : String(error));
+					try {
+						requestLedger.finish(sessionId, requestId, status, message);
+					} catch {
+						console.warn("请求结果无法写入，请核对会话历史");
+					}
+					bufferAndBroadcast(cs, { type: "request_status", requestId, status, error: message });
 					bufferAndBroadcast(cs, {
 						type: "error",
-						message: error instanceof Error ? error.message : String(error),
+						requestId,
+						message,
 					});
 				})
 				.finally(() => {
 					if (cs.activePrompt === activePrompt) cs.activePrompt = null;
+					if (pendingSkillReloads.has(sessionId) && !cs.deleting) void reloadInstalledSkillsInSessions(true);
 				});
-			cs.activePrompt = activePrompt;
 			return;
 		}
 
@@ -2379,6 +2638,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			}
 			sendJson(res, 200, {
 				usage: usage ?? null,
+				cwd: cs.session.sessionManager.getCwd(),
 				model: model
 					? { provider: model.provider, modelId: model.id, name: model.name, contextWindow: model.contextWindow }
 					: null,
@@ -2416,6 +2676,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const body = (await readBodyJson(req, Math.ceil(MAX_TOTAL_FILE_BYTES / 3) * 4 + 65536)) as {
 				files?: unknown;
 			};
+			if (cs.deleting || sessions.get(sessionId) !== cs) {
+				sendJson(res, 409, { error: "会话已删除或正在删除，附件未写入" });
+				return;
+			}
 			if (!Array.isArray(body?.files) || body.files.length === 0) {
 				sendJson(res, 400, { error: '请求体需为 {"files": [...]}' });
 				return;
@@ -2424,6 +2688,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			mkdirSync(uploadsDir, { recursive: true });
 			const saved: string[] = [];
 			const messageFiles: string[] = [];
+			const attachmentReferences: string[] = [];
 			const imageFiles: Array<{ path: string; mimeType: string }> = [];
 			let totalBytes = 0;
 			if (body.files.length > 32) {
@@ -2463,21 +2728,42 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				saved.push(workingPath);
 				const snapshot = saveAttachmentSnapshot(DATA_DIR, cs.sessionId, workingPath, safeName, data);
 				messageFiles.push(snapshot);
+				attachmentReferences.push(getAttachmentReference(DATA_DIR, cs.sessionId, snapshot));
 				if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.mimeType))
 					imageFiles.push({ path: snapshot, mimeType: file.mimeType });
 			}
-			sendJson(res, 200, { files: saved, messageFiles, imageFiles });
+			sendJson(res, 200, { files: saved, messageFiles, imageFiles, attachmentReferences });
 			return;
 		}
 
 		// POST /api/sessions/:id/abort — 中止当前运行
 		case "POST abort": {
+			const body = (await readBodyJson(req)) as { requestId?: unknown };
+			const requestId = typeof body.requestId === "string" ? body.requestId : cs.activePrompt?.requestId;
 			if (cs.deleting) {
 				sendJson(res, 409, { error: "当前会话正在删除" });
 				return;
 			}
+			if (requestId) {
+				const receipt = requestLedger.read(sessionId, requestId);
+				if (!receipt || ["accepted", "running"].includes(receipt.status))
+					requestLedger.finish(sessionId, requestId, "cancelled");
+				if (cs.activePrompt?.requestId !== requestId) {
+					sendJson(res, 200, { ok: true, requestId });
+					return;
+				}
+			}
 			await abortTrackedSessionPrompt(cs.session, cs.activePrompt);
 			sendJson(res, 200, { ok: true });
+			return;
+		}
+		case "POST browser/claim": {
+			if (cs.deleting) {
+				sendJson(res, 409, { error: "会话正在删除" });
+				return;
+			}
+			const state = await getAgentBrowserRuntime().claimSession(sessionId, cs.session.sessionManager.getCwd());
+			sendJson(res, 200, state);
 			return;
 		}
 
@@ -2506,6 +2792,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				return;
 			} finally {
 				if (cs.modelChange === change) cs.modelChange = null;
+				if (pendingSkillReloads.has(sessionId) && !cs.deleting) void reloadInstalledSkillsInSessions(true);
 			}
 			// 通过 SSE 通知前端同步（persist 由 setModel 内部写 settingsManager 完成）
 			bufferAndBroadcast(cs, {
@@ -2544,21 +2831,23 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		// GET /api/sessions/:id/history — 消息快照
 		case "GET history": {
 			const model = cs.session.model;
-			const messages = buildHistory(cs.sessionId, cs.session, cs.enabledPacks);
+			const rawMessages = cs.session.messages;
 			const requestedLimit = Number(url.searchParams.get("limit"));
 			const limit =
 				Number.isSafeInteger(requestedLimit) && requestedLimit > 0
-					? Math.min(requestedLimit, messages.length)
-					: messages.length;
-			let start = Math.max(0, messages.length - limit);
-			while (start > 0 && messages[start]?.role !== "user") start--;
+					? Math.min(requestedLimit, rawMessages.length)
+					: rawMessages.length;
+			let start = Math.max(0, rawMessages.length - limit);
+			while (start > 0 && rawMessages[start]?.role !== "user") start--;
+			const messages = buildHistory(cs.sessionId, cs.session, start);
 			sendJson(res, 200, {
 				sessionId: cs.sessionId,
+				cwd: cs.session.sessionManager.getCwd(),
 				streaming: cs.session.isStreaming || Boolean(cs.activePrompt),
 				streamEpoch: cs.streamEpoch,
-				totalMessages: messages.length,
+				totalMessages: rawMessages.length,
 				hasMore: start > 0,
-				messages: messages.slice(start),
+				messages,
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
@@ -2591,28 +2880,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 409, { error: "会话删除已在进行中" });
 				return;
 			}
-			cs.deleting = true;
-			try {
-				await cs.modelChange?.catch(() => undefined);
-				await disposeSessionBeforeDelete(cs.session, cs.activePrompt);
-			} catch (error) {
-				cs.deleting = false;
-				throw error;
-			}
-			for (const client of cs.sseClients) client.end();
-			sessions.delete(sessionId);
 			const index = readSessionIndex();
 			const entry = index[sessionId];
-			if (entry?.sessionFile) {
-				try {
-					unlinkSync(entry.sessionFile);
-				} catch {
-					/* 文件可能已不存在 */
-				}
+			if (entry) {
+				index[sessionId] = { ...entry, deletionRequestedAt: Date.now() };
+				writeSessionIndex(index);
 			}
-			delete index[sessionId];
-			writeSessionIndex(index);
-			deleteAttachmentSnapshots(DATA_DIR, sessionId);
+			cs.deleting = true;
+			await cs.modelChange?.catch(() => undefined);
+			await disposeSessionBeforeDelete(cs.session, cs.activePrompt);
+			for (const client of cs.sseClients) client.end();
+			sessions.delete(sessionId);
+			pendingSkillReloads.delete(sessionId);
+			completeSessionDeletion(sessionId);
 			sendJson(res, 200, { ok: true });
 			return;
 		}

@@ -8,6 +8,8 @@ import {
 	getDirectoryInfo,
 	importFileIntoDirectory,
 	listDir,
+	listDirAsync,
+	readFileAsBase64,
 	readTextFile,
 	searchFiles,
 	writeTextFile,
@@ -24,6 +26,24 @@ afterEach(() => {
 });
 
 describe("文本保存可靠性", () => {
+	it("asynchronous directory listing preserves the synchronous result and ordering", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-async-list-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		mkdirSync(join(root, "z-directory"));
+		mkdirSync(join(root, "a-directory"));
+		for (let index = 0; index < 96; index++) writeFileSync(join(root, `${95 - index}.txt`), String(index));
+		expect(await listDirAsync(root)).toEqual(listDir(root));
+		expect((await listDirAsync(root)).slice(0, 2).map((entry) => entry.name)).toEqual(["a-directory", "z-directory"]);
+	});
+	it("allows local attachment reads up to the same 20 MiB limit as uploads", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-attachment-limit-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		const path = join(root, "fixture.bin");
+		writeFileSync(path, Buffer.alloc(11 * 1024 * 1024));
+		expect(readFileAsBase64(path).size).toBe(11 * 1024 * 1024);
+		writeFileSync(path, Buffer.alloc(20 * 1024 * 1024 + 1));
+		expect(() => readFileAsBase64(path)).toThrow("20MB");
+	});
 	it("原子替换失败时保留原文件及临时文件之外的其他文件", () => {
 		const root = mkdtempSync(join(tmpdir(), "pi-fs-atomic-failure-"));
 		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);

@@ -17,17 +17,20 @@ import {
 	readFileSync,
 	realpathSync,
 	renameSync,
+	type Stats,
 	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { MAX_ATTACHMENT_BYTES, MAX_TEXT_FILE_BYTES } from "./file-limits.ts";
 import { DATA_DIR } from "./paths.ts";
+import { resolveMigratedDataPath } from "./storage.ts";
 import { decodeTextBuffer, isTextFilePath } from "./text-files.ts";
 import { getWorkspacePath } from "./workspace.ts";
 
-const MAX_READ_BYTES = 10 * 1024 * 1024;
+const MAX_READ_BYTES = MAX_TEXT_FILE_BYTES;
 const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
 const MAX_SEARCH_FILES = 50_000;
 const MAX_SEARCH_RESULTS = 200;
@@ -54,12 +57,6 @@ function pathWithin(path: string, root: string): boolean {
 function configuredRoots(): string[] {
 	const extra = process.env.PI_CONSOLE_FS_ROOT;
 	return extra ? [resolve(extra)] : [];
-}
-
-/** 工作区（用户自定义）作为第一浏览根 */
-function workspaceRoots(): string[] {
-	const path = getWorkspacePath();
-	return path ? [path] : [];
 }
 
 /** 可浏览的根目录列表（工作区优先，其次数据目录与配置根） */
@@ -99,9 +96,9 @@ export function listRoots(): FsRoot[] {
 	});
 }
 
-function withinRoots(absPath: string): string | null {
+function withinRoots(absPath: string, workspace = getWorkspacePath()): string | null {
 	if (process.platform === "win32" && isAbsolute(absPath) && existsSync(absPath)) return parse(absPath).root;
-	const roots = [...workspaceRoots(), DATA_DIR, ...configuredRoots()];
+	const roots = [...(workspace ? [workspace] : []), DATA_DIR, ...configuredRoots()];
 	for (const root of roots) {
 		if (pathWithin(absPath, root)) return root;
 	}
@@ -144,28 +141,69 @@ export interface FsSearchResult {
 /** 列目录；path 为绝对路径（必须落在某个根内） */
 export function listDir(path: string): Array<FsEntry & { root: string }> {
 	const abs = resolve(path);
-	const root = withinRoots(abs);
+	const workspace = getWorkspacePath();
+	const root = withinRoots(abs, workspace);
 	if (!root) throw new Error("路径不在可浏览范围内");
 	const entries: Array<FsEntry & { root: string }> = [];
 	for (const name of readdirSync(abs, { withFileTypes: true })) {
 		const entryAbs = join(abs, name.name);
 		try {
-			const stat = statSync(entryAbs);
-			entries.push({
-				name: name.name,
-				type: name.isDirectory() ? "dir" : "file",
-				size: name.isDirectory() ? null : stat.size,
-				mtime: stat.mtimeMs,
-				rel: name.name,
-				isWorkspace: isWorkspacePath(entryAbs),
-				root,
-			});
+			entries.push(directoryEntry(name, statSync(entryAbs), entryAbs, root, workspace));
 		} catch {
 			/* 跳过无法访问的项 */
 		}
 	}
-	entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
-	return entries;
+	return entries.sort(compareEntries);
+}
+
+function directoryEntry(
+	entry: Dirent,
+	info: Stats,
+	path: string,
+	root: string,
+	workspace: string | null,
+): FsEntry & { root: string } {
+	return {
+		name: entry.name,
+		type: entry.isDirectory() ? "dir" : "file",
+		size: entry.isDirectory() ? null : info.size,
+		mtime: info.mtimeMs,
+		rel: entry.name,
+		isWorkspace: Boolean(workspace && pathWithin(path, workspace)),
+		root,
+	};
+}
+function compareEntries(a: FsEntry, b: FsEntry): number {
+	return a.type === b.type
+		? a.name.localeCompare(b.name) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+		: a.type === "dir"
+			? -1
+			: 1;
+}
+
+/** Bound directory-stat concurrency so large folders do not block streaming requests. */
+export async function listDirAsync(path: string): Promise<Array<FsEntry & { root: string }>> {
+	const abs = resolve(path);
+	const workspace = getWorkspacePath();
+	const root = withinRoots(abs, workspace);
+	if (!root) throw new Error("路径不在可浏览范围内");
+	const children = await readdir(abs, { withFileTypes: true, encoding: "utf8" });
+	const entries: Array<FsEntry & { root: string }> = [];
+	let cursor = 0;
+	await Promise.all(
+		Array.from({ length: Math.min(32, children.length) }, async () => {
+			while (cursor < children.length) {
+				const child = children[cursor++];
+				const path = join(abs, child.name);
+				try {
+					entries.push(directoryEntry(child, await stat(path), path, root, workspace));
+				} catch {
+					/* Entries may disappear while browsing. */
+				}
+			}
+		}),
+	);
+	return entries.sort(compareEntries);
 }
 
 export function getDirectoryInfo(path: string): { path: string; parent: string | null; isWorkspace: boolean } {
@@ -178,11 +216,12 @@ export function getDirectoryInfo(path: string): { path: string; parent: string |
 
 /** 读取文件（限大小），返回 base64 + mime 推断 */
 export function readFileAsBase64(path: string): { dataBase64: string; mimeType: string; size: number } {
-	const abs = resolve(path);
+	const abs = resolveMigratedDataPath(resolve(path));
 	if (!withinRoots(abs)) throw new Error("路径不在可浏览范围内");
 	const stat = statSync(abs);
 	if (!stat.isFile()) throw new Error("目标不是文件");
-	if (stat.size > MAX_READ_BYTES) throw new Error(`文件超过 ${MAX_READ_BYTES / 1024 / 1024}MB，无法直接读取`);
+	if (stat.size > MAX_ATTACHMENT_BYTES)
+		throw new Error(`文件超过 ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB，无法直接读取`);
 	const data = readFileSync(abs);
 	return { dataBase64: data.toString("base64"), mimeType: mimeForPath(abs), size: stat.size };
 }
@@ -280,7 +319,8 @@ export async function searchFiles(
 	mode: "name" | "content",
 ): Promise<{ results: FsSearchResult[]; scanned: number; truncated: boolean }> {
 	const root = resolve(path);
-	if (!withinRoots(root)) throw new Error("路径不在可浏览范围内");
+	const workspace = getWorkspacePath();
+	if (!withinRoots(root, workspace)) throw new Error("路径不在可浏览范围内");
 	if (!(await stat(root)).isDirectory()) throw new Error("目标不是目录");
 	const needle = query.trim().toLocaleLowerCase("zh-CN");
 	if (!needle) return { results: [], scanned: 0, truncated: false };
@@ -346,7 +386,7 @@ export async function searchFiles(
 						name: entry.name,
 						size: fileStat.size,
 						mtime: fileStat.mtimeMs,
-						isWorkspace: isWorkspacePath(entryPath),
+						isWorkspace: Boolean(workspace && pathWithin(entryPath, workspace)),
 						line,
 						preview,
 					});
@@ -408,7 +448,7 @@ export function ensureExists(path: string): boolean {
 
 /** 校验并返回可浏览根目录内的文件绝对路径，供流式预览等无需读取全文件的功能复用。 */
 export function resolveAllowedFilePath(path: string): string {
-	const abs = resolve(path);
+	const abs = resolveMigratedDataPath(resolve(path));
 	if (!withinRoots(abs)) throw new Error("路径不在可浏览范围内");
 	const stat = statSync(abs);
 	if (!stat.isFile()) throw new Error("目标不是文件");

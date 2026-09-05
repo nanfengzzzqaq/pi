@@ -2846,7 +2846,11 @@ body {
 }
 
 .workbench-side.maximized {
-	width: min(76%, 1180px) !important;
+	position: absolute;
+	inset: 0;
+	z-index: 40;
+	width: 100% !important;
+	min-width: 0;
 }
 
 /* 收起状态：只保留底部标签条（贴右下角），随时可以点回任意面板 */
@@ -5262,6 +5266,26 @@ input:disabled {
 	border-radius: 12px;
 	background: var(--fx-surface-soft);
 	overflow: hidden;
+}
+
+.code-editor-markdown-preview { overflow: auto; }
+.code-editor-pane.compact-mode { position: absolute; inset: 0; z-index: 45; width: 100% !important; min-width: 0; }
+.conversation-workbench:has(.code-editor-pane.compact-mode:not([hidden])) #code-editor-resizer { display: none; }
+.session-menu-button { position: absolute; top: 7px; right: 5px; border: 0; border-radius: 6px; background: var(--panel); color: var(--muted); cursor: pointer; }
+.session-row { padding-right: 28px; }
+.session-context-item { display: block; width: 100%; border: 0; background: transparent; color: var(--text); text-align: left; }
+[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.message-recovery { display: grid; gap: 6px; max-height: 160px; overflow: auto; }
+.message-recovery-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 9px; color: var(--muted); font-size: 12px; }
+.message-recovery-row span { min-width: 120px; flex: 1; overflow-wrap: anywhere; }
+.message-recovery-row button { padding: 3px 7px; background: var(--panel-2); color: var(--text); font-size: 11px; }
+.workspace-copy-section summary { cursor: pointer; margin: 12px 0; }
+.settings-content { container-type: inline-size; }
+@container (max-width: 640px) {
+	.model-form-two, .model-form-three, .model-capabilities-row { grid-template-columns: minmax(0, 1fr); }
+	.key-add-row { flex-wrap: wrap; }
+	.key-add-row > input, .key-add-row > select { min-width: 0; }
+	.key-row { flex-wrap: wrap; }
 }
 
 .code-editor-placeholder {

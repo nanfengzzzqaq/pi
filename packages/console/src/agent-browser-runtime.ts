@@ -16,6 +16,8 @@ export interface AgentBrowserState {
 	canGoForward: boolean;
 	status: string;
 	downloadPath?: string;
+	ownerSessionId?: string | null;
+	pageVersion?: number;
 }
 
 export interface AgentBrowserLocator {
@@ -310,6 +312,12 @@ export function agentBrowserUploadOrigin(value: string): string {
 }
 
 export interface AgentBrowserRuntime {
+	runWithSession<T>(
+		context: { sessionId: string; workspace: string; signal?: AbortSignal; allowNavigation?: boolean },
+		operation: () => Promise<T>,
+	): Promise<T>;
+	claimSession(sessionId: string, workspace: string): AgentBrowserState;
+	takeUserControl(): AgentBrowserState;
 	setDownloadDirectory(path: string): void;
 	open(url?: string): Promise<AgentBrowserState>;
 	hide(): AgentBrowserState;

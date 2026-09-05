@@ -5,6 +5,26 @@ import { describe, expect, it } from "vitest";
 import { createConsoleCredentials } from "../src/credentials.ts";
 
 describe("Console credentials", () => {
+	it("isolates invalid provider records while preserving their bytes on valid account edits", async () => {
+		const path = join(mkdtempSync(join(tmpdir(), "pi-credentials-isolation-")), "auth.json");
+		const broken = { type: "oauth", access: 123, refresh: "preserve-fixture", expires: "invalid" };
+		writeFileSync(
+			path,
+			JSON.stringify({ broken, valid: { type: "api_key", key: "valid-fixture" }, primitive: null }),
+		);
+		const credentials = createConsoleCredentials(path);
+		expect(await credentials.apiKeys()).toEqual({ valid: "valid-fixture" });
+		expect((await credentials.store.list()).map((entry) => entry.providerId)).toEqual(["valid"]);
+		expect((await credentials.issues()).map((issue) => issue.provider).sort()).toEqual(["broken", "primitive"]);
+		await credentials.setApiKey("another", "new-fixture");
+		expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({
+			broken,
+			primitive: null,
+			another: { type: "api_key", key: "new-fixture" },
+		});
+		await credentials.setApiKey("broken", "repaired-fixture");
+		expect((await credentials.issues()).map((issue) => issue.provider)).toEqual(["primitive"]);
+	});
 	it.each(["", " ", "[]", "null", "42", "false", '"credential"'])(
 		"refuses all edits of structurally invalid persisted credentials: %j",
 		async (damaged) => {

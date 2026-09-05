@@ -5,8 +5,9 @@
  *   <agentDir>/skills/officecli/<catalogId>/SKILL.md
  * Pi 会递归发现这些标准技能；界面也用同一份目录展示归属关系。
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { atomicFileWrite } from "./durable-json.ts";
 import { loadOfficialSkill } from "./officecli.ts";
 
 export type OfficeCliSkillCategory = "Word" | "PowerPoint" | "Excel";
@@ -123,7 +124,7 @@ export function listOfficeCliSkills(agentDir: string): OfficeCliSkillCatalogItem
 	return OFFICECLI_SKILLS.map((skill) => ({
 		...skill,
 		toolId: "officecli" as const,
-		installed: existsSync(officeCliSkillPath(agentDir, skill.id)),
+		installed: readInstalledOfficeCliSkill(agentDir, skill.id) !== null,
 		installPath: officeCliSkillPath(agentDir, skill.id),
 	}));
 }
@@ -188,11 +189,10 @@ export async function installOfficeCliSkill(
 	const installed: Array<{ id: string; internalName: string; path: string }> = [];
 	for (const skill of officeCliSkillInstallOrder(id)) {
 		const path = officeCliSkillPath(agentDir, skill.id);
-		if (existsSync(path)) continue;
+		if (readInstalledOfficeCliSkill(agentDir, skill.id) !== null) continue;
 		const official = await loadOfficialSkill(skill.id);
 		const adapted = adaptOfficialSkill(official, skill);
-		mkdirSync(join(agentDir, "skills", "officecli", skill.id), { recursive: true });
-		writeFileSync(path, adapted, "utf8");
+		atomicFileWrite(path, adapted);
 		installed.push({ id: skill.id, internalName: skill.internalName, path });
 	}
 	return installed;
@@ -211,7 +211,11 @@ export async function installAllOfficeCliSkills(
 export function readInstalledOfficeCliSkill(agentDir: string, id: string): string | null {
 	const path = officeCliSkillPath(agentDir, id);
 	try {
-		return readFileSync(path, "utf8");
+		const content = readFileSync(path, "utf8");
+		const definition = definitionById(id);
+		if (!definition || !content.startsWith("---")) return null;
+		adaptOfficialSkill(content, definition);
+		return content;
 	} catch {
 		return null;
 	}

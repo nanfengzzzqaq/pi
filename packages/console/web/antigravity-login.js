@@ -14,10 +14,12 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 	const base = "/api/oauth/antigravity";
 	let state = { phase: "idle", connected: false, available: true };
 	let busy = false;
+	let refreshing = false;
 	let disposed = false;
 	let generation = 0;
 	let catalogGeneration = 0;
 	let catalogBusy = false;
+	let catalogNotice = "";
 	let timer;
 
 	function schedule() {
@@ -35,6 +37,7 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 			++catalogGeneration;
 			catalogBusy = false;
 			modelStatus.textContent = "";
+			catalogNotice = "";
 		}
 		const pending = ["starting", "waiting"].includes(state.phase);
 		status.textContent = state.error || state.message || (state.connected ? "已连接" : "未登录");
@@ -51,6 +54,11 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 		modelRefresh.hidden = !state.connected;
 		modelRefresh.disabled = busy || catalogBusy;
 		modelStatus.hidden = !state.connected;
+		if (state.connected) {
+			const catalog = state.catalog;
+			const source = { discovered: "Google 账号发现目录", cache: "本机缓存目录", fallback: "内置备用目录" }[catalog?.source] || "当前模型目录";
+			modelStatus.textContent = catalogBusy || catalog?.refreshStatus === "refreshing" ? "正在向 Google 刷新模型目录…" : `${source}${catalogNotice ? ` · ${catalogNotice}` : ""}${catalog?.refreshStatus === "failed" ? "；刷新未完成，保留已有目录" : ""}。目录不代表所有型号都可调用，仍以账号权限和额度为准。`;
+		}
 		if (changed) {
 			if (state.connected) void refreshModels();
 			else void loadModels().catch(() => { status.textContent += "；模型列表刷新失败，请重新打开设置"; });
@@ -70,10 +78,14 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 			await loadModels();
 			if (request !== catalogGeneration || disposed) return;
 			// The adapter retains cached models when discovery is unavailable.
-			modelStatus.textContent = `当前目录有 ${result.count} 个 Antigravity 模型；若仍有缺失，请检查网络后重试。`;
+			catalogNotice = `当前目录有 ${result.count} 个 Antigravity 模型`;
+			const refreshed = await api(`${base}/status`).catch(() => null);
+			if (request !== catalogGeneration || disposed) return;
+			if (refreshed) state = refreshed;
+			if (refreshed?.catalog) catalogNotice += `（${({ discovered: "账号发现", cache: "缓存", fallback: "备用" })[refreshed.catalog.source] || "当前"}）`;
 		} catch {
 			if (request === catalogGeneration && !disposed) {
-				modelStatus.textContent = "模型目录刷新未完成，请检查网络后点击「刷新模型」重试；已有模型仍可使用。";
+				catalogNotice = "模型目录刷新未完成，可检查网络后重试；已有目录保留";
 				await loadModels().catch(() => {});
 			}
 		} finally {
@@ -85,7 +97,8 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 	}
 
 	async function refresh() {
-		if (busy || disposed) return;
+		if (busy || refreshing || disposed) return;
+		refreshing = true;
 		const request = ++generation;
 		try {
 			const next = await api(`${base}/status`);
@@ -95,6 +108,8 @@ export function setupAntigravityLogin({ document, api, loadModels, openExternalU
 				status.textContent = "暂时无法读取 Google 登录状态，请重新打开设置";
 				schedule();
 			}
+		} finally {
+			refreshing = false;
 		}
 	}
 
