@@ -79,7 +79,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 					typeof error === "object" && error !== null && "code" in error
 						? String((error as { code?: unknown }).code)
 						: undefined;
-				if (code !== "ELOCKED" || attempt === maxAttempts) {
+				// EPERM on Windows marks a lock directory still pending deletion by a
+				// closing process; the mkdir succeeds once the handle is released.
+				if ((code !== "ELOCKED" && code !== "EPERM") || attempt === maxAttempts) {
 					throw error;
 				}
 				lastError = error;
@@ -138,7 +140,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 						? String((error as { code?: unknown }).code)
 						: undefined;
 				const remainingMs = deadline - Date.now();
-				if (code !== "ELOCKED" || remainingMs <= 0) throw error;
+				// EPERM joins ELOCKED: on Windows the lock directory mkdir fails with
+				// EPERM while a released lock is still pending deletion.
+				if ((code !== "ELOCKED" && code !== "EPERM") || remainingMs <= 0) throw error;
 				const baseDelayMs = Math.min(10 * 2 ** retry, maxDelayMs / 2);
 				retry++;
 				const delayMs = Math.min(Math.round(baseDelayMs * (1 + Math.random())), remainingMs);
