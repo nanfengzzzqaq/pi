@@ -69,7 +69,9 @@ export function replaceCredentialFile(path: string, content: string): void {
 		} catch (error) {
 			const detail =
 				typeof error === "object" && error !== null && "stderr" in error
-					? `：${String((error as { stderr?: unknown }).stderr).trim().slice(0, 300)}`
+					? `：${String((error as { stderr?: unknown }).stderr)
+							.trim()
+							.slice(0, 300)}`
 					: "";
 			throw new Error(`账号配置无法安全保存，原文件权限与备份已保留，请检查磁盘和权限后重试${detail}`);
 		}
