@@ -731,22 +731,42 @@ jobs:
             local current_release
             local current_inventory
             local current_classification
+            local owned_count
+            local attempt=1
+            local max_attempts=1
+            if [[ "${1:-}" == "--wait-for-created-draft" ]]; then
+              max_attempts=6
+            elif [[ "$#" != "0" ]]; then
+              echo "::error::Unsupported draft validation option." >&2
+              return 1
+            fi
             if [[ ! "${active_release_id}" =~ ^[0-9]+$ ]]; then
               echo "::error::No numeric active release ID is available." >&2
               return 1
             fi
-            if ! assert_exact_tag_ref; then
-              return 1
-            fi
-            if ! current_inventory="$(load_release_inventory)" \
-              || ! current_classification="$(assert_recoverable_inventory "${current_inventory}")"; then
-              return 1
-            fi
-            if [[ "$(jq '.owned | length' <<< "${current_classification}")" != "1" \
-              || "$(jq -r '.owned[0].id' <<< "${current_classification}")" != "${active_release_id}" ]]; then
-              echo "::error::Release ${active_release_id} is no longer the unique workflow-owned draft for ${RELEASE_TAG}." >&2
-              return 1
-            fi
+            while true; do
+              if ! assert_exact_tag_ref; then
+                return 1
+              fi
+              if ! current_inventory="$(load_release_inventory)" \
+                || ! current_classification="$(assert_recoverable_inventory "${current_inventory}")"; then
+                return 1
+              fi
+              owned_count="$(jq '.owned | length' <<< "${current_classification}")"
+              if [[ "${owned_count}" == "1" \
+                && "$(jq -r '.owned[0].id' <<< "${current_classification}")" == "${active_release_id}" ]]; then
+                break
+              fi
+              # A newly created draft can be absent from the paginated inventory
+              # briefly. Retry only absence, never conflicting or different IDs.
+              if [[ "${owned_count}" != "0" || "${attempt}" -ge "${max_attempts}" ]]; then
+                echo "::error::Release ${active_release_id} is no longer the unique workflow-owned draft for ${RELEASE_TAG}." >&2
+                return 1
+              fi
+              echo "::notice::Waiting for newly created draft ${active_release_id} to appear in the release inventory (${attempt}/${max_attempts})." >&2
+              sleep 2
+              attempt=$((attempt + 1))
+            done
             if ! current_release="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${active_release_id}")"; then
               echo "::error::Unable to reload release ${active_release_id} by numeric ID." >&2
               return 1
@@ -826,11 +846,11 @@ jobs:
 
           notes_file="$(mktemp)"
           {
-            echo '## 本版关键修复'
+            printf '## Pi Console %s\n' "${RELEASE_TAG}"
             echo
-            echo '- Qwen 本地模型在 xhigh 下限制单轮思考预算，为正文和完整工具调用保留空间；仅在推理耗尽输出且正文为空时自动续答一次。'
-            echo '- 新增 Brave 联网检索，提供可核验来源、查询脱敏、响应限长和提示注入隔离。'
-            echo '- 收紧浏览器自动启用边界，并强化安装包内 Pi AI、搜索能力和前端资源的一致性校验。'
+            echo 'Windows 安装包由本页标注的源码提交构建，已通过仓库检查、客户端测试和安装包校验。'
+            echo '可下载安装包更新；具体变更请查看对应源码提交。'
+            printf '设计与改进说明：[查看文档](https://github.com/%s/blob/%s/packages/console/docs/stability-design.md)。\n' "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"
             echo
             printf '构建来源：`%s`。\n' "${SOURCE_SHA}"
             printf '%s\n' "${release_marker}"
@@ -980,7 +1000,7 @@ jobs:
               echo "::error::GitHub's 201 response did not identify the new draft with exact workflow ownership."
               exit 1
             fi
-            load_active_draft >/dev/null
+            load_active_draft --wait-for-created-draft >/dev/null
           fi
 
           # Refuse to touch arbitrary assets. Both the target and exact stale names

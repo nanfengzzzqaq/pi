@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("piDesktop", {
+	getApiToken() { return ipcRenderer.invoke("pi:api-token"); },
 	/** 取得从 Windows 资源管理器拖入的 File 对象所对应的本地路径。 */
 	getFilePath(file) {
 		try {

@@ -67,6 +67,12 @@ describe("bundled Antigravity provider", () => {
 		} finally {
 			session.dispose();
 		}
+		// Console disposes its warmup session; providers belong to the shared runtime.
+		const refresh = await modelRuntime.refresh({ allowNetwork: false, providers: ["antigravity"] });
+		expect(refresh.errors.size).toBe(0);
+		expect(modelRuntime.getProvider("antigravity")?.auth?.oauth).toBeDefined();
+		expect(modelRuntime.getModels("antigravity").map((model) => model.id)).toContain("claude-sonnet-4-6");
+		expect(() => resourceLoader.getExtensions().runtime.assertActive()).toThrow("stale");
 	});
 
 	it("replaces a Gemini-only cache with the complete account catalog and retains it on network failure", async () => {

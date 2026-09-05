@@ -4,8 +4,23 @@
  * Windows 安装版可直接浏览本机磁盘，作为客户端内置的资源管理器；
  * 非 Windows 环境仍限制在工作区、数据目录与显式配置目录内。
  */
-import { createHash } from "node:crypto";
-import { copyFileSync, type Dirent, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	closeSync,
+	copyFileSync,
+	type Dirent,
+	existsSync,
+	fchmodSync,
+	fsyncSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { DATA_DIR } from "./paths.ts";
@@ -197,7 +212,11 @@ export function readTextFile(path: string): {
 export function writeTextFile(path: string, text: string, expectedSha256: string): ReturnType<typeof readTextFile> {
 	const abs = resolveAllowedFilePath(path);
 	if (!isTextFilePath(abs)) throw new Error("该文件不是可编辑的文本格式");
-	const current = readFileSync(abs);
+	// Replace the actual file so editing a symbolic link continues to preserve the link itself.
+	const target = realpathSync(abs);
+	const fileStat = statSync(target);
+	if (fileStat.size > MAX_READ_BYTES) throw new Error(`文本文件超过 ${MAX_READ_BYTES / 1024 / 1024}MB，无法直接编辑`);
+	const current = readFileSync(target);
 	const actualSha256 = createHash("sha256").update(current).digest("hex");
 	if (expectedSha256 && actualSha256 !== expectedSha256) {
 		throw new Error("文件已被其他程序修改，请重新打开后再保存");
@@ -228,7 +247,29 @@ export function writeTextFile(path: string, text: string, expectedSha256: string
 		throw new Error(`当前编辑器不会改写 ${decoded.encoding} 编码文件，请先转换为 UTF-8`);
 	}
 	if (encoded.length > MAX_READ_BYTES) throw new Error(`保存内容超过 ${MAX_READ_BYTES / 1024 / 1024}MB 上限`);
-	writeFileSync(abs, encoded);
+	const temporary = join(dirname(target), `.pi-edit-${randomUUID()}.tmp`);
+	let created = false;
+	try {
+		const descriptor = openSync(temporary, "wx", 0o600);
+		created = true;
+		try {
+			writeFileSync(descriptor, encoded);
+			fchmodSync(descriptor, fileStat.mode & 0o7777);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		// A different program may have saved while the replacement was being written.
+		if (
+			realpathSync(abs) !== target ||
+			createHash("sha256").update(readFileSync(target)).digest("hex") !== actualSha256
+		) {
+			throw new Error("文件已被其他程序修改，请重新打开后再保存");
+		}
+		renameSync(temporary, target);
+	} finally {
+		if (created && existsSync(temporary)) unlinkSync(temporary);
+	}
 	return readTextFile(abs);
 }
 

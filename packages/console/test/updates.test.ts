@@ -7,6 +7,7 @@ import {
 	cleanupStaleUpdateFiles,
 	reconcilePendingUpdate,
 	resolveGithubCredential,
+	retryPendingUpdate,
 	UPDATE_INSTALLER_ARGS,
 	verifyDownloadedInstaller,
 } from "../src/updates.ts";
@@ -249,6 +250,24 @@ describe("checkUpdate", () => {
 });
 
 describe("更新安装与重启", () => {
+	it("rejects a changed cached installer before retry handoff", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-update-tampered-"));
+		const installer = join(directory, "PiConsole-Setup-99.0.0.exe");
+		writeFileSync(installer, "abd");
+		writeFileSync(
+			join(directory, "pending-update.json"),
+			JSON.stringify({
+				fromVersion: "0.3.50",
+				targetVersion: "99.0.0",
+				setupPath: installer,
+				startedAt: 123,
+				expectedBytes: 3,
+				expectedDigest: "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+			}),
+		);
+		await expect(retryPendingUpdate(directory)).rejects.toThrow("SHA256 校验失败");
+		expect(readFileSync(installer, "utf8")).toBe("abd");
+	});
 	it("uses electron-builder's native NSIS update arguments", () => {
 		expect(UPDATE_INSTALLER_ARGS).toEqual(["--updated", "/S", "--force-run", "/currentuser"]);
 	});

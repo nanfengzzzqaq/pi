@@ -6,6 +6,8 @@
 
 const SESSION_KEY = "pi-console-session";
 const TOKEN_KEY = "pi-console-token";
+let desktopApiToken = null;
+let desktopAuthRequest = null;
 const SENSITIVE_DISPLAY_PARAMETER_VALUE =
 	/([?&#](?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)=)(?!\[REDACTED\])([^&#\s<>"')\]}，。；！,;]+)/gi;
 
@@ -31,6 +33,8 @@ const indicatorEl = $("indicator");
 const errorBarEl = $("error-bar");
 const connStateEl = $("conn-state");
 const modelSelectEl = $("model-select");
+const modelSearchEl = $("model-search");
+const modelSearchToggleEl = $("model-search-toggle");
 const thinkingSelectEl = $("thinking-select");
 const fileInputEl = $("file-input");
 const attachBtnEl = $("attach-btn");
@@ -155,6 +159,7 @@ const workbenchSideResizerEl = $("workbench-side-resizer");
 const workbenchCloseButtons = document.querySelectorAll("[data-workbench-close]");
 const workbenchMaximizeButtons = document.querySelectorAll("[data-workbench-maximize]");
 const sideTabTerminalEl = $("side-tab-terminal");
+const sideTabReviewEl = $("side-tab-review");
 const sideTabBrowserEl = $("side-tab-browser");
 const reviewPaneEl = $("review-pane");
 const reviewStatusEl = $("review-status");
@@ -193,6 +198,11 @@ const settingsPages = document.querySelectorAll("[data-settings-page]");
 
 let sessionId = localStorage.getItem(SESSION_KEY);
 let lastSeq = -1;
+let lastStreamEpoch = null;
+let historyRequest = 0;
+let sessionNavigation = 0;
+let historyDisplayLimit = 100;
+let renderingHistory = false;
 let running = false;
 let es = null;
 let reconnectTimer = null;
@@ -219,6 +229,35 @@ let codeEditor = null;
 let codeEditorFile = null;
 let codeEditorDirty = false;
 let codeEditorPreviewing = false;
+let codeEditorOpenRequest = 0;
+let composerComposing = false;
+let fsRequest = 0;
+let modelsRequest = 0;
+let statusPollRunning = false;
+const draftAttachments = new Map();
+const pendingMessageSessions = new Set();
+const attachmentReads = new Map();
+let draftSaveTimer = null;
+
+function saveComposerDraft() {
+	if (!sessionId) return;
+	try {
+		const key = `pi-console-draft:${sessionId}`;
+		if (inputEl.value) localStorage.setItem(key, inputEl.value);
+		else localStorage.removeItem(key);
+	} catch { /* Keep the current text available if browser storage is full. */ }
+	if (pendingAttachments.length) draftAttachments.set(sessionId, pendingAttachments);
+	else draftAttachments.delete(sessionId);
+}
+
+function restoreComposerDraft() {
+	try {
+		inputEl.value = sessionId ? localStorage.getItem(`pi-console-draft:${sessionId}`) || "" : "";
+	} catch { inputEl.value = ""; }
+	pendingAttachments = draftAttachments.get(sessionId) || [];
+	renderAttachments();
+	resizeComposerInput();
+}
 
 const OFFICE_PREVIEW_WIDTH_KEY = "pi-console-office-preview-width";
 const CODE_EDITOR_WIDTH_KEY = "pi-console-code-editor-width";
@@ -247,21 +286,40 @@ const DELIVERABLE_FILE_RE = /\.[A-Za-z0-9]{1,16}$/i;
 // 基础请求
 // ---------------------------------------------------------------------------
 
+function apiToken() {
+	return desktopApiToken ?? localStorage.getItem(TOKEN_KEY);
+}
+
+async function ensureApiAuth() {
+	if (!window.piDesktop?.getApiToken) return;
+	if (!desktopAuthRequest) {
+		desktopAuthRequest = window.piDesktop.getApiToken().then((token) => {
+			if (typeof token !== "string" || !token) throw new Error("无法取得本机连接授权");
+			desktopApiToken = token;
+		}).catch((error) => { desktopAuthRequest = null; throw error; });
+	}
+	await desktopAuthRequest;
+}
+
 function authHeaders() {
-	const token = localStorage.getItem(TOKEN_KEY);
+	const token = apiToken();
 	return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-async function api(path, options = {}) {
+async function api(path, options = {}, retryAuth = true) {
+	await ensureApiAuth();
+	const sentToken = apiToken();
 	const res = await fetch(path, {
 		...options,
 		headers: { "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
 	});
 	if (res.status === 401) {
+		if (!retryAuth || window.piDesktop?.getApiToken) throw new Error("连接授权已失效，请重新启动 Pi");
+		if (apiToken() !== sentToken) return api(path, options, false);
 		const token = window.prompt("此服务器需要访问令牌（PI_CONSOLE_TOKEN），请输入：");
 		if (token !== null) {
 			localStorage.setItem(TOKEN_KEY, token);
-			return api(path, options);
+			return api(path, options, false);
 		}
 		throw new Error("未授权");
 	}
@@ -463,10 +521,12 @@ let sideBrowserLastUrl = "";
 let sidePanelSuppressed = false;
 
 const sideTabButtons = {
+	review: sideTabReviewEl,
 	terminal: sideTabTerminalEl,
 	browser: sideTabBrowserEl,
 };
 const sideTabPanes = {
+	review: reviewPaneEl,
 	terminal: terminalPaneEl,
 	browser: agentBrowserPaneEl,
 };
@@ -582,6 +642,10 @@ function restoreSidePanel() {
 sideTabTerminalEl.addEventListener("click", () => {
 	if (activeSideTab === "terminal" && sidePanelVisible()) closeSidePanel();
 	else showSidePanel("terminal");
+});
+sideTabReviewEl.addEventListener("click", () => {
+	if (activeSideTab === "review" && sidePanelVisible()) closeSidePanel();
+	else void showRepositoryDiff();
 });
 sideTabBrowserEl.addEventListener("click", () => {
 	if (activeSideTab === "browser" && sidePanelVisible()) closeSidePanel();
@@ -877,7 +941,7 @@ function codeLanguage(path) {
 	);
 }
 
-function ensureMonaco() {
+async function ensureMonaco() {
 	if (window.monaco) return Promise.resolve(window.monaco);
 	if (monacoLoading) return monacoLoading;
 	monacoLoading = new Promise((resolve, reject) => {
@@ -890,12 +954,17 @@ function ensureMonaco() {
 		loader.onerror = () => reject(new Error("Monaco 编辑器资源加载失败"));
 		document.head.appendChild(loader);
 	});
-	return monacoLoading;
+	try {
+		return await monacoLoading;
+	} catch (error) {
+		monacoLoading = null;
+		throw error;
+	}
 }
 
 function setCodeEditorDirty(dirty) {
 	codeEditorDirty = dirty;
-	codeEditorSaveEl.disabled = !dirty;
+	codeEditorSaveEl.disabled = !dirty || Boolean(codeEditorFile?.saving);
 	codeEditorStatusEl.textContent = dirty ? "有未保存修改" : "已保存";
 }
 
@@ -918,30 +987,46 @@ function setCodeEditorFocus(focused) {
 }
 
 async function openCodeEditor(path, name) {
+	const request = ++codeEditorOpenRequest;
+	if (codeEditorFile?.path === path) {
+		setCodeEditorDirty(codeEditorDirty);
+		codeEditor?.focus();
+		return true;
+	}
 	if (!catalogCache) catalogCache = await api("/api/catalog");
+	if (request !== codeEditorOpenRequest) return true;
 	const installed = catalogCache.tools?.some((tool) => tool.id === "code-development" && tool.installed);
 	if (!installed) return false;
 	if (codeEditorDirty && codeEditorFile?.path !== path && !window.confirm("当前代码文件还有未保存修改，仍要打开其他文件吗？")) {
 		return true;
 	}
+	const previousDocument = codeEditorFile;
+	const previousRevision = previousDocument?.revision;
 	if (!officePreviewPaneEl.hidden) await closeOfficePreview();
+	if (request !== codeEditorOpenRequest) return true;
 	if (!catalogViewEl.hidden) closeCatalog();
 	suspendSidePanel();
 	applyCodeEditorWidth(localStorage.getItem(CODE_EDITOR_WIDTH_KEY));
 	codeEditorPaneEl.hidden = false;
 	codeEditorResizerEl.hidden = false;
-	codeEditorTitleEl.textContent = name || path.split(/[\\/]/).pop() || "代码文件";
-	codeEditorPathEl.textContent = path;
-	codeEditorPathEl.title = path;
-	codeEditorStatusEl.textContent = "正在读取…";
-	codeEditorPreviewing = false;
-	codeEditorStageEl.hidden = false;
-	codeEditorMarkdownPreviewEl.hidden = true;
-	codeEditorPreviewEl.hidden = !/\.mdx?$/i.test(path);
-	codeEditorPreviewEl.textContent = "预览";
-	codeEditorPreviewEl.classList.remove("active");
+	codeEditorStatusEl.textContent = `正在打开 ${name || path}…`;
 	try {
 		const [monaco, file] = await Promise.all([ensureMonaco(), api(`/api/fs/text?path=${encodeURIComponent(path)}`)]);
+		if (request !== codeEditorOpenRequest) return true;
+		if (previousDocument === codeEditorFile && codeEditorDirty && previousRevision !== codeEditorFile?.revision &&
+			!window.confirm("读取文件期间又有新的修改，仍要放弃修改并切换文件吗？")) {
+			setCodeEditorDirty(true);
+			return true;
+		}
+		codeEditorTitleEl.textContent = name || path.split(/[\\/]/).pop() || "代码文件";
+		codeEditorPathEl.textContent = path;
+		codeEditorPathEl.title = path;
+		codeEditorPreviewing = false;
+		codeEditorStageEl.hidden = false;
+		codeEditorMarkdownPreviewEl.hidden = true;
+		codeEditorPreviewEl.hidden = !/\.mdx?$/i.test(path);
+		codeEditorPreviewEl.textContent = "预览";
+		codeEditorPreviewEl.classList.remove("active");
 		codeEditor?.getModel()?.dispose();
 		codeEditor?.dispose();
 		codeEditorStageEl.innerHTML = "";
@@ -956,47 +1041,62 @@ async function openCodeEditor(path, name) {
 			wordWrap: "off",
 		});
 		codeEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void saveCodeEditor());
-		codeEditorFile = { path, name: name || path.split(/[\\/]/).pop(), sha256: file.sha256, encoding: file.encoding };
+		codeEditorFile = { path, name: name || path.split(/[\\/]/).pop(), sha256: file.sha256, encoding: file.encoding, revision: 0, saving: false };
+		const documentState = codeEditorFile;
 		setCodeEditorDirty(false);
 		model.onDidChangeContent(() => {
+			if (codeEditorFile !== documentState) return;
+			documentState.revision++;
 			setCodeEditorDirty(true);
 			if (codeEditorPreviewing) renderMarkdownInto(codeEditorMarkdownPreviewEl, codeEditor.getValue());
 		});
 		codeEditor.focus();
 		return true;
 	} catch (error) {
-		codeEditorStatusEl.textContent = "打开失败";
+		if (request !== codeEditorOpenRequest) return true;
+		codeEditorStatusEl.textContent = codeEditorDirty ? "打开失败 · 当前文件有未保存修改" : "打开失败";
 		showError(`代码编辑器打开失败：${error.message}`);
-		return false;
+		return Boolean(codeEditor);
 	}
 }
 
 async function saveCodeEditor() {
-	if (!codeEditor || !codeEditorFile || !codeEditorDirty) return;
+	if (!codeEditor || !codeEditorFile || !codeEditorDirty || codeEditorFile.saving) return;
+	const editor = codeEditor;
+	const file = codeEditorFile;
+	const revision = file.revision;
+	const text = editor.getValue();
+	file.saving = true;
 	codeEditorSaveEl.disabled = true;
 	codeEditorStatusEl.textContent = "正在保存（code_save）";
 	try {
 		const saved = await api("/api/fs/text", {
 			method: "PUT",
 			body: JSON.stringify({
-				path: codeEditorFile.path,
-				text: codeEditor.getValue(),
-				expectedSha256: codeEditorFile.sha256,
+				path: file.path,
+				text,
+				expectedSha256: file.sha256,
 			}),
 		});
-		codeEditorFile.sha256 = saved.sha256;
-		setCodeEditorDirty(false);
+		file.sha256 = saved.sha256;
+		if (codeEditorFile !== file || codeEditor !== editor) return;
+		file.saving = false;
+		setCodeEditorDirty(file.revision !== revision);
 		if (currentFsPath) void loadFsDir(currentFsPath);
-		showInfo(`已保存 ${codeEditorFile.name}（code_save）`);
+		if (!codeEditorDirty) showInfo(`已保存 ${file.name}`);
 	} catch (error) {
+		if (codeEditorFile !== file || codeEditor !== editor) return;
 		codeEditorSaveEl.disabled = false;
 		codeEditorStatusEl.textContent = "保存失败";
 		showError(`保存代码失败：${error.message}`);
+	} finally {
+		file.saving = false;
 	}
 }
 
 function closeCodeEditor() {
 	if (codeEditorDirty && !window.confirm("当前代码文件还有未保存修改，确定关闭吗？")) return false;
+	codeEditorOpenRequest++;
 	codeEditor?.getModel()?.dispose();
 	codeEditor?.dispose();
 	codeEditor = null;
@@ -1012,6 +1112,7 @@ function closeCodeEditor() {
 }
 
 async function showRepositoryDiff() {
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	showSidePanel("review");
 	await loadReview();
 }
@@ -1249,7 +1350,7 @@ function handleTerminalToolStart(event) {
 }
 
 // 用户手动点击侧栏标签视为“我在看这里”：短期内终端工具不再自动切换标签
-for (const button of [sideTabTerminalEl, sideTabBrowserEl]) {
+for (const button of [sideTabTerminalEl, sideTabBrowserEl, sideTabReviewEl]) {
 	button.addEventListener("click", () => {
 		terminalAutoShowSuppressedAt = Date.now();
 	});
@@ -1389,11 +1490,12 @@ reviewCopyEl.addEventListener("click", () => {
 // ---------------------------------------------------------------------------
 
 async function ensureSession() {
+	const navigation = sessionNavigation;
 	if (sessionId) {
 		const targetSessionId = sessionId;
 		try {
-			const history = await api(`/api/sessions/${targetSessionId}/history`);
-			if (targetSessionId !== sessionId) return;
+			const history = await api(`/api/sessions/${targetSessionId}/history?limit=${historyDisplayLimit}`);
+			if (targetSessionId !== sessionId || navigation !== sessionNavigation) return;
 			renderHistory(history);
 			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
 			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
@@ -1408,10 +1510,12 @@ async function ensureSession() {
 		}
 	}
 	const result = await api("/api/sessions", { method: "POST", body: "{}" });
+	if (navigation !== sessionNavigation) { void loadSessions(); return; }
 	sessionId = result.sessionId;
 	localStorage.setItem(SESSION_KEY, sessionId);
 	clearMessages();
-	const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+	const history = await api(`/api/sessions/${sessionId}/history?limit=${historyDisplayLimit}`).catch(() => null);
+	if (navigation !== sessionNavigation) return;
 	if (history) renderHistory(history);
 	else setRunning(false, true);
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
@@ -1438,21 +1542,29 @@ function syncThinkingOptions(availableLevels) {
 /** 清空消息区（保留折叠控制条） */
 function clearMessages() {
 	messagesEl.querySelectorAll(".message").forEach((m) => m.remove());
+	historyMoreEl.hidden = true;
+	messagesToolbarEl.hidden = true;
 	messagesEmptyEl.hidden = false;
 	currentAssistant = null;
 	officeToolCalls.clear();
 }
 
 function renderHistory(history) {
+	renderingHistory = true;
+	try {
 	clearMessages();
 	clearTerminal();
 	clearActivity();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
+	lastStreamEpoch = history.streamEpoch ?? null;
+	let firstVisible = Math.max(0, history.messages.length - historyDisplayLimit);
+	while (firstVisible > 0 && history.messages[firstVisible]?.role !== "user") firstVisible--;
+	historyMoreEl.hidden = !history.hasMore && firstVisible === 0;
 	let latestAssistant = null;
 	let pendingCapabilityTrace = null;
-	for (const item of history.messages) {
+	for (const item of history.messages.slice(firstVisible)) {
 		if (item.role === "user") {
-			if (latestAssistant) latestAssistant.foldProcess();
+			if (latestAssistant) { latestAssistant.foldProcess(); void latestAssistant.finalizeArtifacts(); }
 			latestAssistant = null;
 			pendingCapabilityTrace = item.capabilityTrace || null;
 			appendMessage(
@@ -1487,7 +1599,6 @@ function renderHistory(history) {
 				}
 			}
 			if (item.usage) addModelUsageStep(container, item.usage, `history-usage-${item.timestamp}`);
-			void container.finalizeArtifacts();
 			if (item.errorMessage) showError(item.errorMessage);
 		} else if (item.role === "toolResult") {
 			const block = document.querySelector(`[data-tool-call-id="${CSS.escape(item.toolCallId)}"]`);
@@ -1498,16 +1609,21 @@ function renderHistory(history) {
 			if (latestAssistant && !item.isError) {
 				const path = findDeliverableToolPath(item.text);
 				if (path) latestAssistant.addArtifactPath(path);
-				void latestAssistant.finalizeArtifacts();
 			}
 		}
 	}
 	updateTerminalStatus();
 	if (latestAssistant) {
+		void latestAssistant.finalizeArtifacts();
 		if (history.streaming) currentAssistant = latestAssistant;
 		else latestAssistant.foldProcess();
 	}
 	setRunning(Boolean(history.streaming), true);
+	} finally {
+		renderingHistory = false;
+		applyCollapse();
+		scrollToBottom();
+	}
 }
 
 function addCapabilitySelectionStep(container, event) {
@@ -1552,9 +1668,10 @@ function connectSSE() {
 	if (!sessionId) return;
 	disconnectSSE();
 	const connectedSessionId = sessionId;
-	const token = localStorage.getItem(TOKEN_KEY);
+	const token = apiToken();
 	const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : "";
-	const source = new EventSource(`/api/sessions/${connectedSessionId}/stream?since=${lastSeq}${tokenQuery}`);
+	const epochQuery = lastStreamEpoch ? `&epoch=${encodeURIComponent(lastStreamEpoch)}` : "";
+	const source = new EventSource(`/api/sessions/${connectedSessionId}/stream?since=${lastSeq}${tokenQuery}${epochQuery}`);
 	es = source;
 
 	source.onopen = () => {
@@ -1593,12 +1710,17 @@ function connectSSE() {
 
 async function refreshFromHistory() {
 	const targetSessionId = sessionId;
+	const request = ++historyRequest;
+	disconnectSSE();
 	try {
-		const history = await api(`/api/sessions/${targetSessionId}/history`);
-		if (targetSessionId !== sessionId) return;
+		const history = await api(`/api/sessions/${targetSessionId}/history?limit=${historyDisplayLimit}`);
+		if (targetSessionId !== sessionId || request !== historyRequest) return;
 		renderHistory(history);
+		connectSSE();
 	} catch {
-		/* 等下次重连 */
+		if (targetSessionId !== sessionId || request !== historyRequest) return;
+		connStateEl.textContent = "正在恢复对话…";
+		reconnectTimer = setTimeout(() => void refreshFromHistory(), 2000);
 	}
 }
 
@@ -1607,7 +1729,7 @@ async function refreshFromHistory() {
 // ---------------------------------------------------------------------------
 
 /** 上次渲染的列表签名：5 秒轮询数据无变化时跳过 DOM 重建，避免闪烁与 hover 丢失 */
-let lastSessionsSignature = "";
+let lastSessionsSignature = null;
 
 async function loadSessions() {
 	try {
@@ -1646,7 +1768,7 @@ async function loadSessions() {
 			sessionsListEl.appendChild(row);
 		}
 	} catch (error) {
-		lastSessionsSignature = "";
+		lastSessionsSignature = null;
 		sessionsListEl.textContent = `加载失败：${error.message}`;
 	}
 }
@@ -1654,9 +1776,16 @@ async function loadSessions() {
 /** 切换到历史会话（服务端从磁盘恢复，消息与 SSE 随之切换） */
 async function switchSession(id) {
 	if (id === sessionId) return;
+	const navigation = ++sessionNavigation;
+	saveComposerDraft();
+	historyRequest++;
+	historyDisplayLimit = 100;
+	lastStreamEpoch = null;
 	await closeOfficePreview();
+	if (navigation !== sessionNavigation) return;
 	disconnectSSE();
 	sessionId = id;
+	restoreComposerDraft();
 	localStorage.setItem(SESSION_KEY, id);
 	clearMessages();
 	setRunning(false, true);
@@ -1682,7 +1811,16 @@ async function deleteSession(id) {
 	if (id === sessionId && !codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 	try {
 		await api(`/api/sessions/${id}`, { method: "DELETE" });
+		localStorage.removeItem(`pi-console-draft:${id}`);
+		draftAttachments.delete(id);
 		if (id === sessionId) {
+			sessionNavigation++;
+			historyRequest++;
+			historyDisplayLimit = 100;
+			lastStreamEpoch = null;
+			inputEl.value = "";
+			pendingAttachments = [];
+			renderAttachments();
 			const list = await api("/api/sessions").catch(() => []);
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
@@ -1763,12 +1901,22 @@ document.addEventListener("click", hideSessionContextMenu);
 document.addEventListener("contextmenu", hideSessionContextMenu);
 
 sessionNewBtnEl.addEventListener("click", async () => {
+	if (sessionNewBtnEl.disabled) return;
+	sessionNewBtnEl.disabled = true;
+	const navigation = ++sessionNavigation;
 	try {
 		if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
 		await closeOfficePreview();
+		if (navigation !== sessionNavigation) return;
+		saveComposerDraft();
 		disconnectSSE();
+		historyRequest++;
+		historyDisplayLimit = 100;
+		lastStreamEpoch = null;
 		const result = await api("/api/sessions", { method: "POST", body: "{}" });
+		if (navigation !== sessionNavigation) { void loadSessions(); return; }
 		sessionId = result.sessionId;
+		restoreComposerDraft();
 		localStorage.setItem(SESSION_KEY, sessionId);
 		clearMessages();
 		clearTerminal();
@@ -1779,6 +1927,9 @@ sessionNewBtnEl.addEventListener("click", async () => {
 		await pollContext();
 	} catch (error) {
 		showError(`新建对话失败：${error.message}`);
+		if (sessionId) connectSSE();
+	} finally {
+		sessionNewBtnEl.disabled = false;
 	}
 });
 
@@ -1868,8 +2019,9 @@ contextBtnEl.addEventListener("click", async () => {
 
 // 每 5 秒刷新当前上下文和左侧后台任务状态。
 setInterval(() => {
-	void pollContext();
-	void loadSessions();
+	if (document.hidden || statusPollRunning) return;
+	statusPollRunning = true;
+	void Promise.allSettled([pollContext(), loadSessions()]).finally(() => { statusPollRunning = false; });
 }, 5000);
 
 // ---------------------------------------------------------------------------
@@ -1932,6 +2084,7 @@ function handleEvent(event) {
 			break;
 		}
 		case "turn_end":
+			currentAssistant?.flushText();
 			if (event.stopReason === "error") showError(event.errorMessage || "模型返回错误");
 			if (event.usage && currentAssistant) {
 				addModelUsageStep(currentAssistant, event.usage, `usage-${event.seq}`);
@@ -1941,6 +2094,7 @@ function handleEvent(event) {
 			break;
 		case "agent_settled":
 			if (currentAssistant) {
+				currentAssistant.flushText();
 				currentAssistant.foldProcess();
 				void currentAssistant.finalizeArtifacts();
 			}
@@ -2123,6 +2277,28 @@ function renderArtifactCards(container, files) {
 	}
 }
 
+const artifactBatches = new Map();
+function resolveMessageArtifacts(id, data) {
+	return new Promise((resolve, reject) => {
+		let batch = artifactBatches.get(id);
+		if (!batch) {
+			batch = [];
+			artifactBatches.set(id, batch);
+			queueMicrotask(async () => {
+				artifactBatches.delete(id);
+				for (let start = 0; start < batch.length; start += 100) {
+					const items = batch.slice(start, start + 100);
+					try {
+						const result = await api(`/api/sessions/${id}/artifacts`, { method: "POST", body: JSON.stringify({ groups: items.map(item => item.data) }) });
+						items.forEach((item, index) => item.resolve(result.groups?.[index] || { files: [] }));
+					} catch (error) { items.forEach(item => item.reject(error)); }
+				}
+			});
+		}
+		batch.push({ data, resolve, reject });
+	});
+}
+
 function appendMessage(role, text, attachmentPaths = []) {
 	messagesEmptyEl.hidden = true;
 	const messageSessionId = sessionId;
@@ -2182,10 +2358,7 @@ function appendMessage(role, text, attachmentPaths = []) {
 	applyCollapse();
 	scrollToBottom();
 	if (role === "user" && attachmentPaths.length > 0 && messageSessionId) {
-		void api(`/api/sessions/${messageSessionId}/artifacts`, {
-			method: "POST",
-			body: JSON.stringify({ paths: attachmentPaths }),
-		})
+		void resolveMessageArtifacts(messageSessionId, { paths: attachmentPaths })
 			.then((result) => {
 				renderArtifactCards(sentAttachmentsEl, result.files);
 				scrollToBottom();
@@ -2211,11 +2384,8 @@ function appendMessage(role, text, attachmentPaths = []) {
 			if (role !== "assistant" || !messageSessionId) return;
 			const request = ++this._artifactRequest;
 			try {
-				const result = await api(`/api/sessions/${messageSessionId}/artifacts`, {
-					method: "POST",
-					body: JSON.stringify({ text: this._allTextBuffer || "", paths: [...this._artifactPaths] }),
-				});
-				if (request !== this._artifactRequest) return;
+				const result = await resolveMessageArtifacts(messageSessionId, { text: this._allTextBuffer || "", paths: [...this._artifactPaths] });
+				if (request !== this._artifactRequest || messageSessionId !== sessionId || !this.el.isConnected) return;
 				renderArtifactCards(this.artifactsEl, result.files);
 				for (const file of result.files || []) appendActivityArtifact(file);
 				scrollToBottom();
@@ -2333,11 +2503,17 @@ function appendMessage(role, text, attachmentPaths = []) {
 			this._thinkingBody.textContent += delta;
 			if (!this._thinkingBody.hidden) this._thinkingBody.scrollTop = this._thinkingBody.scrollHeight;
 		},
+		flushText() {
+			clearTimeout(this._renderTimer);
+			this._renderTimer = null;
+			renderMarkdownInto(this.textEl, this._textBuffer || "");
+		},
 		appendText(delta) {
 			this._textBuffer = (this._textBuffer ?? "") + delta;
 			this._allTextBuffer = (this._allTextBuffer ?? "") + delta;
-			clearTimeout(this._renderTimer);
+			if (this._renderTimer) return;
 			this._renderTimer = setTimeout(() => {
+				this._renderTimer = null;
 				// 流式渲染：避免每 token 全量重排
 				if (this._textBuffer.length > 4000) {
 					// 超长时把已渲染部分固化，只渲染增量
@@ -2836,11 +3012,16 @@ async function downloadPathLink(path, suggestedName) {
 			headers: authHeaders(),
 		});
 	try {
+		await ensureApiAuth();
+		const sentToken = apiToken();
 		let response = await request();
 		if (response.status === 401) {
-			const token = window.prompt("此服务器需要访问令牌（PI_CONSOLE_TOKEN），请输入：");
-			if (token === null) throw new Error("未授权");
-			localStorage.setItem(TOKEN_KEY, token);
+			if (window.piDesktop?.getApiToken) throw new Error("连接授权已失效，请重新启动 Pi");
+			if (apiToken() === sentToken) {
+				const token = window.prompt("此服务器需要访问令牌（PI_CONSOLE_TOKEN），请输入：");
+				if (token === null) throw new Error("未授权");
+				localStorage.setItem(TOKEN_KEY, token);
+			}
 			response = await request();
 		}
 		if (!response.ok) {
@@ -2873,19 +3054,25 @@ async function downloadPathLink(path, suggestedName) {
 /** 点击文件链接：读文件加入对话附件 */
 async function attachPathLink(path) {
 	if (!sessionId) return;
+	const targetSessionId = sessionId;
 	try {
-		const file = await api(`/api/sessions/${sessionId}/attach-from-path`, {
+		const file = await api(`/api/sessions/${targetSessionId}/attach-from-path`, {
 			method: "POST",
 			body: JSON.stringify({ path }),
 		});
-		pendingAttachments.push({
+		const attachment = {
 			name: file.name,
 			mimeType: file.mimeType,
 			dataBase64: file.dataBase64,
 			size: file.size,
 			isImage: IMAGE_MIME.has(file.mimeType),
-		});
-		renderAttachments();
+		};
+		const attachments = targetSessionId === sessionId ? pendingAttachments : draftAttachments.get(targetSessionId) || [];
+		if (attachments.length >= 32 || attachments.reduce((sum, item) => sum + item.size, file.size) > 50 * 1024 * 1024)
+			throw new Error("每次最多添加 32 个附件，总大小不能超过 50 MB");
+		attachments.push(attachment);
+		draftAttachments.set(targetSessionId, attachments);
+		if (targetSessionId === sessionId) { renderAttachments(); saveComposerDraft(); }
 		showInfo(`已将 ${file.name} 添加到对话附件`);
 	} catch (error) {
 		showError(`读取文件失败：${error.message}`);
@@ -2914,13 +3101,14 @@ function summarizeArgs(args) {
 
 function setRunning(value, restoreOnly = false) {
 	running = value;
+	historyMoreEl.disabled = value;
 	sendBtn.classList.toggle("is-running", value);
 	sendBtn.querySelector("span").textContent = value ? "停止" : "发送";
 	sendBtn.querySelector(".send-icon").hidden = value;
 	sendBtn.querySelector(".stop-icon").hidden = !value;
 	sendBtn.setAttribute("aria-label", value ? "停止生成" : "发送消息");
 	sendBtn.title = value ? "停止生成" : "发送消息";
-	sendBtn.disabled = false;
+	sendBtn.disabled = !value && pendingMessageSessions.has(sessionId);
 	if (!value) {
 		currentAssistant = null;
 		setIndicator(false);
@@ -2934,7 +3122,8 @@ function setIndicator(visible, text) {
 }
 
 function showError(message) {
-	errorBarEl.textContent = message;
+	clearTimeout(infoTimer);
+	errorBarEl.textContent = message || "操作未完成，请稍后重试";
 	errorBarEl.classList.remove("info-bar");
 	errorBarEl.classList.add("error-bar");
 	errorBarEl.hidden = false;
@@ -2946,6 +3135,7 @@ function showError(message) {
 
 let infoTimer = null;
 function showInfo(message) {
+	clearTimeout(showError._t);
 	errorBarEl.textContent = message;
 	errorBarEl.classList.remove("error-bar");
 	errorBarEl.classList.add("info-bar");
@@ -2959,6 +3149,7 @@ function showInfo(message) {
 }
 
 function scrollToBottom() {
+	if (renderingHistory) return;
 	const should = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 160;
 	if (should) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -2971,9 +3162,27 @@ const collapseBtnEl = $("collapse-btn");
 const collapseHintEl = $("collapse-hint");
 const messagesToolbarEl = $("messages-toolbar");
 let collapsed = false;
+const historyMoreEl = document.createElement("button");
+historyMoreEl.className = "secondary-btn small";
+historyMoreEl.textContent = "加载更早的消息";
+historyMoreEl.hidden = true;
+messagesToolbarEl.after(historyMoreEl);
+historyMoreEl.addEventListener("click", async () => {
+	const targetSessionId = sessionId;
+	historyMoreEl.disabled = true;
+	historyDisplayLimit += 100;
+	await refreshFromHistory();
+	if (sessionId === targetSessionId) {
+		collapsed = false;
+		applyCollapse();
+		messagesEl.scrollTop = 0;
+	}
+	historyMoreEl.disabled = running;
+});
 
 /** 折叠状态应用到消息列表：隐藏除最后 2 条外的消息 */
 function applyCollapse() {
+	if (renderingHistory) return;
 	const msgs = messagesEl.querySelectorAll(".message");
 	const keep = Math.max(0, msgs.length - 2);
 	messagesToolbarEl.hidden = msgs.length <= 2;
@@ -3074,17 +3283,38 @@ function fileToBase64(file) {
 	});
 }
 
-function addAttachment(file) {
-	fileToBase64(file).then((dataBase64) => {
-		pendingAttachments.push({
+async function addAttachment(file) {
+	const targetSessionId = sessionId;
+	if (!targetSessionId) return showError("请先创建对话，再添加附件");
+	const reads = attachmentReads.get(targetSessionId) || [];
+	const attachments = pendingAttachments;
+	if (file.size > 20 * 1024 * 1024) return showError("单个附件不能超过 20 MB");
+	if (attachments.length + reads.length >= 32) return showError("每次最多添加 32 个附件");
+	if ([...attachments, ...reads, file].reduce((sum, item) => sum + item.size, 0) > 50 * 1024 * 1024) return showError("附件总大小不能超过 50 MB");
+	reads.push(file);
+	attachmentReads.set(targetSessionId, reads);
+	try {
+		const dataBase64 = await fileToBase64(file);
+		const attachment = {
 			name: file.name,
 			mimeType: file.type || "application/octet-stream",
 			dataBase64,
 			size: file.size,
 			isImage: IMAGE_MIME.has(file.type),
-		});
-		renderAttachments();
-	});
+		};
+		if (targetSessionId === sessionId) {
+			pendingAttachments.push(attachment);
+			renderAttachments();
+			saveComposerDraft();
+		} else {
+			draftAttachments.set(targetSessionId, [...(draftAttachments.get(targetSessionId) || []), attachment]);
+		}
+	} catch {
+		showError(`无法读取附件 ${file.name}，请重新添加`);
+	} finally {
+		reads.splice(reads.indexOf(file), 1);
+		if (!reads.length) attachmentReads.delete(targetSessionId);
+	}
 }
 
 function renderAttachments() {
@@ -3101,6 +3331,7 @@ function renderAttachments() {
 		remove.addEventListener("click", () => {
 			pendingAttachments.splice(index, 1);
 			renderAttachments();
+			saveComposerDraft();
 		});
 		chip.appendChild(remove);
 		attachmentsEl.appendChild(chip);
@@ -3152,9 +3383,13 @@ window.addEventListener("paste", (e) => {
 
 async function sendMessage() {
 	const text = inputEl.value.trim();
-	if ((!text && pendingAttachments.length === 0) || running || !sessionId) return;
+	if ((!text && pendingAttachments.length === 0) || running || !sessionId || pendingMessageSessions.has(sessionId)) return;
+	if (attachmentReads.get(sessionId)?.length) return showInfo("附件正在读取，请稍后发送");
 	const targetSessionId = sessionId;
+	const originalInput = inputEl.value;
 	const attachmentsToSend = [...pendingAttachments];
+	saveComposerDraft();
+	pendingMessageSessions.add(targetSessionId);
 	inputEl.value = "";
 	resizeComposerInput();
 	errorBarEl.hidden = true;
@@ -3165,10 +3400,7 @@ async function sendMessage() {
 	let userBubble = null;
 
 	try {
-		const images = [];
-		for (const attachment of attachmentsToSend) {
-			if (attachment.isImage) images.push({ data: attachment.dataBase64, mimeType: attachment.mimeType });
-		}
+		let imageAttachments = [];
 		let savedPaths = [];
 		let messagePaths = [];
 		if (attachmentsToSend.length > 0) {
@@ -3179,9 +3411,12 @@ async function sendMessage() {
 				}),
 			});
 			savedPaths = saved.files;
+			imageAttachments = saved.imageFiles || [];
 			messagePaths = Array.isArray(saved.messageFiles) ? saved.messageFiles : saved.files;
-			pendingAttachments = pendingAttachments.filter((attachment) => !attachmentsToSend.includes(attachment));
-			renderAttachments();
+			if (targetSessionId === sessionId) {
+				pendingAttachments = pendingAttachments.filter((attachment) => !attachmentsToSend.includes(attachment));
+				renderAttachments();
+			}
 		}
 		if (targetSessionId === sessionId) {
 			userBubble = appendMessage(
@@ -3192,10 +3427,21 @@ async function sendMessage() {
 		}
 		await api(`/api/sessions/${targetSessionId}/messages`, {
 			method: "POST",
-			body: JSON.stringify({ text, images, attachments: savedPaths }),
+			body: JSON.stringify({ text, imageAttachments, attachments: savedPaths }),
 		});
+		if (targetSessionId === sessionId) saveComposerDraft();
+		else {
+			try {
+				const key = `pi-console-draft:${targetSessionId}`;
+				if (localStorage.getItem(key) === originalInput) localStorage.removeItem(key);
+			} catch { /* The live composer remains usable without local storage. */ }
+			const remaining = (draftAttachments.get(targetSessionId) || []).filter(attachment => !attachmentsToSend.includes(attachment));
+			if (remaining.length) draftAttachments.set(targetSessionId, remaining);
+			else draftAttachments.delete(targetSessionId);
+		}
 		void loadSessions(); // 首条消息后标题更新，并显示后台运行状态。
 	} catch (error) {
+		pendingMessageSessions.delete(targetSessionId);
 		showError(error.message);
 		if (targetSessionId === sessionId) {
 			setRunning(false);
@@ -3211,7 +3457,18 @@ async function sendMessage() {
 				renderAttachments();
 			}
 			inputEl.focus();
+			saveComposerDraft();
+		} else {
+			try {
+				const key = `pi-console-draft:${targetSessionId}`;
+				if (!localStorage.getItem(key) && originalInput) localStorage.setItem(key, originalInput);
+			} catch { /* Keep attachment drafts available even when storage is full. */ }
+			const existing = draftAttachments.get(targetSessionId) || [];
+			draftAttachments.set(targetSessionId, [...attachmentsToSend.filter(attachment => !existing.includes(attachment)), ...existing]);
 		}
+	} finally {
+		pendingMessageSessions.delete(targetSessionId);
+		if (targetSessionId === sessionId) setRunning(running, true);
 	}
 }
 
@@ -3240,7 +3497,21 @@ function resizeComposerInput() {
 }
 
 inputEl.addEventListener("input", resizeComposerInput);
+inputEl.addEventListener("input", () => {
+	clearTimeout(draftSaveTimer);
+	draftSaveTimer = setTimeout(saveComposerDraft, 200);
+});
+window.addEventListener("beforeunload", (event) => {
+	saveComposerDraft();
+	if (codeEditorDirty || codeEditorFile?.saving) {
+		event.preventDefault();
+		event.returnValue = "";
+	}
+});
+inputEl.addEventListener("compositionstart", () => { composerComposing = true; });
+inputEl.addEventListener("compositionend", () => { composerComposing = false; });
 inputEl.addEventListener("keydown", (e) => {
+	if (e.isComposing || composerComposing || e.keyCode === 229) return;
 	if (e.key === "Enter" && !e.shiftKey) {
 		e.preventDefault();
 		sendMessage();
@@ -3257,21 +3528,44 @@ function syncModelSelect(provider, modelId) {
 	if ([...modelSelectEl.options].some((o) => o.value === value)) modelSelectEl.value = value;
 }
 
+function filterModelOptions() {
+	const query = modelSearchEl.value.trim().toLocaleLowerCase();
+	for (const option of modelSelectEl.options) {
+		option.hidden = Boolean(query) && !`${option.textContent} ${option.value}`.toLocaleLowerCase().includes(query);
+	}
+	for (const group of modelSelectEl.querySelectorAll("optgroup")) group.hidden = [...group.children].every(option => option.hidden);
+}
+modelSearchToggleEl.addEventListener("click", () => {
+	modelSearchEl.hidden = !modelSearchEl.hidden;
+	modelSearchToggleEl.setAttribute("aria-expanded", String(!modelSearchEl.hidden));
+	if (modelSearchEl.hidden) { modelSearchEl.value = ""; filterModelOptions(); }
+	else modelSearchEl.focus();
+});
+modelSearchEl.addEventListener("input", filterModelOptions);
+
 async function loadModels() {
+	const request = ++modelsRequest;
+	const targetSessionId = sessionId;
 	try {
 		const models = await api("/api/models");
+		if (request !== modelsRequest) return;
 		modelSelectEl.innerHTML = "";
 		const authed = models.filter((m) => m.hasAuth);
 		if (authed.length > 0) {
-			const group = document.createElement("optgroup");
-			group.label = "已连接模型";
+			const groups = new Map();
 			for (const m of authed) {
+				let group = groups.get(m.provider);
+				if (!group) {
+					group = document.createElement("optgroup");
+					group.label = ({ antigravity: "Google Antigravity", "openai-codex": "Codex" })[m.provider] || m.provider;
+					groups.set(m.provider, group);
+					modelSelectEl.appendChild(group);
+				}
 				const option = document.createElement("option");
 				option.value = `${m.provider}/${m.modelId}`;
 				option.textContent = m.label;
 				group.appendChild(option);
 			}
-			modelSelectEl.appendChild(group);
 		} else {
 			const option = document.createElement("option");
 			option.value = "";
@@ -3279,7 +3573,9 @@ async function loadModels() {
 			modelSelectEl.appendChild(option);
 		}
 		modelSelectEl.disabled = authed.length === 0;
-		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+		filterModelOptions();
+		const history = targetSessionId ? await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null) : null;
+		if (request !== modelsRequest || targetSessionId !== sessionId) return;
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	} catch (error) {
 		showError(`加载模型列表失败：${error.message}`);
@@ -3300,7 +3596,7 @@ modelSelectEl.addEventListener("change", async () => {
 		syncThinkingOptions(result?.availableThinkingLevels);
 	} catch (error) {
 		showError(`切换模型失败：${error.message}`);
-		const history = await api(`/api/sessions/${sessionId}/history`).catch(() => null);
+		const history = await api(`/api/sessions/${sessionId}/history?limit=1`).catch(() => null);
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 		syncThinkingOptions(history?.availableThinkingLevels);
 	}
@@ -4499,9 +4795,11 @@ storageMigrateBtnEl.addEventListener("click", async () => {
 });
 
 async function loadFsDir(path) {
+	const request = ++fsRequest;
 	try {
 		fsSearchInputEl.value = "";
 		const result = await api(`/api/fs/list?path=${encodeURIComponent(path)}`);
+		if (request !== fsRequest) return;
 		currentFsPath = result.path;
 		currentFsParent = result.parent;
 		fsPathInputEl.value = result.path;
@@ -4523,6 +4821,7 @@ async function loadFsDir(path) {
 			fsTreeEl.appendChild(createFsRow(result.path, entry));
 		}
 	} catch (error) {
+		if (request !== fsRequest) return;
 		fsTreeEl.textContent = `加载失败：${error.message}`;
 	}
 }
@@ -4533,12 +4832,14 @@ async function runFsSearch() {
 		if (currentFsPath) await loadFsDir(currentFsPath);
 		return;
 	}
+	const request = ++fsRequest;
 	fsTreeEl.textContent = "正在本地搜索…";
 	try {
 		const mode = fsSearchModeEl.value === "content" ? "content" : "name";
 		const result = await api(
 			`/api/fs/search?path=${encodeURIComponent(currentFsPath)}&q=${encodeURIComponent(query)}&mode=${mode}`,
 		);
+		if (request !== fsRequest) return;
 		fsTreeEl.innerHTML = "";
 		fsLocationStateEl.textContent = `本地搜索 · 找到 ${result.results.length} 项${result.truncated ? "（结果已截断）" : ""}`;
 		if (result.results.length === 0) {
@@ -4547,6 +4848,7 @@ async function runFsSearch() {
 		}
 		for (const entry of result.results) fsTreeEl.appendChild(createFsSearchRow(entry));
 	} catch (error) {
+		if (request !== fsRequest) return;
 		fsTreeEl.textContent = `搜索失败：${error.message}`;
 	}
 }
@@ -4755,7 +5057,7 @@ async function openFilePreview(path, name, source = "file") {
 		if (source !== "message-attachment" && isTextPreviewPath(path) && (await openCodeEditor(path, shownName))) return;
 		if (/\.pdf$/i.test(path)) {
 			if (!catalogCache) catalogCache = await api("/api/catalog");
-			const token = localStorage.getItem(TOKEN_KEY);
+			const token = apiToken();
 			const rawUrl = `/api/fs/raw?path=${encodeURIComponent(path)}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
 			const pdfJsInstalled = catalogCache?.tools?.some((tool) => tool.id === "pdfjs" && tool.installed);
 			previewFile = { path, name: shownName, mimeType: "application/pdf", size: 0, isImage: false };
@@ -4877,6 +5179,7 @@ function openSettings(page = "general") {
 	settingsBtnEl.classList.remove("update-available");
 	setSettingsPage(page);
 	settingsModalEl.hidden = false;
+	settingsModalEl.querySelector(".settings-nav-btn.active")?.focus();
 	loadKeysSection();
 	loadCustomModelsSection();
 	loadCodexOAuthSection();
@@ -4890,10 +5193,37 @@ modelManageBtnEl.addEventListener("click", () => openSettings("models"));
 for (const button of settingsNavButtons) button.addEventListener("click", () => setSettingsPage(button.dataset.settingsTarget));
 settingsCloseEl.addEventListener("click", () => {
 	settingsModalEl.hidden = true;
+	settingsBtnEl.focus();
 });
 settingsModalEl.addEventListener("click", (e) => {
 	if (e.target === settingsModalEl) settingsModalEl.hidden = true;
 });
+
+// Keep keyboard navigation inside the visible dialog; Escape closes only that dialog.
+document.addEventListener("keydown", (event) => {
+	if (event.isComposing) return;
+	const modal = !previewModalEl.hidden ? previewModalEl : !settingsModalEl.hidden ? settingsModalEl : null;
+	if (!modal || !["Escape", "Tab"].includes(event.key)) return;
+	if (event.key === "Escape") {
+		event.preventDefault();
+		event.stopImmediatePropagation();
+		if (modal === previewModalEl) { closeFilePreview(); inputEl.focus(); }
+		else { settingsModalEl.hidden = true; settingsBtnEl.focus(); }
+		return;
+	}
+	const controls = [...modal.querySelectorAll('button, input, select, textarea, a[href], [tabindex="0"]')]
+		.filter(element => !element.disabled && element.getClientRects().length > 0);
+	const first = controls[0];
+	const last = controls.at(-1);
+	if (!first) return;
+	if (!modal.contains(document.activeElement) || (event.shiftKey && document.activeElement === first)) {
+		event.preventDefault();
+		(event.shiftKey ? last : first).focus();
+	} else if (!event.shiftKey && document.activeElement === last) {
+		event.preventDefault();
+		first.focus();
+	}
+}, true);
 
 function openExternalUrl(url) {
 	if (!/^https?:\/\//i.test(url || "")) return;
@@ -5321,6 +5651,8 @@ async function loadUpdateRecovery() {
 }
 
 updateRetryBtnEl.addEventListener("click", async () => {
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
+	saveComposerDraft();
 	updateRetryBtnEl.disabled = true;
 	updateStatusEl.textContent = "正在重新启动安装程序…";
 	updateOverlayEl.hidden = false;
@@ -5334,6 +5666,8 @@ updateRetryBtnEl.addEventListener("click", async () => {
 });
 
 updateRunBtnEl.addEventListener("click", async () => {
+	if (!codeEditorPaneEl.hidden && !closeCodeEditor()) return;
+	saveComposerDraft();
 	updateRunBtnEl.disabled = true;
 	updateStatusEl.textContent = "正在下载更新…";
 	updateProgressEl.hidden = false;
@@ -5410,23 +5744,20 @@ async function autoCheckUpdate() {
 
 (async function init() {
 	try {
-		await Promise.all([
-			// 目录接口失败不阻断启动：其余能力照常可用，目录稍后手动刷新
-			refreshCatalog().catch(() => showError("工具目录加载失败，可在工具页重试")),
-			loadModels(),
-			loadFsRoots(),
-			loadContextPanel(),
-			loadSessions(),
-			loadUpdateRecovery(),
-		]);
+		await Promise.all([loadModels(), loadSessions()]);
 		await ensureSession();
 		connectSSE();
 		inputEl.disabled = false;
+		restoreComposerDraft();
 		sendBtn.disabled = false;
 		modelSelectEl.disabled = !modelSelectEl.value;
 		thinkingSelectEl.disabled = false;
 		pollContext();
 		inputEl.focus();
+		void Promise.allSettled([
+			refreshCatalog().catch(() => showError("工具目录加载失败，可在工具页重试")),
+			loadFsRoots(), loadContextPanel(), loadUpdateRecovery(),
+		]);
 		// 右侧工作台默认关闭；智能体运行命令或用户使用快捷键时再打开，避免挤占对话空间。
 		void autoCheckUpdate();
 	} catch (error) {

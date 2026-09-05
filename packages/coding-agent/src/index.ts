@@ -23,7 +23,12 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
-export { readStoredCredential } from "./core/auth-storage.ts";
+export {
+	AuthStorage,
+	type AuthStorageBackend,
+	FileAuthStorageBackend,
+	readStoredCredential,
+} from "./core/auth-storage.ts";
 // Compaction
 export {
 	type BranchPreparation,

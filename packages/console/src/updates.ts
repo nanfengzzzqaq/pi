@@ -318,6 +318,8 @@ interface PendingUpdateRecord {
 	setupPath: string;
 	startedAt: number;
 	lastError?: string;
+	expectedBytes?: number;
+	expectedDigest?: string;
 }
 
 export interface UpdateRecovery {
@@ -362,14 +364,17 @@ function readPendingUpdate(updateDir = UPDATE_DIR): PendingUpdateRecord | null {
 	}
 }
 
-function recordPendingFailure(error: unknown): void {
+function recordPendingFailure(error: unknown, updateDir = UPDATE_DIR): void {
 	try {
-		const pending = readPendingUpdate();
+		const pending = readPendingUpdate(updateDir);
 		if (!pending) return;
-		writePendingUpdate({
-			...pending,
-			lastError: error instanceof Error ? error.message : String(error),
-		});
+		writePendingUpdate(
+			{
+				...pending,
+				lastError: error instanceof Error ? error.message : String(error),
+			},
+			updateDir,
+		);
 	} catch {
 		/* 记录失败原因是尽力而为，不能掩盖原始安装错误。 */
 	}
@@ -542,6 +547,7 @@ export async function runUpdate(): Promise<void> {
 		const info = await checkUpdate({ credential });
 		if (!info.assetUrl) throw new Error("无法获得更新包下载地址（GitHub 不可达或 Release 缺少 Setup 资产）");
 		if (!info.latest) throw new Error("GitHub Release 没有有效的版本号");
+		if (!info.assetDigest) throw new Error("更新包缺少可信校验信息，请稍后重新检查更新");
 		if (info.updateAvailable === false) throw new Error(`当前已是最新版 v${APP_VERSION}`);
 
 		mkdirSync(UPDATE_DIR, { recursive: true });
@@ -600,6 +606,8 @@ export async function runUpdate(): Promise<void> {
 			targetVersion: info.latest,
 			setupPath,
 			startedAt: Date.now(),
+			expectedBytes: progress.receivedBytes,
+			expectedDigest: info.assetDigest,
 		});
 		updateRecovery = null;
 		await launchDesktopUpdateInstaller({
@@ -628,19 +636,30 @@ export async function runUpdate(): Promise<void> {
 }
 
 /** 对上次失败且安装包仍在的更新重新执行安装，不重复下载。 */
-export async function retryPendingUpdate(): Promise<void> {
+export async function retryPendingUpdate(updateDir = UPDATE_DIR): Promise<void> {
 	if (progress.running) throw new Error("更新任务正在进行");
-	const pending = readPendingUpdate();
+	const pending = readPendingUpdate(updateDir);
 	if (!pending || !existsSync(pending.setupPath)) throw new Error("没有可重新安装的更新包，请重新检查更新");
 	progress = { running: true, receivedBytes: 0, totalBytes: null, error: null, phase: "installing" };
 	updateRecovery = null;
 	try {
-		writePendingUpdate({
-			fromVersion: pending.fromVersion,
-			targetVersion: pending.targetVersion,
-			setupPath: pending.setupPath,
-			startedAt: Date.now(),
-		});
+		if (!pending.expectedDigest) throw new Error("缓存安装包缺少校验记录，请重新下载更新");
+		await verifyDownloadedInstaller(
+			pending.setupPath,
+			statSync(pending.setupPath).size,
+			pending.expectedBytes ?? null,
+			pending.expectedDigest,
+		);
+		writePendingUpdate(
+			{
+				...pending,
+				fromVersion: pending.fromVersion,
+				targetVersion: pending.targetVersion,
+				setupPath: pending.setupPath,
+				startedAt: Date.now(),
+			},
+			updateDir,
+		);
 		await launchDesktopUpdateInstaller({
 			setupPath: pending.setupPath,
 			args: [...UPDATE_INSTALLER_ARGS],
@@ -654,8 +673,8 @@ export async function retryPendingUpdate(): Promise<void> {
 			error: error instanceof Error ? error.message : String(error),
 			phase: "idle",
 		};
-		recordPendingFailure(error);
-		updateRecovery = reconcilePendingUpdate();
+		recordPendingFailure(error, updateDir);
+		updateRecovery = reconcilePendingUpdate(updateDir);
 		throw error;
 	}
 }

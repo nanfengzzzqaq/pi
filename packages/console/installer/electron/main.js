@@ -6,12 +6,14 @@
  */
 import { app, BrowserWindow, Menu, dialog, ipcMain, nativeImage, shell } from "electron";
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { createServer as createProbeServer } from "node:net";
 import { AgentBrowserController } from "./browser-controller.js";
 import { registerAgentBrowserRuntime } from "./src/agent-browser-runtime.ts";
 import { handOffToDetachedInstaller, registerDesktopUpdateInstaller } from "./src/desktop-update-runtime.ts";
+import { isTrustedConsoleUrl } from "./src/http-security.ts";
 
 // 数据位置指针固定留在 AppData；实际数据目录可由用户在设置中整体迁移到其他磁盘。
 const storageConfigPath = join(app.getPath("appData"), "pi-console", "storage-location.json");
@@ -31,12 +33,17 @@ process.env.PI_CONSOLE_STORAGE_CONFIG = storageConfigPath;
 process.env.PI_CONSOLE_DATA = process.env.PI_CONSOLE_DATA ?? configuredDataPath();
 process.env.PI_CODING_AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(process.env.PI_CONSOLE_DATA, "agent");
 process.env.PORT = process.env.PORT ?? "3200";
+if (!process.env.PI_CONSOLE_TOKEN?.trim()) process.env.PI_CONSOLE_TOKEN = randomBytes(32).toString("hex");
 
 /**
  * 直接把已校验的安装包交给 electron-builder 的 NSIS 更新流程。
  * 不再派生 PowerShell/VBS 辅助脚本，避免脚本被执行策略或安全软件静默终止。
  */
 registerDesktopUpdateInstaller(async ({ setupPath, args, targetVersion }) => {
+	if (win && !win.isDestroyed() && isTrustedConsoleUrl(win.webContents.getURL(), APP_URL)) {
+		const unsaved = await win.webContents.executeJavaScript("Boolean(codeEditorDirty || codeEditorFile?.saving)");
+		if (unsaved) throw new Error("文件有未保存修改，请保存后在设置中重新安装更新");
+	}
 	const updateRoot = resolve(process.env.PI_CONSOLE_DATA, "update");
 	const setup = resolve(setupPath);
 	const prefix = updateRoot.endsWith(sep) ? updateRoot : updateRoot + sep;
@@ -67,6 +74,24 @@ const APP_URL = `http://127.0.0.1:${APP_PORT}/`;
 
 let win = null;
 let agentBrowser = null;
+
+function isTrustedSender(event) {
+	return Boolean(win && !win.isDestroyed() && event.sender === win.webContents &&
+		event.senderFrame === win.webContents.mainFrame && isTrustedConsoleUrl(event.senderFrame.url, APP_URL));
+}
+
+function handleTrusted(channel, handler) {
+	ipcMain.handle(channel, (event, ...args) => {
+		if (!isTrustedSender(event)) throw new Error("请求不是来自 Pi 主界面");
+		return handler(event, ...args);
+	});
+}
+
+function listenTrusted(channel, handler) {
+	ipcMain.on(channel, (event, ...args) => {
+		if (isTrustedSender(event)) handler(event, ...args);
+	});
+}
 
 /** 检测端口是否被占用（旧版服务仍在跑） */
 function portInUse(port) {
@@ -159,12 +184,19 @@ function createWindow() {
 		},
 	});
 	registerContextMenu(win);
+	win.webContents.on("will-prevent-unload", (event) => {
+		const choice = dialog.showMessageBoxSync(win, {
+			type: "warning", buttons: ["继续编辑", "关闭并放弃修改"], defaultId: 0, cancelId: 0,
+			message: "文件还有未保存的修改", detail: "关闭客户端会丢失这些文件修改。未发送的文字草稿已保留。",
+		});
+		if (choice === 1) event.preventDefault();
+	});
 	win.webContents.setWindowOpenHandler(({ url }) => {
 		if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
 		return { action: "deny" };
 	});
 	win.webContents.on("will-navigate", (event, url) => {
-		if (url.startsWith(APP_URL)) return;
+		if (isTrustedConsoleUrl(url, APP_URL)) return;
 		event.preventDefault();
 		if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
 	});
@@ -174,7 +206,7 @@ function createWindow() {
 	});
 }
 
-ipcMain.on("pi:file-drag-start", (event, path) => {
+listenTrusted("pi:file-drag-start", (event, path) => {
 	try {
 		const file = resolve(String(path));
 		if (!existsSync(file) || !statSync(file).isFile()) return;
@@ -185,16 +217,17 @@ ipcMain.on("pi:file-drag-start", (event, path) => {
 	}
 });
 
-ipcMain.handle("pi:browser-open", (_event, url) => agentBrowser?.open(typeof url === "string" ? url : undefined));
-ipcMain.handle("pi:browser-hide", () => agentBrowser?.hide());
-ipcMain.handle("pi:browser-state", () => agentBrowser?.state());
-ipcMain.handle("pi:browser-navigate", (_event, url) => agentBrowser?.navigate(String(url ?? "")));
-ipcMain.handle("pi:browser-back", () => agentBrowser?.back());
-ipcMain.handle("pi:browser-forward", () => agentBrowser?.forward());
-ipcMain.handle("pi:browser-reload", () => agentBrowser?.reload());
-ipcMain.handle("pi:browser-devtools", () => agentBrowser?.toggleDevtools());
-ipcMain.handle("pi:browser-pick-element", () => agentBrowser?.pickElement());
-ipcMain.handle("pi:browser-screenshot", async () => {
+handleTrusted("pi:api-token", () => process.env.PI_CONSOLE_TOKEN);
+handleTrusted("pi:browser-open", (_event, url) => agentBrowser?.open(typeof url === "string" ? url : undefined));
+handleTrusted("pi:browser-hide", () => agentBrowser?.hide());
+handleTrusted("pi:browser-state", () => agentBrowser?.state());
+handleTrusted("pi:browser-navigate", (_event, url) => agentBrowser?.navigate(String(url ?? "")));
+handleTrusted("pi:browser-back", () => agentBrowser?.back());
+handleTrusted("pi:browser-forward", () => agentBrowser?.forward());
+handleTrusted("pi:browser-reload", () => agentBrowser?.reload());
+handleTrusted("pi:browser-devtools", () => agentBrowser?.toggleDevtools());
+handleTrusted("pi:browser-pick-element", () => agentBrowser?.pickElement());
+handleTrusted("pi:browser-screenshot", async () => {
 	if (!agentBrowser) return null;
 	const title = String(agentBrowser.state().title || "网页截图").replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
 	const options = {
@@ -207,9 +240,9 @@ ipcMain.handle("pi:browser-screenshot", async () => {
 	await agentBrowser.screenshot(result.filePath);
 	return { path: result.filePath };
 });
-ipcMain.on("pi:browser-bounds", (_event, bounds) => agentBrowser?.setBounds(bounds));
+listenTrusted("pi:browser-bounds", (_event, bounds) => agentBrowser?.setBounds(bounds));
 
-ipcMain.handle("pi:choose-directory", async () => {
+handleTrusted("pi:choose-directory", async () => {
 	const options = {
 		properties: ["openDirectory", "createDirectory"],
 		title: "选择保存位置",
@@ -218,14 +251,14 @@ ipcMain.handle("pi:choose-directory", async () => {
 	return result.canceled ? null : result.filePaths[0];
 });
 
-ipcMain.handle("pi:open-external", async (_event, url) => {
+handleTrusted("pi:open-external", async (_event, url) => {
 	const target = String(url);
 	if (!/^https?:\/\//i.test(target)) return false;
 	await shell.openExternal(target);
 	return true;
 });
 
-ipcMain.on("pi:relaunch", () => {
+listenTrusted("pi:relaunch", () => {
 	app.relaunch();
 	app.exit(0);
 });

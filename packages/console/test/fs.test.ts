@@ -1,7 +1,8 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import * as fileSystem from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	copyFileIntoDirectory,
 	getDirectoryInfo,
@@ -11,6 +12,80 @@ import {
 	searchFiles,
 	writeTextFile,
 } from "../src/fs.ts";
+
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof fileSystem>();
+	return { ...actual, fsyncSync: vi.fn(actual.fsyncSync), renameSync: vi.fn(actual.renameSync) };
+});
+
+afterEach(() => {
+	vi.clearAllMocks();
+	vi.unstubAllEnvs();
+});
+
+describe("文本保存可靠性", () => {
+	it("原子替换失败时保留原文件及临时文件之外的其他文件", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-atomic-failure-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		const file = join(root, "app.ts");
+		writeFileSync(file, "original");
+		writeFileSync(join(root, ".pi-edit-existing.tmp"), "unrelated");
+		const opened = readTextFile(file);
+		vi.mocked(fileSystem.renameSync).mockImplementationOnce(() => {
+			throw new Error("file is locked");
+		});
+		expect(() => writeTextFile(file, "replacement", opened.sha256)).toThrow("file is locked");
+		expect(readFileSync(file, "utf8")).toBe("original");
+		expect(readdirSync(root).sort()).toEqual([".pi-edit-existing.tmp", "app.ts"]);
+		expect(readFileSync(join(root, ".pi-edit-existing.tmp"), "utf8")).toBe("unrelated");
+	});
+
+	it("写入替换文件期间发生外部修改时拒绝覆盖并清理临时文件", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-save-conflict-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		const file = join(root, "app.ts");
+		writeFileSync(file, "original");
+		const opened = readTextFile(file);
+		const flush = vi.mocked(fileSystem.fsyncSync).getMockImplementation()!;
+		vi.mocked(fileSystem.fsyncSync).mockImplementationOnce((descriptor) => {
+			flush(descriptor);
+			writeFileSync(file, "other program");
+		});
+		expect(() => writeTextFile(file, "my changes", opened.sha256)).toThrow("其他程序修改");
+		expect(readFileSync(file, "utf8")).toBe("other program");
+		expect(readdirSync(root)).toEqual(["app.ts"]);
+	});
+
+	it("刷盘失败时原内容完整且没有留下本次临时文件", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-flush-failure-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		const file = join(root, "app.ts");
+		writeFileSync(file, "original");
+		const opened = readTextFile(file);
+		vi.mocked(fileSystem.fsyncSync).mockImplementationOnce(() => {
+			throw new Error("disk failure");
+		});
+		expect(() => writeTextFile(file, "replacement", opened.sha256)).toThrow("disk failure");
+		expect(readFileSync(file, "utf8")).toBe("original");
+		expect(readdirSync(root)).toEqual(["app.ts"]);
+	});
+
+	it("保存 UTF-16BE 文本保留 BOM、编码与文件权限", () => {
+		const root = mkdtempSync(join(tmpdir(), "pi-fs-mode-encoding-"));
+		vi.stubEnv("PI_CONSOLE_FS_ROOT", root);
+		const file = join(root, "script.ps1");
+		writeFileSync(file, Buffer.from([0xfe, 0xff, 0, 65]));
+		if (process.platform !== "win32") chmodSync(file, 0o750);
+		const mode = statSync(file).mode & 0o7777;
+		const opened = readTextFile(file);
+		const saved = writeTextFile(file, "B中", opened.sha256);
+		expect(readFileSync(file)).toEqual(Buffer.from([0xfe, 0xff, 0, 66, 0x4e, 0x2d]));
+		expect(statSync(file).mode & 0o7777).toBe(mode);
+		expect(saved.encoding).toBe("utf-16be");
+		expect(saved.text).toBe("B中");
+		expect(saved.sha256).not.toBe(opened.sha256);
+	});
+});
 
 describe("Windows 本地资源管理器", () => {
 	it.runIf(process.platform === "win32")("浏览任意本地目录并标记父目录", () => {

@@ -20,7 +20,7 @@
 			<span class="brand-copy"><strong class="logo">Pi</strong><small>Agent Console</small></span>
 		</div>
 		<span class="topbar-divider" aria-hidden="true"></span>
-		<span id="conn-state" class="conn-state">连接中…</span>
+		<span id="conn-state" class="conn-state" role="status" aria-live="polite">连接中…</span>
 		<div class="topbar-right">
 			<button id="workbench-btn" class="secondary-btn small topbar-action" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 4.5h13v11h-13zM11.5 4.5v11M4 8h7"></path></svg><span>工作台</span></button>
 			<button id="agent-browser-btn" class="secondary-btn small topbar-action" type="button" title="打开客户端独立浏览器（agent_browser）"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg><span>浏览器</span></button>
@@ -112,7 +112,7 @@
 
 			<div id="conversation-workbench" class="conversation-workbench">
 				<section id="chat-pane" class="chat-pane">
-					<div id="error-bar" class="error-bar" hidden></div>
+					<div id="error-bar" class="error-bar" role="status" aria-live="polite" hidden></div>
 
 					<main id="messages" class="messages">
 						<div class="messages-toolbar" id="messages-toolbar" hidden>
@@ -140,7 +140,7 @@
 							<div class="composer-input-box">
 								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 10.5 11 6a3 3 0 0 1 4.2 4.2l-5.8 5.8a4.3 4.3 0 0 1-6.1-6.1l6-6"></path></svg></button>
 								<input type="file" id="file-input" multiple hidden>
-								<textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
+								<textarea id="input" rows="1" aria-label="消息" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
 							</div>
 							<div class="composer-buttons">
 								<button id="send-btn" type="button" aria-label="发送" disabled><span>发送</span><svg class="send-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 11-5-3.8 10-2.1-3.7zM9.1 11.3 15 5"></path></svg><svg class="stop-icon" viewBox="0 0 20 20" aria-hidden="true" hidden><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg></button>
@@ -151,6 +151,8 @@
 							<select id="model-select" title="模型" disabled>
 								<option value="">加载中…</option>
 							</select>
+							<button id="model-search-toggle" class="composer-mini-btn" type="button" aria-expanded="false" aria-controls="model-search" title="搜索模型">搜索</button>
+							<input id="model-search" type="search" aria-label="搜索模型名称或来源" placeholder="模型名称或来源" size="14" hidden>
 							<span class="composer-model-label">思考</span>
 							<select id="thinking-select" title="思考等级" disabled>
 								<option value="off">off</option>
@@ -202,12 +204,12 @@
 				<section id="code-editor-pane" class="code-editor-pane" hidden>
 					<header class="code-editor-header">
 						<div class="code-editor-heading">
-							<span class="office-preview-kicker">代码编辑器（code_editor）</span>
+							<span class="office-preview-kicker">文件编辑</span>
 							<strong id="code-editor-title" class="office-preview-title">代码文件</strong>
 							<span id="code-editor-status" class="office-preview-status">未修改</span>
 						</div>
 						<div class="office-preview-actions">
-							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异（git_diff）" hidden>查看差异</button>
+							<button id="code-editor-diff" class="secondary-btn small" type="button" title="查看工作区代码差异">查看差异</button>
 							<button id="code-editor-preview" class="secondary-btn small" type="button" title="预览 Markdown" hidden>预览</button>
 							<button id="code-editor-focus" class="secondary-btn small" type="button" title="进入专注模式">专注</button>
 							<button id="code-editor-save" class="primary-btn small" type="button" title="保存当前文件（code_save）" disabled>保存</button>
@@ -323,6 +325,7 @@
 					</div>
 
 					<nav class="workbench-tabs" aria-label="侧栏视图">
+						<button id="side-tab-review" class="workbench-tab" type="button" title="查看工作区代码差异"><span>差异</span></button>
 						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
 							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 6 3.5 4-3.5 4M10.5 14h5"></path></svg></span><span>终端</span>
 						</button>
@@ -358,7 +361,7 @@
 	</div>
 
 	<!-- 文件预览弹层 -->
-	<div id="preview-modal" class="modal" hidden>
+	<div id="preview-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="preview-title" hidden>
 		<div class="modal-body preview-body">
 			<div class="modal-header">
 				<span class="modal-title" id="preview-title">预览</span>
@@ -371,7 +374,7 @@
 		</div>
 	</div>
 
-	<div id="settings-modal" class="modal" hidden>
+	<div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-label="设置" hidden>
 		<div class="modal-body settings-body">
 			<div class="modal-header">
 				<div class="settings-title-group">

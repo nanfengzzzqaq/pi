@@ -1,5 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	copyFileSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, join } from "node:path";
 
 interface AttachmentSnapshotEntry {
@@ -25,14 +38,68 @@ function attachmentKey(workingPath: string): string {
 	return workingPath.trim().replace(/\\/g, "/");
 }
 
-function readSnapshotIndex(directory: string): AttachmentSnapshotIndex {
-	try {
-		const parsed = JSON.parse(readFileSync(join(directory, INDEX_FILE), "utf8")) as unknown;
-		if (typeof parsed === "object" && parsed !== null) return parsed as AttachmentSnapshotIndex;
-	} catch {
-		// 首次保存或索引损坏时从空索引继续；现有快照文件不会被覆盖。
+function parseSnapshotIndex(text: string): AttachmentSnapshotIndex {
+	const parsed: unknown = JSON.parse(text);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("附件索引格式无效");
+	const index: AttachmentSnapshotIndex = Object.create(null);
+	for (const [key, value] of Object.entries(parsed)) {
+		if (!key || !value || typeof value !== "object" || Array.isArray(value)) throw new Error("附件索引记录无效");
+		const entry = value as Record<string, unknown>;
+		if (
+			typeof entry.directory !== "string" ||
+			!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(entry.directory) ||
+			typeof entry.name !== "string" ||
+			!entry.name ||
+			entry.name === "." ||
+			entry.name === ".." ||
+			/[\\/\0]/u.test(entry.name)
+		) {
+			throw new Error("附件索引记录无效");
+		}
+		index[key] = { directory: entry.directory, name: entry.name };
 	}
-	return {};
+	return index;
+}
+
+function atomicWrite(path: string, content: string | Buffer): void {
+	const temporary = `${path}.${randomUUID()}.tmp`;
+	let created = false;
+	try {
+		const descriptor = openSync(temporary, "wx", 0o600);
+		created = true;
+		try {
+			writeFileSync(descriptor, content);
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		renameSync(temporary, path);
+	} finally {
+		if (created && existsSync(temporary)) unlinkSync(temporary);
+	}
+}
+
+function readSnapshotIndex(directory: string): AttachmentSnapshotIndex {
+	const path = join(directory, INDEX_FILE);
+	if (!existsSync(path) && !existsSync(`${path}.bak`)) return Object.create(null) as AttachmentSnapshotIndex;
+	try {
+		return parseSnapshotIndex(readFileSync(path, "utf8"));
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code !== "ENOENT") throw error;
+		let backup: string;
+		let index: AttachmentSnapshotIndex;
+		try {
+			backup = readFileSync(`${path}.bak`, "utf8");
+			index = parseSnapshotIndex(backup);
+		} catch {
+			throw new Error(`附件索引无法读取，已保留原文件，请从备份恢复：${path}`);
+		}
+		// Preserve the damaged bytes without removing the live index before a replacement is ready.
+		if (existsSync(path)) copyFileSync(path, `${path}.corrupt-${randomUUID()}`, constants.COPYFILE_EXCL);
+		atomicWrite(path, backup);
+		console.warn("附件索引已从最后有效备份恢复，损坏文件已保留");
+		return index;
+	}
 }
 
 /**
@@ -47,16 +114,22 @@ export function saveAttachmentSnapshot(
 	data: Buffer,
 ): string {
 	const directory = sessionSnapshotDirectory(dataDir, sessionId);
+	const index = readSnapshotIndex(directory);
+	const previous = `${JSON.stringify(index, null, "\t")}\n`;
+	const indexPath = join(directory, INDEX_FILE);
+	const hadIndex = existsSync(indexPath);
 	const snapshotDirectory = randomUUID();
 	const safeName = basename(fileName).slice(0, 200) || "未命名文件";
 	const targetDirectory = join(directory, snapshotDirectory);
 	mkdirSync(targetDirectory, { recursive: true });
 	const snapshotPath = join(targetDirectory, safeName);
-	writeFileSync(snapshotPath, data);
+	atomicWrite(snapshotPath, data);
 
-	const index = readSnapshotIndex(directory);
 	index[attachmentKey(workingPath)] = { directory: snapshotDirectory, name: safeName };
-	writeFileSync(join(directory, INDEX_FILE), `${JSON.stringify(index, null, "\t")}\n`, "utf8");
+	const content = `${JSON.stringify(index, null, "\t")}\n`;
+	parseSnapshotIndex(content);
+	atomicWrite(`${indexPath}.bak`, hadIndex ? previous : content);
+	atomicWrite(indexPath, content);
 	return snapshotPath;
 }
 

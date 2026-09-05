@@ -40,6 +40,11 @@
 	box-sizing: border-box;
 }
 
+/* Component display rules must never reveal a hidden control or panel. */
+[hidden] {
+	display: none !important;
+}
+
 html,
 body {
 	height: 100%;
@@ -3451,8 +3456,8 @@ input:disabled {
 
 @container (max-width: 720px) {
 	.composer-bottom {
-		display: grid;
-		grid-template-columns: auto minmax(120px, 1fr) auto minmax(84px, auto) auto;
+		display: flex;
+		flex-wrap: wrap;
 		gap: 7px;
 	}
 
@@ -3466,7 +3471,7 @@ input:disabled {
 	}
 
 	.composer-mini-btn {
-		display: none;
+		display: inline-flex;
 	}
 }
 
@@ -6435,7 +6440,25 @@ body::before {
 	border-radius: 8px;
 	background-color: rgb(255 255 255 / 0.025);
 	color: var(--muted);
-	font-size: 10.5px;
+	font-size: 12px;
+}
+
+#model-select {
+	max-width: min(320px, 100%);
+	min-width: 120px;
+	flex: 1 1 160px;
+}
+
+#model-search {
+	min-width: 120px;
+	max-width: 100%;
+	flex: 1 1 160px;
+	padding: 5px 8px;
+	border: 1px solid var(--border-strong);
+	border-radius: 8px;
+	background: var(--panel);
+	color: var(--text);
+	font: inherit;
 }
 
 .composer-bottom select:hover,
@@ -6450,8 +6473,8 @@ body::before {
 	padding: 4px 8px !important;
 	border-color: var(--border) !important;
 	background: rgb(255 255 255 / 0.02) !important;
-	color: var(--faint) !important;
-	font-size: 10px !important;
+	color: var(--muted) !important;
+	font-size: 11.5px !important;
 }
 
 .context-ring-btn {

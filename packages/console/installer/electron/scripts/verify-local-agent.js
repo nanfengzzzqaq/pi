@@ -19,6 +19,16 @@ export const LOCAL_AI_CRITICAL_FILES = [
 
 export const CONSOLE_CRITICAL_FILES = [
 	"src/server.ts",
+	"src/attachment-images.ts",
+	"src/attachment-snapshots.ts",
+	"src/credentials.ts",
+	"src/event-replay.ts",
+	"src/fs.ts",
+	"src/http-body.ts",
+	"src/http-security.ts",
+	"src/session-index.ts",
+	"src/storage.ts",
+	"src/updates.ts",
 	"src/packs.ts",
 	"src/custom-models.ts",
 	"src/antigravity-oauth.ts",
@@ -29,6 +39,7 @@ export const CONSOLE_CRITICAL_FILES = [
 	"src/agent-browser-runtime.ts",
 	"src/agent-browser-tools.ts",
 	"web/app.js",
+	"web/style.css",
 	"web/index.html",
 	"web/antigravity-login.js",
 	"packs/agent-browser/pack.json",
@@ -36,7 +47,7 @@ export const CONSOLE_CRITICAL_FILES = [
 	"packs/web-search/pack.json",
 ];
 
-export const ELECTRON_ASAR_CRITICAL_FILES = ["browser-controller.js"];
+export const ELECTRON_ASAR_CRITICAL_FILES = ["browser-controller.js", "main.js", "preload.cjs", "preload.js"];
 
 const PACKAGED_AGENT_ROOT = "node_modules/@earendil-works/pi-coding-agent";
 const PACKAGED_AI_PACKAGE_PATH = "@earendil-works/pi-ai";

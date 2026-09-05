@@ -28,6 +28,7 @@ import {
 } from "./agent-browser-runtime.ts";
 import { AntigravityOAuthCoordinator } from "./antigravity-oauth.ts";
 import { extractFileReferences } from "./artifacts.ts";
+import { resolveAttachmentImages } from "./attachment-images.ts";
 import {
 	deleteAttachmentSnapshots,
 	resolveAttachmentSnapshots,
@@ -37,9 +38,12 @@ import { bundledProviderExtensionPaths, createAntigravityModelRefresher } from "
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
 import { instantiateCoreFileTools } from "./core-file-tools.ts";
+import { createConsoleCredentials } from "./credentials.ts";
 import * as customModels from "./custom-models.ts";
+import { needsEventResync } from "./event-replay.ts";
 import * as fsExplorer from "./fs.ts";
-import { isAllowedLoopbackHost } from "./http-security.ts";
+import { HttpBodyError, readBodyJson } from "./http-body.ts";
+import { isAllowedLoopbackHost, isAllowedRequestOrigin, safeFileHeaders } from "./http-security.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
@@ -67,6 +71,7 @@ import {
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
 import * as redteam from "./redteam.ts";
+import { readSessionIndexFile, type SessionIndexEntry, writeSessionIndexFile } from "./session-index.ts";
 import {
 	abortTrackedSessionPrompt,
 	disposeSessionBeforeDelete,
@@ -133,8 +138,6 @@ updates.cleanupStaleUpdateFiles();
 
 /** 每会话保留的最近事件数（SSE 重连补发用） */
 const MAX_BUFFERED_EVENTS = 500;
-/** 普通请求 body 大小上限（文件上传接口单独放宽） */
-const MAX_BODY_BYTES = 1024 * 1024;
 /** 文件上传上限：单文件 20MB、总量 50MB */
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_TOTAL_FILE_BYTES = 50 * 1024 * 1024;
@@ -160,6 +163,7 @@ interface ConsoleSession {
 	session: AgentSession;
 	events: BufferedEvent[];
 	nextSeq: number;
+	streamEpoch: string;
 	sseClients: Set<ServerResponse>;
 	/** 这个会话绑定的助手；与全局“已启用”目录分离。 */
 	enabledPacks: Set<string>;
@@ -173,10 +177,32 @@ interface ConsoleSession {
 	deleting: boolean;
 	/** 包含鉴权/扩展预处理阶段，避免 isStreaming 尚未置位时删除形成孤儿任务。 */
 	activePrompt: TrackedSessionPrompt | null;
+	/** 切换模型会异步检查鉴权；删除必须等它结束，避免重新写入已删除的会话文件。 */
+	modelChange: Promise<void> | null;
 }
 
 const sessions = new Map<string, ConsoleSession>();
 const restoringSessions = new Map<string, Promise<ConsoleSession | null>>();
+let pendingMutations = 0;
+let storageRestartRequired = false;
+
+function hasActiveDataWork(): boolean {
+	return (
+		pendingMutations > 1 ||
+		restoringSessions.size > 0 ||
+		[...sessions.values()].some((cs) => cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting) ||
+		officecli.getDownloadProgress().running ||
+		redteam.getInstallProgress().running ||
+		codeDevelopment.getCodeDevelopmentProgress().running ||
+		codeDevelopment.getGithubLoginProgress().running ||
+		codeDevelopment.getDeveloperComponents().some((component) => component.progress?.running) ||
+		(["pdfjs", "sevenzip", "ocr", "libreoffice"] as const).some(
+			(id) => managedFileTools.getManagedToolProgress(id).running,
+		) ||
+		["starting", "waiting"].includes(codexOAuth.status().phase) ||
+		["starting", "waiting"].includes(antigravityOAuth.status().phase)
+	);
+}
 
 const SENSITIVE_TOOL_FIELD =
 	/^(?:access_?token|provisional_?token|refresh_?token|id_?token|token|authorization|auth|api_?key|secret|session|sid)$/i;
@@ -235,30 +261,12 @@ interface CapabilityTrace extends ToolSnapshot {
 // 会话索引（持久化：sessionId → cwd/title，支持列表与重启恢复）
 // ---------------------------------------------------------------------------
 
-interface SessionIndexEntry {
-	cwd: string;
-	/** Pi 会话文件路径（恢复消息用） */
-	sessionFile?: string;
-	/** 会话绑定的助手。旧索引没有该字段时，在恢复时迁移一次。 */
-	enabledPacks?: string[];
-	title: string;
-	createdAt: number;
-	updatedAt: number;
-}
-
 function readSessionIndex(): Record<string, SessionIndexEntry> {
-	try {
-		const raw = JSON.parse(readFileSync(SESSION_INDEX_FILE, "utf8"));
-		if (typeof raw === "object" && raw !== null) return raw as Record<string, SessionIndexEntry>;
-	} catch {
-		/* 不存在或损坏 */
-	}
-	return {};
+	return readSessionIndexFile(SESSION_INDEX_FILE);
 }
 
 function writeSessionIndex(index: Record<string, SessionIndexEntry>): void {
-	mkdirSync(DATA_DIR, { recursive: true });
-	writeFileSync(SESSION_INDEX_FILE, `${JSON.stringify(index, null, "\t")}\n`, "utf8");
+	writeSessionIndexFile(SESSION_INDEX_FILE, index);
 }
 
 function touchSessionIndex(
@@ -324,7 +332,7 @@ function deactivatePackForAllSessions(packName: string): boolean {
 async function reloadInstalledSkillsInSessions(): Promise<number> {
 	let reloaded = 0;
 	for (const cs of sessions.values()) {
-		if (cs.session.isStreaming) continue;
+		if (cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting) continue;
 		try {
 			await cs.session.reload();
 			reloaded += 1;
@@ -339,8 +347,8 @@ async function reloadInstalledSkillsInSessions(): Promise<number> {
 function updateSessionTitle(sessionId: string, text: string): void {
 	const index = readSessionIndex();
 	const entry = index[sessionId];
-	if (!entry || entry.title) return;
-	entry.title = text.replace(/\s+/g, " ").slice(0, 40);
+	if (!entry) return;
+	if (!entry.title) entry.title = text.replace(/\s+/g, " ").slice(0, 40);
 	entry.updatedAt = Date.now();
 	writeSessionIndex(index);
 }
@@ -361,7 +369,8 @@ function renameSession(sessionId: string, title: string): string | null {
 const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
-const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE });
+const credentials = createConsoleCredentials(AUTH_FILE);
+const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE, credentials: credentials.store });
 const refreshAntigravityModels = createAntigravityModelRefresher(modelRuntime);
 try {
 	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
@@ -435,13 +444,14 @@ try {
 		additionalExtensionPaths: bundledProviderExtensionPaths(),
 	});
 	await resourceLoader.reload();
-	await createAgentSession({
+	const { session } = await createAgentSession({
 		cwd: warmupCwd,
 		modelRuntime,
 		agentDir: CONSOLE_AGENT_DIR,
 		resourceLoader,
 		sessionManager: SessionManager.inMemory(warmupCwd),
 	});
+	session.dispose();
 } catch (error) {
 	console.warn(`扩展预热失败（不影响内置 provider）：${error instanceof Error ? error.message : String(error)}`);
 }
@@ -664,7 +674,10 @@ function bufferAndBroadcast(cs: ConsoleSession, clientEvent: { type: string; [ke
 	}
 	const payload = `data: ${JSON.stringify(event)}\n\n`;
 	for (const client of cs.sseClients) {
-		client.write(payload);
+		if (client.destroyed || client.writableLength > 1024 * 1024) {
+			client.destroy();
+			cs.sseClients.delete(client);
+		} else client.write(payload);
 	}
 }
 
@@ -792,6 +805,7 @@ async function createConsoleSession(
 		session,
 		events: [],
 		nextSeq: 0,
+		streamEpoch: randomUUID(),
 		sseClients: new Set(),
 		enabledPacks,
 		activePackTools,
@@ -800,6 +814,7 @@ async function createConsoleSession(
 		lastUsage: null,
 		deleting: false,
 		activePrompt: null,
+		modelChange: null,
 	};
 	sessions.set(sessionId, cs);
 	touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
@@ -828,6 +843,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			session,
 			events: [],
 			nextSeq: 0,
+			streamEpoch: randomUUID(),
 			sseClients: new Set(),
 			enabledPacks,
 			activePackTools,
@@ -836,6 +852,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			lastUsage: null,
 			deleting: false,
 			activePrompt: null,
+			modelChange: null,
 		};
 		sessions.set(sessionId, cs);
 		touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
@@ -1212,70 +1229,39 @@ function listModels(): Array<{ provider: string; modelId: string; label: string;
 // 模型服务 Key 管理（auth.json：Record<provider, {type:"api_key",key}>）
 // ---------------------------------------------------------------------------
 
-type AuthFileEntry = { type: "api_key"; key: string } | { type: "oauth"; [key: string]: unknown };
-type AuthFile = Record<string, AuthFileEntry>;
-
-function readAuthFile(): AuthFile {
-	try {
-		const data = JSON.parse(readFileSync(AUTH_FILE, "utf8"));
-		if (typeof data === "object" && data !== null) return data as AuthFile;
-	} catch {
-		/* 不存在或损坏时视为空 */
-	}
-	return {};
+async function savedApiKey(provider: string): Promise<string | undefined> {
+	return (await credentials.apiKeys())[provider];
 }
 
-function writeAuthFile(data: AuthFile): void {
-	mkdirSync(CONSOLE_AGENT_DIR, { recursive: true });
-	writeFileSync(AUTH_FILE, `${JSON.stringify(data, null, "\t")}\n`, "utf8");
-}
-
-function writeAuthEntry(provider: string, key: string): void {
-	const data = readAuthFile();
-	data[provider] = { type: "api_key", key };
-	writeAuthFile(data);
-}
-
-function deleteAuthEntry(provider: string): boolean {
-	const data = readAuthFile();
-	if (data[provider]?.type !== "api_key") return false;
-	delete data[provider];
-	writeAuthFile(data);
-	return true;
-}
-
-function savedApiKey(provider: string): string | undefined {
-	const entry = readAuthFile()[provider];
-	return entry?.type === "api_key" ? entry.key : undefined;
-}
-
-function listCustomModels() {
-	const authFile = readAuthFile();
+async function listCustomModels() {
+	const keys = await credentials.apiKeys();
 	return customModels.loadCustomModels(CUSTOM_MODELS_FILE).map((definition) => ({
 		...definition,
-		hasKey: authFile[definition.providerId]?.type === "api_key",
+		hasKey: Object.hasOwn(keys, definition.providerId),
 	}));
 }
 
 /** Key 列表：文件里已存的 + 环境变量配置的（标注来源），脱敏显示 */
-function listKeys(): Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> {
+async function listKeys(): Promise<
+	Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }>
+> {
 	const entries: Array<{ provider: string; displayName: string; masked: string; source: "file" | "env" }> = [];
 	const names = new Map(modelRuntime.getProviders().map((p) => [p.id, p.name ?? p.id]));
 	// 非模型服务的凭据记录（如 Brave 联网检索）也在此展示，使用固定显示名。
 	names.set(BRAVE_WEB_SEARCH_AUTH_RECORD, BRAVE_WEB_SEARCH_DISPLAY_NAME);
-	const authFile = readAuthFile();
-	for (const [provider, entry] of Object.entries(authFile)) {
-		if (entry.type !== "api_key") continue;
+	const keys = await credentials.apiKeys();
+	const storedProviders = new Set((await credentials.store.list()).map((entry) => entry.providerId));
+	for (const [provider, key] of Object.entries(keys)) {
 		entries.push({
 			provider,
 			displayName: names.get(provider) ?? provider,
 			// The Brave credential never crosses into the renderer, even partially.
-			masked: provider === BRAVE_WEB_SEARCH_AUTH_RECORD ? "****" : maskKey(entry.key),
+			masked: provider === BRAVE_WEB_SEARCH_AUTH_RECORD ? "****" : maskKey(key),
 			source: "file",
 		});
 	}
 	for (const provider of modelRuntime.getProviders()) {
-		if (provider.id in authFile) continue;
+		if (storedProviders.has(provider.id)) continue;
 		if (modelRuntime.hasConfiguredAuth(provider.id)) {
 			entries.push({
 				provider: provider.id,
@@ -1286,7 +1272,7 @@ function listKeys(): Array<{ provider: string; displayName: string; masked: stri
 		}
 	}
 	// 开发环境用 BRAVE_SEARCH_API_KEY 配置的检索 Key 同样可见（未落盘）。
-	if (!(BRAVE_WEB_SEARCH_AUTH_RECORD in authFile) && resolveBraveSearchApiKey()) {
+	if (!storedProviders.has(BRAVE_WEB_SEARCH_AUTH_RECORD) && resolveBraveSearchApiKey()) {
 		entries.push({
 			provider: BRAVE_WEB_SEARCH_AUTH_RECORD,
 			displayName: BRAVE_WEB_SEARCH_DISPLAY_NAME,
@@ -1346,10 +1332,8 @@ async function resolveRequestFile(path: string, sessionId?: string): Promise<fsE
 
 function sendFileDownload(res: ServerResponse, file: fsExplorer.AllowedFileInfo): void {
 	res.writeHead(200, {
-		"Content-Type": file.mimeType,
+		...safeFileHeaders(file.name, file.mimeType, true),
 		"Content-Length": file.size,
-		"Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(file.name)}`,
-		"Cache-Control": "no-store",
 		"X-File-Name": encodeURIComponent(file.name),
 	});
 	const stream = createReadStream(file.path);
@@ -1359,48 +1343,12 @@ function sendFileDownload(res: ServerResponse, file: fsExplorer.AllowedFileInfo)
 
 function sendFileInline(res: ServerResponse, file: fsExplorer.AllowedFileInfo): void {
 	res.writeHead(200, {
-		"Content-Type": file.mimeType,
+		...safeFileHeaders(file.name, file.mimeType),
 		"Content-Length": file.size,
-		"Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`,
-		"Cache-Control": "no-store",
 	});
 	const stream = createReadStream(file.path);
 	stream.on("error", () => res.destroy());
 	stream.pipe(res);
-}
-
-function readBodyJson(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
-	return new Promise((resolve, reject) => {
-		const chunks: Buffer[] = [];
-		let size = 0;
-		req.on("data", (chunk: Buffer) => {
-			size += chunk.length;
-			if (size > maxBytes) {
-				reject(new HttpBodyError("请求体过大", 413));
-				req.destroy();
-				return;
-			}
-			chunks.push(chunk);
-		});
-		req.on("end", () => {
-			try {
-				resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-			} catch {
-				reject(new Error("请求体不是合法的 JSON"));
-			}
-		});
-		req.on("error", reject);
-	});
-}
-
-/** 携带 HTTP 状态码的 body 错误（如 413） */
-class HttpBodyError extends Error {
-	readonly status: number;
-
-	constructor(message: string, status: number) {
-		super(message);
-		this.status = status;
-	}
 }
 
 /** 静态文件只映射固定路径，不读任意文件 */
@@ -1439,7 +1387,12 @@ function isAuthorized(req: IncomingMessage, url: URL): boolean {
 // SSE
 // ---------------------------------------------------------------------------
 
-function handleStream(req: IncomingMessage, res: ServerResponse, cs: ConsoleSession, sinceParam: string | null): void {
+function handleStream(
+	res: ServerResponse,
+	cs: ConsoleSession,
+	sinceParam: string | null,
+	clientEpoch: string | null,
+): void {
 	res.writeHead(200, {
 		"Content-Type": "text/event-stream; charset=utf-8",
 		"Cache-Control": "no-cache, no-transform",
@@ -1451,8 +1404,10 @@ function handleStream(req: IncomingMessage, res: ServerResponse, cs: ConsoleSess
 	const oldest = cs.events[0]?.seq;
 
 	// 缓冲已裁剪、无法完整补发时，让前端改走 /history 全量重建
-	if (oldest !== undefined && since < oldest - 1) {
+	if (needsEventResync(since, cs.nextSeq, oldest, cs.streamEpoch, clientEpoch)) {
 		res.write(`data: ${JSON.stringify({ seq: -1, type: "resync" })}\n\n`);
+		res.end();
+		return;
 	} else {
 		for (const event of cs.events) {
 			if (event.seq > since) res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -1460,7 +1415,12 @@ function handleStream(req: IncomingMessage, res: ServerResponse, cs: ConsoleSess
 	}
 
 	cs.sseClients.add(res);
-	req.on("close", () => {
+	const heartbeat = setInterval(() => {
+		if (!res.destroyed) res.write(": heartbeat\n\n");
+	}, 15_000);
+	heartbeat.unref();
+	res.on("close", () => {
+		clearInterval(heartbeat);
 		cs.sseClients.delete(res);
 	});
 }
@@ -1470,11 +1430,18 @@ function handleStream(req: IncomingMessage, res: ServerResponse, cs: ConsoleSess
 // ---------------------------------------------------------------------------
 
 const server = createServer((req, res) => {
-	handleRequest(req, res).catch((error) => {
-		const message = error instanceof Error ? error.message : String(error);
-		const status = error instanceof HttpBodyError ? error.status : 500;
-		if (!res.headersSent) sendJson(res, status, { error: message });
-	});
+	const mutating = req.method !== "GET" && req.method !== "HEAD";
+	if (mutating) pendingMutations++;
+	void handleRequest(req, res)
+		.catch((error) => {
+			const message = error instanceof Error ? error.message : String(error);
+			const status = error instanceof HttpBodyError ? error.status : 500;
+			if (status === 413 && !res.headersSent) res.setHeader("Connection", "close");
+			if (!res.headersSent) sendJson(res, status, { error: message });
+		})
+		.finally(() => {
+			if (mutating) pendingMutations--;
+		});
 });
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1484,6 +1451,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 	}
 	const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 	const pathname = url.pathname;
+	if (pathname.startsWith("/api/") && storageRestartRequired) {
+		sendJson(res, 503, { error: "数据迁移已完成，请重启 Pi 后继续使用" });
+		return;
+	}
+	if (req.method !== "GET" && pathname.startsWith("/api/") && updates.getUpdateProgress().running) {
+		sendJson(res, 409, { error: "正在更新，请等待更新完成后继续操作" });
+		return;
+	}
+	if (pathname.startsWith("/api/") && !isAllowedRequestOrigin(req.headers, PORT)) {
+		sendJson(res, 403, { error: "请求来源不是当前 Pi 控制台" });
+		return;
+	}
 
 	if (req.method === "GET" && serveStatic(pathname, res)) return;
 	if (req.method === "GET" && pathname.startsWith("/code-development/monaco/")) {
@@ -1539,7 +1518,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				cwd: entry.cwd,
 				assistants: packSummaries(entry.enabledPacks ?? []),
 				active: sessions.has(id),
-				streaming: sessions.get(id)?.session.isStreaming ?? false,
+				streaming: Boolean(
+					sessions.get(id)?.session.isStreaming ||
+						sessions.get(id)?.activePrompt ||
+						sessions.get(id)?.modelChange ||
+						sessions.get(id)?.deleting,
+				),
 			}))
 			.sort((a, b) => b.updatedAt - a.updatedAt);
 		sendJson(res, 200, list);
@@ -1774,7 +1758,9 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		/^\/api\/tools\/(officecli|redteam|code-development|pdfjs|sevenzip|ocr|libreoffice)$/,
 	);
 	if (toolUninstallMatch && req.method === "DELETE") {
-		const runningSessionIds = [...sessions.values()].filter((cs) => cs.session.isStreaming).map((cs) => cs.sessionId);
+		const runningSessionIds = [...sessions.values()]
+			.filter((cs) => cs.session.isStreaming || cs.activePrompt || cs.modelChange || cs.deleting)
+			.map((cs) => cs.sessionId);
 		if (runningSessionIds.length > 0) {
 			sendJson(res, 409, { error: "仍有会话正在运行，请等待任务完成或停止后再卸载工具" });
 			return;
@@ -1838,7 +1824,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 	// 自定义 OpenAI 兼容模型：独立保存服务配置，Key 复用 auth.json。
 	if (pathname === "/api/custom-models" && req.method === "GET") {
-		sendJson(res, 200, listCustomModels());
+		sendJson(res, 200, await listCustomModels());
 		return;
 	}
 	if (pathname === "/api/custom-models/discover" && req.method === "POST") {
@@ -1848,7 +1834,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			typeof body.apiKey === "string" && body.apiKey.trim()
 				? body.apiKey.trim()
 				: providerId
-					? savedApiKey(providerId)
+					? await savedApiKey(providerId)
 					: undefined;
 		try {
 			sendJson(res, 200, { models: await customModels.discoverOpenAIModels(body.baseUrl, apiKey) });
@@ -1869,14 +1855,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			return;
 		}
 		const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
-		if (!apiKey && !savedApiKey(providerId)) {
+		if (!apiKey && !(await savedApiKey(providerId))) {
 			sendJson(res, 400, { error: "首次添加时请填写 API Key；无鉴权服务可填写任意占位值" });
 			return;
 		}
 		try {
 			const definition = customModels.normalizeCustomModel(providerId, body);
 			customModels.saveCustomModel(CUSTOM_MODELS_FILE, definition);
-			if (apiKey) writeAuthEntry(providerId, apiKey);
+			if (apiKey) await credentials.setApiKey(providerId, apiKey);
 			modelRuntime.registerProvider(providerId, customModels.toProviderConfig(definition));
 			await modelRuntime.refresh();
 			sendJson(res, 200, { ok: true, ...definition });
@@ -1894,7 +1880,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				return;
 			}
 			modelRuntime.unregisterProvider(providerId);
-			deleteAuthEntry(providerId);
+			await credentials.deleteApiKey(providerId);
 			await modelRuntime.refresh();
 			sendJson(res, 200, { ok: true });
 		} catch (error) {
@@ -1958,7 +1944,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 	// 模型服务 Key 管理（auth.json 读写 + runtime 刷新）
 	if (pathname === "/api/keys" && req.method === "GET") {
-		sendJson(res, 200, listKeys());
+		sendJson(res, 200, await listKeys());
 		return;
 	}
 	if (pathname === "/api/keys" && req.method === "POST") {
@@ -1973,7 +1959,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		// Brave 联网检索不是模型服务，走同一 auth.json 存储，但无需注册 provider。
 		if (body.provider === BRAVE_WEB_SEARCH_AUTH_RECORD) {
-			writeAuthEntry(body.provider, body.key.trim());
+			await credentials.setApiKey(body.provider, body.key.trim());
 			sendJson(res, 200, { ok: true });
 			return;
 		}
@@ -1981,7 +1967,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 404, { error: `未知的模型服务商：${body.provider}` });
 			return;
 		}
-		writeAuthEntry(body.provider, body.key.trim());
+		await credentials.setApiKey(body.provider, body.key.trim());
 		await modelRuntime.refresh();
 		sendJson(res, 200, { ok: true });
 		return;
@@ -1989,7 +1975,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	const keyMatch = pathname.match(/^\/api\/keys\/([^/]+)$/);
 	if (keyMatch && req.method === "DELETE") {
 		const provider = decodeURIComponent(keyMatch[1]);
-		if (!deleteAuthEntry(provider)) {
+		if (!(await credentials.deleteApiKey(provider))) {
 			sendJson(res, 404, { error: `${provider} 没有已保存的 Key` });
 			return;
 		}
@@ -2030,12 +2016,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 400, { error: '请求体需为 {"path": "..."}' });
 			return;
 		}
-		if ([...sessions.values()].some((item) => item.session.isStreaming)) {
+		if (hasActiveDataWork()) {
 			sendJson(res, 409, { error: "Agent 正在执行任务，请等待本轮完成后再迁移" });
 			return;
 		}
 		try {
-			sendJson(res, 200, storage.migrateDataDirectory(body.path));
+			const result = storage.migrateDataDirectory(body.path);
+			storageRestartRequired = result.restartRequired;
+			sendJson(res, 200, result);
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -2191,6 +2179,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/app/update" && req.method === "POST") {
+		if (hasActiveDataWork()) {
+			sendJson(res, 409, { error: "仍有任务或安装正在进行，请完成后再更新" });
+			return;
+		}
 		if (updates.getUpdateProgress().running) {
 			sendJson(res, 409, { error: "更新已在进行中" });
 			return;
@@ -2208,6 +2200,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/app/update-retry" && req.method === "POST") {
+		if (hasActiveDataWork()) {
+			sendJson(res, 409, { error: "仍有任务或安装正在进行，请完成后再更新" });
+			return;
+		}
 		try {
 			await updates.retryPendingUpdate();
 			sendJson(res, 202, { ok: true });
@@ -2234,13 +2230,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	switch (`${req.method} ${action}`) {
 		// GET /api/sessions/:id/stream?since=N — SSE 事件流
 		case "GET stream": {
-			handleStream(req, res, cs, url.searchParams.get("since"));
+			handleStream(res, cs, url.searchParams.get("since"), url.searchParams.get("epoch"));
 			return;
 		}
 
 		// POST /api/sessions/:id/messages — 发送用户消息（支持 images）
 		case "POST messages": {
-			const body = (await readBodyJson(req)) as { text?: unknown; images?: unknown; attachments?: unknown };
+			const body = (await readBodyJson(req)) as {
+				text?: unknown;
+				images?: unknown;
+				imageAttachments?: unknown;
+				attachments?: unknown;
+			};
 			const text = typeof body?.text === "string" ? body.text.trim() : "";
 			const attachments = Array.isArray(body?.attachments)
 				? body.attachments
@@ -2259,8 +2260,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 409, { error: "当前会话正在删除，不能再提交消息" });
 				return;
 			}
-			if (cs.session.isStreaming || cs.activePrompt) {
-				sendJson(res, 409, { error: "当前正在运行中，请先停止或等待完成" });
+			if (cs.session.isStreaming || cs.activePrompt || cs.modelChange) {
+				sendJson(res, 409, { error: "当前正在运行或切换模型，请先停止或等待完成" });
 				return;
 			}
 			const images = parseImages(body.images);
@@ -2268,18 +2269,33 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
 				return;
 			}
+			try {
+				images?.push(
+					...resolveAttachmentImages(
+						DATA_DIR,
+						sessionId,
+						cs.session.sessionManager.getCwd(),
+						body.imageAttachments,
+					),
+				);
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : "图片附件无效" });
+				return;
+			}
 			// URL 中的临时登录凭据绝不能进入 AgentSession/JSONL。模型只看到可导航的
 			// 随机引用，browser_navigate 在当前进程内存中于执行前还原原始 URL。
 			const safeText = vaultSensitiveUrlsInText(text);
 			const promptText = appendAttachmentAnnotation(safeText, attachments);
-			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
-			bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
-			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
-			sendJson(res, 202, { ok: true });
+			// Persist acceptance metadata before replying; a disk failure must still
+			// return an HTTP error instead of leaving the client waiting for a run.
 			updateSessionTitle(
 				cs.sessionId,
 				redactSensitiveText(safeText) || attachments.map((path) => path.split(/[\\/]/).pop()).join("、"),
 			);
+			const capabilityTrace = prepareTurnCapabilities(cs, promptText);
+			bufferAndBroadcast(cs, { type: "capability_selection", ...capabilityTrace });
+			// 立即回 202，错误（无模型、鉴权失败等）通过 SSE error 事件传递
+			sendJson(res, 202, { ok: true });
 			let resolvePreflight: (success: boolean) => void = () => undefined;
 			const preflight = new Promise<boolean>((resolvePromise) => {
 				resolvePreflight = resolvePromise;
@@ -2303,26 +2319,34 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// POST /api/sessions/:id/artifacts — 解析回复中的真实本地文件，供前端展示下载卡片
 		case "POST artifacts": {
-			const body = (await readBodyJson(req)) as { text?: unknown; paths?: unknown };
-			const text = typeof body?.text === "string" ? body.text : "";
-			const explicitPaths = Array.isArray(body?.paths)
-				? body.paths.filter((path): path is string => typeof path === "string").slice(0, 32)
-				: [];
-			const candidates = [...extractFileReferences(text), ...explicitPaths];
-			const files: Array<fsExplorer.AllowedFileInfo & { officePreview: boolean }> = [];
-			const seen = new Set<string>();
-			for (const candidate of candidates) {
-				try {
-					const info = fsExplorer.getAllowedFileInfo(resolve(cs.session.sessionManager.getCwd(), candidate));
-					const key = process.platform === "win32" ? info.path.toLocaleLowerCase("en-US") : info.path;
-					if (seen.has(key)) continue;
-					seen.add(key);
-					files.push({ ...info, officePreview: officePreview.isOfficePreviewPath(info.path) });
-				} catch {
-					// 模型回复可能含示例路径或网页域名，只展示当前确实存在且允许访问的文件。
-				}
+			const body = (await readBodyJson(req)) as { text?: unknown; paths?: unknown; groups?: unknown };
+			if (body.groups !== undefined && (!Array.isArray(body.groups) || body.groups.length > 100)) {
+				sendJson(res, 400, { error: "产物分组最多 100 项" });
+				return;
 			}
-			sendJson(res, 200, { files });
+			const groups = Array.isArray(body.groups) ? body.groups : [body];
+			const results = groups.map((value: unknown) => {
+				const group = value && typeof value === "object" ? (value as { text?: unknown; paths?: unknown }) : {};
+				const text = typeof group.text === "string" ? group.text : "";
+				const paths = Array.isArray(group.paths)
+					? group.paths.filter((path): path is string => typeof path === "string").slice(0, 32)
+					: [];
+				const files: Array<fsExplorer.AllowedFileInfo & { officePreview: boolean }> = [];
+				const seen = new Set<string>();
+				for (const candidate of [...extractFileReferences(text), ...paths]) {
+					try {
+						const info = fsExplorer.getAllowedFileInfo(resolve(cs.session.sessionManager.getCwd(), candidate));
+						const key = process.platform === "win32" ? info.path.toLocaleLowerCase("en-US") : info.path;
+						if (seen.has(key)) continue;
+						seen.add(key);
+						files.push({ ...info, officePreview: officePreview.isOfficePreviewPath(info.path) });
+					} catch {
+						/* Ignore examples and files that no longer exist. */
+					}
+				}
+				return { files };
+			});
+			sendJson(res, 200, Array.isArray(body.groups) ? { groups: results } : results[0]);
 			return;
 		}
 
@@ -2389,7 +2413,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// POST /api/sessions/:id/files — 保存附件到会话工作目录 uploads/
 		case "POST files": {
-			const body = (await readBodyJson(req, MAX_TOTAL_FILE_BYTES + 4096)) as {
+			const body = (await readBodyJson(req, Math.ceil(MAX_TOTAL_FILE_BYTES / 3) * 4 + 65536)) as {
 				files?: unknown;
 			};
 			if (!Array.isArray(body?.files) || body.files.length === 0) {
@@ -2400,7 +2424,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			mkdirSync(uploadsDir, { recursive: true });
 			const saved: string[] = [];
 			const messageFiles: string[] = [];
+			const imageFiles: Array<{ path: string; mimeType: string }> = [];
 			let totalBytes = 0;
+			if (body.files.length > 32) {
+				sendJson(res, 400, { error: "每条消息最多添加 32 个附件" });
+				return;
+			}
+			const validated: Array<{ name: string; mimeType: string; data: Buffer }> = [];
 			for (const file of body.files as Array<{ name?: unknown; mimeType?: unknown; dataBase64?: unknown }>) {
 				if (typeof file?.name !== "string" || typeof file?.dataBase64 !== "string") {
 					sendJson(res, 400, { error: "files 每项需含 name 与 dataBase64" });
@@ -2416,6 +2446,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					sendJson(res, 413, { error: `单文件 ${file.name} 超过 ${MAX_FILE_BYTES / 1024 / 1024}MB 上限` });
 					return;
 				}
+				validated.push({
+					name: file.name,
+					mimeType: typeof file.mimeType === "string" ? file.mimeType : "application/octet-stream",
+					data,
+				});
+			}
+			for (const file of validated) {
+				const data = file.data;
 				const safeName = String(file.name)
 					.replace(/[\\/:*?"<>|]/g, "_")
 					.slice(0, 200);
@@ -2423,9 +2461,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				writeFileSync(join(uploadsDir, relative), data);
 				const workingPath = `uploads/${relative}`;
 				saved.push(workingPath);
-				messageFiles.push(saveAttachmentSnapshot(DATA_DIR, cs.sessionId, workingPath, safeName, data));
+				const snapshot = saveAttachmentSnapshot(DATA_DIR, cs.sessionId, workingPath, safeName, data);
+				messageFiles.push(snapshot);
+				if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.mimeType))
+					imageFiles.push({ path: snapshot, mimeType: file.mimeType });
 			}
-			sendJson(res, 200, { files: saved, messageFiles });
+			sendJson(res, 200, { files: saved, messageFiles, imageFiles });
 			return;
 		}
 
@@ -2447,16 +2488,24 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: '请求体需为 {"provider": "...", "modelId": "..."}' });
 				return;
 			}
+			if (cs.deleting || cs.session.isStreaming || cs.activePrompt || cs.modelChange) {
+				sendJson(res, 409, { error: "当前会话正在处理任务，请等待完成后再切换模型" });
+				return;
+			}
 			const model = modelRuntime.getModel(body.provider, body.modelId);
 			if (!model) {
 				sendJson(res, 404, { error: `模型不存在：${body.provider}/${body.modelId}` });
 				return;
 			}
+			const change = cs.session.setModel(model, { persist: true });
+			cs.modelChange = change;
 			try {
-				await cs.session.setModel(model);
+				await change;
 			} catch (error) {
 				sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 				return;
+			} finally {
+				if (cs.modelChange === change) cs.modelChange = null;
 			}
 			// 通过 SSE 通知前端同步（persist 由 setModel 内部写 settingsManager 完成）
 			bufferAndBroadcast(cs, {
@@ -2483,7 +2532,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 400, { error: `level 需为：${THINKING_LEVELS.join(" / ")}` });
 				return;
 			}
-			cs.session.setThinkingLevel(body.level as (typeof THINKING_LEVELS)[number]);
+			if (cs.deleting || cs.session.isStreaming || cs.activePrompt || cs.modelChange) {
+				sendJson(res, 409, { error: "当前会话正在处理任务，请等待完成后再调整思考等级" });
+				return;
+			}
+			cs.session.setThinkingLevel(body.level as (typeof THINKING_LEVELS)[number], { persist: true });
 			sendJson(res, 200, { level: cs.session.thinkingLevel });
 			return;
 		}
@@ -2491,10 +2544,21 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		// GET /api/sessions/:id/history — 消息快照
 		case "GET history": {
 			const model = cs.session.model;
+			const messages = buildHistory(cs.sessionId, cs.session, cs.enabledPacks);
+			const requestedLimit = Number(url.searchParams.get("limit"));
+			const limit =
+				Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+					? Math.min(requestedLimit, messages.length)
+					: messages.length;
+			let start = Math.max(0, messages.length - limit);
+			while (start > 0 && messages[start]?.role !== "user") start--;
 			sendJson(res, 200, {
 				sessionId: cs.sessionId,
-				streaming: cs.session.isStreaming,
-				messages: buildHistory(cs.sessionId, cs.session, cs.enabledPacks),
+				streaming: cs.session.isStreaming || Boolean(cs.activePrompt),
+				streamEpoch: cs.streamEpoch,
+				totalMessages: messages.length,
+				hasMore: start > 0,
+				messages: messages.slice(start),
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
 				thinkingLevel: cs.session.thinkingLevel,
 				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
@@ -2529,6 +2593,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			}
 			cs.deleting = true;
 			try {
+				await cs.modelChange?.catch(() => undefined);
 				await disposeSessionBeforeDelete(cs.session, cs.activePrompt);
 			} catch (error) {
 				cs.deleting = false;
