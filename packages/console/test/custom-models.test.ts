@@ -79,7 +79,7 @@ describe("custom model configuration", () => {
 						medium: "medium",
 						high: null,
 						xhigh: "xhigh",
-						max: null,
+						max: "max",
 					},
 					input: ["text"],
 					contextWindow: 128000,
