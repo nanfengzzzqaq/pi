@@ -116,6 +116,8 @@ const storageInputEl = $("storage-input");
 const storageBrowseBtnEl = $("storage-browse-btn");
 const storageMigrateBtnEl = $("storage-migrate-btn");
 const storageCurrentEl = $("storage-current");
+const modelsRefreshBtnEl = $("models-refresh-btn");
+const modelsRefreshStatusEl = $("models-refresh-status");
 const previewModalEl = $("preview-modal");
 const previewTitleEl = $("preview-title");
 const previewContentEl = $("preview-content");
@@ -5153,6 +5155,28 @@ async function loadStorageState() {
 		storageCurrentEl.textContent = `读取失败：${error.message}`;
 	}
 }
+
+modelsRefreshBtnEl.addEventListener("click", async () => {
+	modelsRefreshBtnEl.disabled = true;
+	modelsRefreshStatusEl.textContent = "正在更新模型目录…";
+	try {
+		const summary = await api("/api/models/refresh", { method: "POST" });
+		const parts = [`已更新 ${summary.refreshed.length} 个服务`];
+		if (summary.skipped.length) parts.push(`跳过 ${summary.skipped.length} 个未配置 Key 的服务`);
+		if (summary.aborted) parts.push("部分检查未完成");
+		if (summary.errors.length) parts.push(`${summary.errors.length} 个失败`);
+		parts.push(`当前共 ${summary.modelCount} 个模型`);
+		modelsRefreshStatusEl.textContent = parts.join("，");
+		modelsRefreshStatusEl.title = summary.errors.length
+			? summary.errors.map((error) => `${error.provider}: ${error.message}`).join("\n")
+			: "";
+		await loadModels();
+	} catch (error) {
+		modelsRefreshStatusEl.textContent = `更新失败：${error.message}；已有模型列表保留`;
+	} finally {
+		modelsRefreshBtnEl.disabled = false;
+	}
+});
 
 storageBrowseBtnEl.addEventListener("click", () => void chooseDirectoryInto(storageInputEl));
 storageMigrateBtnEl.addEventListener("click", async () => {
