@@ -427,6 +427,12 @@
 			<section class="modal-section settings-page" data-settings-page="models" hidden>
 				<h3>模型服务</h3>
 				<p class="modal-hint">先连接服务，再读取模型并确认能力。凭据只保存在当前 Pi 客户端的数据目录。</p>
+				<div class="key-row">
+					<span class="key-name">模型目录</span>
+					<span class="key-masked" id="models-refresh-status" role="status" aria-live="polite">各服务的模型列表定期自动同步远端目录</span>
+					<button id="models-refresh-btn" type="button">更新模型</button>
+				</div>
+				<p class="modal-hint">「更新模型」立即向远端目录拉取各服务的最新模型，已保存的 API Key 不受影响，无需重新输入；未配置 Key 的服务跳过远端更新。自定义模型请在下方表单用「读取模型」更新。</p>
 				<div class="key-row" id="codex-oauth-row">
 					<span class="key-name">Codex 订阅登录（openai-codex-oauth）</span>
 					<span class="key-masked" id="codex-oauth-status">读取中…</span>

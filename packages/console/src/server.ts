@@ -50,6 +50,7 @@ import { HttpBodyError, readBodyJson } from "./http-body.ts";
 import { isAllowedLoopbackHost, isAllowedRequestOrigin, safeFileHeaders } from "./http-security.ts";
 import { InstallCompletion } from "./install-completion.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
+import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { configureConsoleNetworking } from "./network.ts";
 import * as officePreview from "./office-preview.ts";
 import * as officecli from "./officecli.ts";
@@ -1959,6 +1960,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// 模型枚举
 	if (pathname === "/api/models" && req.method === "GET") {
 		sendJson(res, 200, listModels());
+		return;
+	}
+
+	// 手动更新模型目录：强制刷新各内置服务的远端目录；凭据与自定义模型保持不变。
+	if (pathname === "/api/models/refresh" && req.method === "POST") {
+		try {
+			sendJson(res, 200, await refreshModelCatalogs(modelRuntime));
+		} catch (error) {
+			sendJson(res, 500, { error: error instanceof Error ? error.message : "模型目录更新未完成，请重试" });
+		}
 		return;
 	}
 
