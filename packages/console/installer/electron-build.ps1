@@ -187,6 +187,8 @@ try {
 
 		& node --test (Join-Path $ElectronDir "scripts\verify-local-agent.node-test.js")
 		if ($LASTEXITCODE -ne 0) { throw "安装包关键资源校验器自测失败" }
+		& node --test (Join-Path $ElectronDir "scripts\verify-queue-runtime.node-test.js")
+		if ($LASTEXITCODE -ne 0) { throw "排队运行时校验器测试失败" }
 
         # 校验脚本依赖 Electron 暂存目录安装的 @electron/asar；必须在 npm install 后运行，
         # 否则干净 CI 会在真正开始校验前因模块缺失退出。
@@ -206,6 +208,7 @@ try {
 	}
 
 	$LocalAgentDist = Join-Path $CodingAgentDir "dist"
+	$LocalAgentCoreDist = Join-Path $RepositoryRoot "packages\agent\dist"
 	$LocalAiDist = Join-Path $AiDir "dist"
 	$InstalledAgentDist = Join-Path $InstalledAgentRoot "dist"
 	$InstalledAiParent = Join-Path $InstalledAgentRoot "node_modules\@earendil-works"
@@ -363,6 +366,8 @@ try {
 
 	node $Verifier --source-dist $LocalAgentDist --installed-dist $InstalledAgentDist
     if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的 coding-agent 与本地构建不一致" }
+	node (Join-Path $ElectronDir "scripts\verify-queue-runtime.js") $LocalAgentCoreDist --installed-agent-root $InstalledAgentRoot
+	if ($LASTEXITCODE -ne 0) { throw "Electron 暂存目录中的排队运行时与源码不一致" }
     Write-Host "已校验 Electron 暂存目录中的本地 coding-agent"
 
     # 4. 生成图标并打包，再从 app.asar 读取关键文件做第二次哈希校验。
@@ -379,6 +384,8 @@ try {
     if (-not (Test-Path -LiteralPath $PackagedAsar)) { throw "未找到打包结果 $PackagedAsar" }
 	node $Verifier --source-dist $LocalAgentDist --asar $PackagedAsar
 	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的 coding-agent 与本地构建不一致" }
+	node (Join-Path $ElectronDir "scripts\verify-queue-runtime.js") $LocalAgentCoreDist --asar $PackagedAsar
+	if ($LASTEXITCODE -ne 0) { throw "app.asar 中的排队运行时与源码不一致" }
 	Write-Host "已校验 app.asar 中的本地 coding-agent"
 
 	node $Verifier --source-ai-dist $LocalAiDist --asar $PackagedAsar

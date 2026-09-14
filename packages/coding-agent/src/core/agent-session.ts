@@ -1754,6 +1754,17 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
+	/** Atomically remove one pending item. A message already drained by the agent cannot be recalled. */
+	removeQueuedMessage(kind: "steer" | "followUp", index: number): AgentMessage | undefined {
+		const mirror = kind === "steer" ? this._steeringMessages : this._followUpMessages;
+		const removed = this.agent.removeQueuedMessage(kind, index, mirror.length);
+		if (removed) {
+			mirror.splice(index, 1);
+			this._emitQueueUpdate();
+		}
+		return removed;
+	}
+
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
 		return this._steeringMessages.length + this._followUpMessages.length;

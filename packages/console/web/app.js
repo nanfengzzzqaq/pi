@@ -596,7 +596,7 @@ function browserTabActive() {
 		!workbenchSideEl.hidden &&
 		catalogViewEl.hidden &&
 		officePreviewPaneEl.hidden &&
-		codeEditorPaneEl.hidden && settingsModalEl.hidden && previewModalEl.hidden && updateOverlayEl.hidden
+		codeEditorPaneEl.hidden && settingsModalEl.hidden && previewModalEl.hidden && updateOverlayEl.hidden && !document.getElementById("global-search-dialog")?.open
 	);
 }
 
@@ -1629,6 +1629,7 @@ function syncThinkingOptions(availableLevels) {
 
 /** 清空消息区（保留折叠控制条） */
 function clearMessages() {
+	renderSteerQueue({ sessionId, steering: [], followUp: [] }, true);
 	messagesEl.querySelectorAll(".message").forEach((m) => m.remove());
 	historyMoreEl.hidden = true;
 	messagesToolbarEl.hidden = true;
@@ -1642,6 +1643,7 @@ function renderHistory(history) {
 	try {
 	clearMessages();
 	clearTerminal();
+	renderSteerQueue(history.queue || { sessionId, steering: [], followUp: [] }, true);
 	clearActivity();
 	lastSeq = typeof history.lastSeq === "number" ? history.lastSeq : -1;
 	lastStreamEpoch = history.streamEpoch ?? null;
@@ -3404,6 +3406,7 @@ const collapseHintEl = $("collapse-hint");
 const messagesToolbarEl = $("messages-toolbar");
 let collapsed = false;
 let collapsedByAuto = false;
+const historyCollapseChoices = new Map();
 const historyMoreEl = document.createElement("button");
 historyMoreEl.className = "secondary-btn small";
 historyMoreEl.textContent = "加载更早的消息";
@@ -3416,6 +3419,7 @@ historyMoreEl.addEventListener("click", async () => {
 	await refreshFromHistory();
 	if (sessionId === targetSessionId) {
 		collapsed = false;
+		historyCollapseChoices.set(sessionId, false);
 		applyCollapse();
 		messagesEl.scrollTop = 0;
 	}
@@ -3431,12 +3435,11 @@ function applyCollapse() {
 	const keep = Math.max(0, msgs.length - 2);
 	messagesToolbarEl.hidden = msgs.length <= 2;
 	// 超过阈值自动折叠较早的消息（用户手动展开后尊重手动状态，不再自动收回）
-	if (!collapsed && msgs.length > AUTO_FOLD_THRESHOLD) {
-		collapsed = true;
-		collapsedByAuto = true;
-	}
-	for (let i = 0; i < keep; i++) {
-		msgs[i].classList.toggle("collapsed-hidden", collapsed);
+	const manual = historyCollapseChoices.get(sessionId);
+	collapsed = manual ?? msgs.length > AUTO_FOLD_THRESHOLD;
+	collapsedByAuto = manual === undefined && collapsed;
+	for (let i = 0; i < msgs.length; i++) {
+		msgs[i].classList.toggle("collapsed-hidden", collapsed && i < keep);
 	}
 	if (collapsed && collapsedByAuto && keep > 0) {
 		collapseHintEl.textContent = `已自动折叠 ${keep} 条较早的消息`;
@@ -3448,6 +3451,7 @@ function applyCollapse() {
 
 collapseBtnEl.addEventListener("click", () => {
 	collapsed = !collapsed;
+	historyCollapseChoices.set(sessionId, collapsed);
 	collapsedByAuto = false;
 	applyCollapse();
 	// 折叠后回到顶部，展开后回到底部
@@ -3900,31 +3904,77 @@ sendBtn.addEventListener("click", () => (running ? abortRun() : sendMessage()));
 const steerQueueEl = $("steer-queue");
 
 async function sendSteerMessage(text) {
+	const targetSessionId = sessionId;
+	if (!targetSessionId || pendingSteerSubmissions.has(targetSessionId)) return;
+	const originalInput = inputEl.value;
+	pendingSteerSubmissions.add(targetSessionId);
 	try {
-		await api(`/api/sessions/${sessionId}/steer`, { method: "POST", body: JSON.stringify({ text }) });
-		inputEl.value = "";
-		resizeComposerInput();
-		saveComposerDraft();
-		renderSteerQueue({ steering: [...steerPendingLocal, text] });
+		const result = await api(`/api/sessions/${targetSessionId}/steer`, { method: "POST", body: JSON.stringify({ text }) });
+		if (targetSessionId === sessionId) {
+			if (inputEl.value === originalInput) inputEl.value = "";
+			resizeComposerInput();
+			saveComposerDraft();
+			renderSteerQueue(result.queue);
+		} else {
+			const key = `pi-console-draft:${targetSessionId}`;
+			if (localStorage.getItem(key) === originalInput) localStorage.removeItem(key);
+		}
 	} catch (error) {
 		showError(`补充消息排队失败：${error.message}`);
+	} finally {
+		pendingSteerSubmissions.delete(targetSessionId);
 	}
 }
 
-const steerPendingLocal = [];
+const pendingSteerSubmissions = new Set();
+let steerQueueSnapshot = null;
+let removingQueuedMessage = false;
 
-function renderSteerQueue(event) {
+async function removeQueuedMessage(snapshot, kind, index, recall) {
+	if (removingQueuedMessage) return;
+	removingQueuedMessage = true;
+	const targetSessionId = snapshot.sessionId;
+	try {
+		const result = await api(`/api/sessions/${targetSessionId}/queue/remove`, { method: "POST", body: JSON.stringify({ revision: snapshot.revision, kind, index }) });
+		if (recall) {
+			const images = (result.images || []).map((image, i) => ({ name: `撤回图片-${i + 1}.${image.mimeType?.split("/")[1] || "png"}`, mimeType: image.mimeType, dataBase64: image.data, size: Math.floor(image.data.length * 3 / 4) }));
+			if (sessionId === targetSessionId) {
+				pendingAttachments.push(...images);
+				insertComposerText(result.text);
+				renderAttachments();
+			} else if (!deletedSessions.has(targetSessionId)) {
+				const key = `pi-console-draft:${targetSessionId}`;
+				const draft = localStorage.getItem(key) || "";
+				localStorage.setItem(key, `${draft}${draft.trim() ? "\n\n" : ""}${result.text}`);
+				if (images.length) draftAttachments.set(targetSessionId, [...(draftAttachments.get(targetSessionId) || []), ...images]);
+			}
+		}
+		if (targetSessionId === sessionId) renderSteerQueue(result.queue);
+	} catch (error) {
+		showError(`撤回失败：${error.message}`);
+		if (targetSessionId === sessionId) {
+			const queue = await api(`/api/sessions/${targetSessionId}/queue`).catch(() => null);
+			if (queue && targetSessionId === sessionId) renderSteerQueue(queue);
+		}
+	} finally {
+		removingQueuedMessage = false;
+	}
+}
+
+function renderSteerQueue(event, reset = false) {
+	if (!event || event.sessionId !== sessionId) return;
+	if (!reset && steerQueueSnapshot?.epoch === event.epoch && event.version < steerQueueSnapshot.version) return;
+	steerQueueSnapshot = event;
 	const steering = Array.isArray(event.steering) ? event.steering : [];
-	steerPendingLocal.length = 0;
-	steerPendingLocal.push(...steering);
-	if (steering.length === 0) {
+	const followUp = Array.isArray(event.followUp) ? event.followUp : [];
+	if (steering.length + followUp.length === 0) {
 		steerQueueEl.hidden = true;
 		steerQueueEl.innerHTML = "";
 		return;
 	}
 	steerQueueEl.hidden = false;
 	steerQueueEl.innerHTML = "";
-	for (const text of steering) {
+	for (const { text, kind, index } of [...steering.map((text, index) => ({ text, kind: "steer", index })), ...followUp.map((text, index) => ({ text, kind: "followUp", index }))]) {
 		const chip = document.createElement("div");
 		chip.className = "steer-chip";
 		const label = document.createElement("span");
@@ -3932,8 +3982,17 @@ function renderSteerQueue(event) {
 		label.textContent = text;
 		const state = document.createElement("span");
 		state.className = "steer-chip-state";
-		state.textContent = "排队中 · 本轮工具结算后注入";
+		state.textContent = kind === "steer" ? "排队中 · 本轮工具结算后注入" : "排队中 · 当前任务结束后发送";
 		chip.append(label, state);
+		for (const [title, recall] of [["撤回编辑", true], ["移除", false]]) {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "steer-chip-action";
+			button.textContent = title;
+			button.disabled = !event.revision;
+			button.addEventListener("click", () => void removeQueuedMessage(event, kind, index, recall));
+			chip.appendChild(button);
+		}
 		steerQueueEl.appendChild(chip);
 	}
 }
@@ -4504,7 +4563,7 @@ async function refreshTasksPopover(open = false) {
 function renderTasksPopover(tasks) {
 	tasksPopover.innerHTML = "";
 	if (tasks.length === 0) {
-		tasksPopover.innerHTML = '<div class="tasks-empty">没有检测到运行中的开发服务（node / python / npm 等）。</div>';
+		tasksPopover.innerHTML = '<div class="tasks-empty">暂无可确认归属的后台服务。这里只列出本次启动后由会话启动的开发服务。</div>';
 		return;
 	}
 	const head = document.createElement("div");
@@ -4519,7 +4578,8 @@ function renderTasksPopover(tasks) {
 		const name = document.createElement("strong");
 		name.textContent = `${task.processName} · :${task.port}`;
 		const detail = document.createElement("small");
-		detail.textContent = `${task.address} · PID ${task.pid}${task.command ? ` · ${task.command.slice(0, 60)}` : ""}`;
+		detail.textContent = `${task.sessionTitle} · ${task.cwd} · ${task.address} · PID ${task.pid}`;
+		detail.title = task.command || detail.textContent;
 		info.append(name, detail);
 		const stopBtn = document.createElement("button");
 		stopBtn.type = "button";
@@ -4528,7 +4588,7 @@ function renderTasksPopover(tasks) {
 		stopBtn.addEventListener("click", async () => {
 			if (!confirm(`停止 ${task.processName}（PID ${task.pid}，端口 ${task.port}）？`)) return;
 			try {
-				await api("/api/tasks/kill", { method: "POST", body: JSON.stringify({ pid: task.pid, processName: task.processName }) });
+				await api("/api/tasks/kill", { method: "POST", body: JSON.stringify({ pid: task.pid, processName: task.processName, taskId: task.taskId }) });
 				showInfo(`已停止 ${task.processName}（:${task.port}）`);
 				await refreshTasksPopover();
 			} catch (error) {

@@ -198,7 +198,7 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 							medium: "medium",
 							high: null,
 							xhigh: "xhigh",
-							max: null,
+							max: "max",
 						}
 					: undefined,
 				input,

@@ -5,6 +5,7 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>Pi 控制台</title>
 	<link rel="stylesheet" href="/style.css">
+	<link rel="stylesheet" href="/search.css">
 	<script>
 		// 防主题闪烁：加载前按本地偏好设置主题（dark 默认）
 		document.documentElement.dataset.theme =
@@ -23,6 +24,7 @@
 		<span id="conn-state" class="conn-state" role="status" aria-live="polite">连接中…</span>
 		<button id="conn-retry" class="secondary-btn small" type="button" hidden>重试连接</button>
 		<div class="topbar-right">
+			<button id="global-search-open" class="secondary-btn small topbar-action" type="button" title="搜索历史对话、当前项目文件和最近项目"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg><span>搜索</span></button>
 			<div class="topbar-tasks-menu">
 				<button id="tasks-btn" class="secondary-btn small topbar-action" type="button" title="智能体启动的后台服务（端口）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h5l1.5 2H17v6H3z"></path><path d="M7 13h6"></path></svg><span>后台任务</span></button>
 				<div id="tasks-popover" class="tasks-popover" hidden></div>
@@ -635,6 +637,7 @@
 	</div>
 
 	<script src="/app.js"></script>
+	<script src="/search.js"></script>
 	<script type="module" src="/antigravity-login.js"></script>
 </body>
 </html>

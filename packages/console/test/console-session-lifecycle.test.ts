@@ -14,10 +14,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { withBackgroundOwner } from "../src/background-owner.ts";
 import * as customModels from "../src/custom-models.ts";
 import { RequestLedger } from "../src/request-ledger.ts";
 import { readSessionIndexFile, type SessionIndex, writeSessionIndexFile } from "../src/session-index.ts";
 import { abortTrackedSessionPrompt, disposeSessionBeforeDelete } from "../src/session-lifecycle.ts";
+import { SessionSearch } from "../src/session-search.ts";
 
 const directories: string[] = [];
 const activeSessions: AgentSession[] = [];
@@ -47,7 +49,7 @@ const routeScript = new Script(
 				.filter(
 					(statement) =>
 						ts.isFunctionDeclaration(statement) &&
-						["handleApi", "completeSessionDeletion"].includes(statement.name?.text ?? ""),
+						["handleApi", "completeSessionDeletion", "queueSnapshot"].includes(statement.name?.text ?? ""),
 				)
 				.map((statement) => statement.getText(source))
 				.join("\n"),
@@ -67,6 +69,7 @@ const reloadScript = new Script(
 interface ResponseCapture {
 	status?: number;
 	body?: unknown;
+	on?: () => void;
 }
 
 async function fixture() {
@@ -125,6 +128,9 @@ async function fixture() {
 	});
 	const cs = {
 		sessionId: "fixture",
+		queueRevision: randomUUID(),
+		nextSeq: 0,
+		streamEpoch: "fixture-epoch",
 		session,
 		enabledPacks: new Set<string>(),
 		sseClients: new Set(),
@@ -132,6 +138,12 @@ async function fixture() {
 		activePrompt: null,
 		modelChange: null as Promise<void> | null,
 	};
+	session.subscribe((event) => {
+		if (event.type === "queue_update") {
+			cs.queueRevision = randomUUID();
+			cs.nextSeq++;
+		}
+	});
 	const sessions = new Map([[cs.sessionId, cs]]);
 	const index: SessionIndex = {
 		fixture: { cwd: directory, sessionFile: session.sessionFile, title: "fixture", createdAt: 1, updatedAt: 1 },
@@ -149,6 +161,10 @@ async function fixture() {
 		Error,
 		randomUUID,
 		AbortController,
+		withBackgroundOwner,
+		sessionSearch: new SessionSearch(),
+		fsExplorer: { searchFiles: async () => ({ results: [], truncated: false }) },
+		workspace: { getWorkspacePath: () => directory },
 		existsSync,
 		requestLedger,
 		pendingSkillReloads,
@@ -194,8 +210,9 @@ async function fixture() {
 		return response;
 	};
 	const requestPath = async (method: string, path: string) => {
-		const response: ResponseCapture = {};
-		await execute({ method }, response, new URL(path, "http://127.0.0.1"), path);
+		const response: ResponseCapture = { on() {} };
+		const url = new URL(path, "http://127.0.0.1");
+		await execute({ method }, response, url, url.pathname);
 		return response;
 	};
 	const reloadSkills = reloadScript.runInNewContext({ sessions, console, pendingSkillReloads }) as (
@@ -236,6 +253,53 @@ function holdAuth(runtime: ModelRuntime, fail = false) {
 }
 
 describe("Console session route lifecycle", () => {
+	it("rejects stale queue revisions and retains other queued messages after removal", async () => {
+		const item = await fixture();
+		await item.session.steer("first");
+		const stale = item.cs.queueRevision;
+		await item.session.steer("second");
+		expect((await item.request("POST", "queue/remove", { revision: stale, kind: "steer", index: 0 })).status).toBe(
+			409,
+		);
+		expect(item.session.getSteeringMessages()).toEqual(["first", "second"]);
+		const response = await item.request("POST", "queue/remove", {
+			revision: item.cs.queueRevision,
+			kind: "steer",
+			index: 1,
+		});
+		expect(response.status).toBe(200);
+		expect(response.body).toMatchObject({ text: "second", queue: { steering: ["first"] } });
+	});
+	it("searches and opens a persisted original without starting a prompt or altering history", async () => {
+		const item = await fixture();
+		const prompt = vi.spyOn(item.session, "prompt");
+		const before = readFileSync(item.session.sessionFile!, "utf8");
+		const response = await item.requestPath("GET", "/api/search?q=fixture&scope=session&sessionId=fixture");
+		expect(response.status).toBe(200);
+		const body = response.body as { conversations: { results: { entryId: string }[] } };
+		expect(body.conversations.results).toHaveLength(1);
+		const original = await item.requestPath(
+			"GET",
+			`/api/search/message?sessionId=fixture&entryId=${body.conversations.results[0].entryId}`,
+		);
+		expect(original.body).toMatchObject({ message: { text: "Local fixture transcript" } });
+		expect(prompt).not.toHaveBeenCalled();
+		expect(readFileSync(item.session.sessionFile!, "utf8")).toBe(before);
+		item.session.sessionManager.appendMessage({
+			role: "user",
+			content: `${"x".repeat(110000)}needle-at-the-end`,
+			timestamp: 200,
+		});
+		const latest = item.session.sessionManager.getEntries().at(-1)!;
+		const longOriginal = await item.requestPath(
+			"GET",
+			`/api/search/message?sessionId=fixture&entryId=${latest.id}&q=needle-at-the-end`,
+		);
+		expect(longOriginal.body).toMatchObject({
+			message: { text: expect.stringContaining("needle-at-the-end"), truncated: true },
+		});
+		expect((await item.requestPath("GET", "/api/search?q=x&scope=session&sessionId=missing")).status).toBe(404);
+	});
 	it("cancels stalled authentication without waiting for the authentication result or starting a late turn", async () => {
 		const item = await fixture();
 		vi.spyOn(item.runtime, "hasConfiguredAuth").mockReturnValue(false);

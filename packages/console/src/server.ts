@@ -36,6 +36,7 @@ import {
 	getAttachmentReference,
 	saveAttachmentSnapshot,
 } from "./attachment-snapshots.ts";
+import { withBackgroundOwner } from "./background-owner.ts";
 import { killBackgroundTask, listBackgroundTasks } from "./background-tasks.ts";
 import { bundledProviderExtensionPaths, createAntigravityModelRefresher } from "./bundled-providers.ts";
 import * as codeDevelopment from "./code-development.ts";
@@ -96,6 +97,7 @@ import {
 	type TrackedSessionPrompt,
 } from "./session-lifecycle.ts";
 import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages.ts";
+import { SessionSearch } from "./session-search.ts";
 import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
@@ -130,6 +132,7 @@ const SESSION_DIR = join(DATA_DIR, "sessions");
 const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
 /** 提示词模板库（空对话一键模板卡片） */
 const promptTemplates = new PromptTemplateStore(DATA_DIR);
+const sessionSearch = new SessionSearch();
 /**
  * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
@@ -185,6 +188,7 @@ interface ConsoleSession {
 	events: BufferedEvent[];
 	nextSeq: number;
 	streamEpoch: string;
+	queueRevision: string;
 	sseClients: Set<ServerResponse>;
 	/** 这个会话绑定的助手；与全局“已启用”目录分离。 */
 	enabledPacks: Set<string>;
@@ -846,8 +850,24 @@ async function buildSession(
 	};
 }
 
+function queueSnapshot(cs: ConsoleSession) {
+	return {
+		sessionId: cs.sessionId,
+		revision: cs.queueRevision,
+		version: cs.nextSeq,
+		epoch: cs.streamEpoch,
+		steering: cs.session.getSteeringMessages().map(redactSensitiveText),
+		followUp: cs.session.getFollowUpMessages().map(redactSensitiveText),
+	};
+}
+
 function subscribeConsoleSession(cs: ConsoleSession): void {
 	cs.session.subscribe((ev) => {
+		if (ev.type === "queue_update") {
+			cs.queueRevision = randomUUID();
+			bufferAndBroadcast(cs, { type: "queue_update", ...queueSnapshot(cs) });
+			return;
+		}
 		// This listener runs before AgentSession persists message_end. Reject the old
 		// env-based redteam contract before it can enter history or tool execution.
 		if (ev.type === "message_end" && ev.message.role === "assistant") {
@@ -901,6 +921,7 @@ async function createConsoleSession(
 		events: [],
 		nextSeq: 0,
 		streamEpoch: randomUUID(),
+		queueRevision: randomUUID(),
 		sseClients: new Set(),
 		enabledPacks,
 		activePackTools,
@@ -946,6 +967,7 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			events: [],
 			nextSeq: 0,
 			streamEpoch: randomUUID(),
+			queueRevision: randomUUID(),
 			sseClients: new Set(),
 			enabledPacks,
 			activePackTools,
@@ -1598,6 +1620,8 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/index.html": { file: "index.html", contentType: "text/html; charset=utf-8" },
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
+	"/search.js": { file: "search.js", contentType: "text/javascript; charset=utf-8" },
+	"/search.css": { file: "search.css", contentType: "text/css; charset=utf-8" },
 	"/antigravity-login.js": { file: "antigravity-login.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
@@ -1788,6 +1812,95 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		});
 		return;
 	}
+	// Search never creates an agent or changes a transcript.
+	if (req.method === "GET" && pathname === "/api/search") {
+		const query = (url.searchParams.get("q") ?? "").trim();
+		if (!query || query.length > 256) {
+			sendJson(res, 400, { error: "搜索内容需为 1–256 个字符" });
+			return;
+		}
+		const index = readSessionIndex();
+		const currentId = url.searchParams.get("sessionId") ?? undefined;
+		const onlyCurrent = url.searchParams.get("scope") === "session";
+		if (onlyCurrent && (!currentId || !index[currentId] || index[currentId].deletionRequestedAt)) {
+			sendJson(res, 404, { error: "当前会话不存在" });
+			return;
+		}
+		const controller = new AbortController();
+		res.on("close", () => controller.abort());
+		const cwd =
+			currentId && index[currentId] && !index[currentId].deletionRequestedAt
+				? index[currentId].cwd
+				: workspace.getWorkspacePath();
+		const [conversations, files] = await Promise.all([
+			sessionSearch.search(index, query, onlyCurrent ? currentId : undefined, controller.signal),
+			!onlyCurrent && cwd
+				? fsExplorer
+						.searchFiles(cwd, query, "name")
+						.catch(() => ({ results: [], truncated: false, unavailable: true }))
+				: Promise.resolve({ results: [], truncated: false }),
+		]);
+		const needle = query.toLocaleLowerCase("zh-CN");
+		const projects = onlyCurrent
+			? []
+			: [
+					...new Set(
+						Object.values(index)
+							.filter((entry) => !entry.deletionRequestedAt)
+							.sort((a, b) => b.updatedAt - a.updatedAt)
+							.map((entry) => entry.cwd),
+					),
+				]
+					.filter((path) => path.toLocaleLowerCase("zh-CN").includes(needle) && existsSync(path))
+					.slice(0, 20);
+		if (!controller.signal.aborted)
+			sendJson(res, 200, {
+				conversations: {
+					...conversations,
+					results: conversations.results.map((hit) => ({
+						...hit,
+						text: redactSensitiveText(hit.text),
+						title: redactSensitiveText(hit.title),
+					})),
+				},
+				files,
+				projects,
+			});
+		return;
+	}
+
+	// Historical originals remain read-only, including messages excluded by compaction.
+	if (req.method === "GET" && pathname === "/api/search/message") {
+		const id = url.searchParams.get("sessionId") ?? "";
+		const entryId = url.searchParams.get("entryId");
+		const entry = readSessionIndex()[id];
+		if (!entry || entry.deletionRequestedAt || !entry.sessionFile || !entryId) {
+			sendJson(res, 404, { error: "会话或历史消息不存在" });
+			return;
+		}
+		const data = await sessionSearch.read(entry.sessionFile);
+		const position = data.messages.findIndex((message) => message.entryId === entryId);
+		if (position < 0 || readSessionIndex()[id]?.deletionRequestedAt || !readSessionIndex()[id]) {
+			sendJson(res, 404, { error: "历史消息已不在当前会话分支中" });
+			return;
+		}
+		const message = data.messages[position];
+		const needle = (url.searchParams.get("q") ?? "").trim().slice(0, 256).toLocaleLowerCase("zh-CN");
+		const excerptStart = needle ? Math.max(0, message.text.toLocaleLowerCase("zh-CN").indexOf(needle) - 3000) : 0;
+		sendJson(res, 200, {
+			sessionId: id,
+			title: redactSensitiveText(entry.title),
+			message: {
+				...message,
+				text: redactSensitiveText(message.text.slice(excerptStart, excerptStart + 100000)),
+				truncated: message.text.length > 100000,
+			},
+			previous: data.messages[position - 1]?.entryId,
+			next: data.messages[position + 1]?.entryId,
+		});
+		return;
+	}
+
 	// GET /api/sessions — 历史会话列表（左侧"对话"栏）
 	if (req.method === "GET" && pathname === "/api/sessions") {
 		const index = readSessionIndex();
@@ -2266,20 +2379,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 	// ---------------------------------------------------------------------------
 	if (pathname === "/api/tasks" && req.method === "GET") {
 		try {
-			sendJson(res, 200, { tasks: await listBackgroundTasks() });
+			const index = readSessionIndex();
+			sendJson(res, 200, {
+				tasks: (await listBackgroundTasks()).map((task) => ({
+					...task,
+					command: task.command ? redactSensitiveText(task.command) : null,
+					sessionTitle: index[task.sessionId]?.title ?? "已删除的会话",
+				})),
+			});
 		} catch (error) {
 			sendJson(res, 500, { error: error instanceof Error ? error.message : "后台任务列表读取失败" });
 		}
 		return;
 	}
 	if (pathname === "/api/tasks/kill" && req.method === "POST") {
-		const body = (await readBodyJson(req)) as { pid?: unknown; processName?: unknown };
-		if (typeof body?.pid !== "number" || typeof body?.processName !== "string") {
-			sendJson(res, 400, { error: '请求体需为 {"pid": 123, "processName": "node"}' });
+		const body = (await readBodyJson(req)) as { pid?: unknown; processName?: unknown; taskId?: unknown };
+		if (typeof body?.pid !== "number" || typeof body?.processName !== "string" || typeof body?.taskId !== "string") {
+			sendJson(res, 400, { error: "缺少后台任务标识，请刷新列表后重试" });
 			return;
 		}
 		try {
-			await killBackgroundTask(body.pid, body.processName);
+			await killBackgroundTask(body.pid, body.processName, body.taskId);
 			sendJson(res, 200, { ok: true });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : "停止失败" });
@@ -2928,15 +3048,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					});
 				}
 			}
-			activePrompt.done = cs.session
-				.prompt(promptText, {
+			activePrompt.done = withBackgroundOwner({ sessionId, cwd: cs.session.sessionManager.getCwd() }, () =>
+				cs.session.prompt(promptText, {
 					images: promptImages,
 					signal: controller.signal,
 					preflightResult: (accepted) => {
 						resolvePreflight(accepted);
 						if (accepted) requestLedger.finish(sessionId, requestId, "running");
 					},
-				})
+				}),
+			)
 				.then(() => {
 					let failed = false;
 					for (let i = cs.session.messages.length - 1; i >= 0; i--) {
@@ -2999,10 +3120,49 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			}
 			try {
 				await cs.session.steer(vaultSensitiveUrlsInText(text), images);
-				sendJson(res, 202, { ok: true });
+				sendJson(res, 202, { ok: true, queue: queueSnapshot(cs) });
 			} catch (error) {
 				sendJson(res, 409, { error: error instanceof Error ? error.message : "补充消息排队失败" });
 			}
+			return;
+		}
+
+		case "GET queue": {
+			sendJson(res, 200, queueSnapshot(cs));
+			return;
+		}
+		case "POST queue/remove": {
+			const body = (await readBodyJson(req)) as { revision?: unknown; kind?: unknown; index?: unknown };
+			if (
+				(body.kind !== "steer" && body.kind !== "followUp") ||
+				typeof body.index !== "number" ||
+				!Number.isSafeInteger(body.index) ||
+				body.index < 0
+			) {
+				sendJson(res, 400, { error: "排队消息标识无效" });
+				return;
+			}
+			if (body.revision !== cs.queueRevision) {
+				sendJson(res, 409, { error: "队列已变化，请重试；已开始处理的消息不能撤回" });
+				return;
+			}
+			const removed = cs.session.removeQueuedMessage(body.kind, body.index);
+			if (!removed || removed.role !== "user") {
+				sendJson(res, 409, { error: "该消息已开始处理，无法撤回" });
+				return;
+			}
+			const content =
+				typeof removed.content === "string" ? [{ type: "text" as const, text: removed.content }] : removed.content;
+			sendJson(res, 200, {
+				queue: queueSnapshot(cs),
+				text: redactSensitiveText(
+					content
+						.filter((block) => block.type === "text")
+						.map((block) => block.text)
+						.join("\n"),
+				),
+				images: content.filter((block) => block.type === "image"),
+			});
 			return;
 		}
 
@@ -3364,6 +3524,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				enabledCapabilities: packSummaries(cs.enabledPacks),
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,
+				queue: queueSnapshot(cs),
 			});
 			return;
 		}

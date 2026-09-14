@@ -165,6 +165,11 @@ class PendingMessageQueue {
 	clear(): void {
 		this.messages = [];
 	}
+
+	remove(index: number, expectedLength: number): AgentMessage | undefined {
+		if (!Number.isSafeInteger(index) || index < 0 || this.messages.length !== expectedLength) return undefined;
+		return this.messages.splice(index, 1)[0];
+	}
 }
 
 type ActiveRun = {
@@ -312,6 +317,11 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Remove one still-pending message without rebuilding or losing other messages' image blocks. */
+	removeQueuedMessage(kind: "steer" | "followUp", index: number, expectedLength: number): AgentMessage | undefined {
+		return (kind === "steer" ? this.steeringQueue : this.followUpQueue).remove(index, expectedLength);
 	}
 
 	/** Returns true when either queue still contains pending messages. */

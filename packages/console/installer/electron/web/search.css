@@ -1,0 +1,30 @@
+.global-search-dialog {
+	width: min(760px, calc(100vw - 32px));
+	max-height: min(780px, calc(100vh - 48px));
+	padding: 22px;
+	border: 1px solid var(--border, #39414c);
+	border-radius: 16px;
+	background: var(--panel);
+	color: var(--text, #e9edf4);
+	box-shadow: 0 24px 80px #0008;
+}
+.global-search-dialog::backdrop { background: #0008; }
+.global-search-header, .global-search-form, .global-search-history-actions { display: flex; align-items: center; gap: 12px; }
+.global-search-header { justify-content: space-between; margin-bottom: 16px; }
+.global-search-form input { flex: 1; min-width: 0; padding: 12px; }
+.global-search-form select { padding: 12px 6px; }
+.global-search-form input, .global-search-form select { border: 1px solid var(--border-strong); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.global-search-status, .global-search-note { font-size: 12px; color: var(--muted, #a4aebb); line-height: 1.65; }
+.global-search-results { display: grid; gap: 6px; overflow-wrap: anywhere; }
+.global-search-results h3 { font-size: 12px; color: var(--muted, #a4aebb); margin: 14px 0 4px; }
+.global-search-result { display: grid; gap: 6px; text-align: left; width: 100%; padding: 12px; border: 1px solid transparent; border-radius: 8px; color: inherit; background: transparent; cursor: pointer; }
+.global-search-result:hover, .global-search-result:focus-visible, .global-search-result.selected { background: var(--bg-hover, #ffffff0b); border-color: var(--accent, #8aacf0); outline: none; }
+.global-search-result span { font-size: 12px; line-height: 1.65; white-space: pre-wrap; }
+.global-search-dialog mark { background: #d5a53540; color: inherit; border-radius: 2px; }
+.global-search-history-actions { position: sticky; top: -22px; padding: 10px 0; background: var(--panel); }
+.global-search-original { white-space: pre-wrap; font: inherit; line-height: 1.8; padding: 12px 0; }
+.steer-chip-action { flex: none; border: 1px solid var(--border, #39414c); border-radius: 5px; background: transparent; color: inherit; cursor: pointer; font-size: 11px; padding: 3px 6px; }
+.steer-chip { flex-wrap: wrap; }
+.task-info small { overflow-wrap: anywhere; }
+html[data-theme="light"] .global-search-dialog, html[data-theme="light"] .global-search-history-actions { background: #fff; color: #242a34; }
+@media (max-width: 600px) { .global-search-dialog { padding: 14px; } .global-search-form { gap: 6px; } .global-search-form select { max-width: 100px; } }

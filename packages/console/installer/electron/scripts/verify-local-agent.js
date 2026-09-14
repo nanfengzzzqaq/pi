@@ -19,6 +19,9 @@ export const LOCAL_AI_CRITICAL_FILES = [
 
 export const CONSOLE_CRITICAL_FILES = [
 	"src/server.ts",
+	"src/session-search.ts",
+	"src/background-owner.ts",
+	"src/background-tasks.ts",
 	"src/attachment-images.ts",
 	"src/attachment-snapshots.ts",
 	"src/credentials.ts",
@@ -39,6 +42,8 @@ export const CONSOLE_CRITICAL_FILES = [
 	"src/agent-browser-runtime.ts",
 	"src/agent-browser-tools.ts",
 	"web/app.js",
+	"web/search.js",
+	"web/search.css",
 	"web/style.css",
 	"web/index.html",
 	"web/antigravity-login.js",

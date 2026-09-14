@@ -4,6 +4,15 @@
 默认形态为**纯净原生 Pi**（内置 read/bash/edit/write + find/grep/ls 全套原生工具，官方系统提示词）；能力包通过 `customTools` 注册、
 `setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与纯净版完全一致。
 
+## v0.4.1：搜索、排队撤回与状态修复
+
+- **统一搜索**：顶栏“搜索”查找历史对话正文、当前会话项目中的文件名和最近项目路径；“查找本对话”只搜当前会话。支持关键词高亮、方向键选择与 Enter 打开。对话结果定位到只读历史原文，可查看相邻消息，压缩前的原文仍可搜索，不会重新加入模型上下文。
+- **排队消息撤回**：单独“撤回编辑”或“移除”，保留其他排队消息和图片；撤回内容追加到原会话草稿，不覆盖正在输入的内容。已开始处理或队列已变化时拒绝陈旧操作并刷新。
+- **长对话展开**：修复超过 30 条消息时手动展开立即再次折叠的问题；当前页面会为每个会话分别记住手动选择，新消息到达和来回切换会话均保留该选择。
+- **后台服务归属**：仅列出本次 Pi 启动后能确认由会话启动的开发服务，显示会话和项目；停止前重新核对进程创建时间、监听端口和归属，不再把电脑上的其他 Node/Python 服务都列为 Pi 任务。
+
+搜索为本地读取，不调用模型。每次最多扫描最近 500 个会话、约 64 MiB 记录，每个会话文件上限 16 MiB，最多返回 50 条对话结果；达到上限或遇到不可读文件时界面会提示。项目文件搜索沿用现有目录范围和扫描限制。
+
 ## v0.4.0 新特性（借鉴 pi-web-ui 社区项目）
 
 **对话**
@@ -138,6 +147,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/sessions/:id/files` | body `{"files":[{name,mimeType,dataBase64}]}`；单文件 ≤20MB、总量 ≤50MB，超限 413；返回模型工作副本 `files` 与消息原始快照 `messageFiles` |
 | `POST /api/sessions/:id/abort` | 中止当前运行 |
 | `POST /api/sessions/:id/steer` | body `{"text":"..."}`；运行中排队补充消息，工具结算后注入 |
+| `GET /api/sessions/:id/queue` | 排队快照及 `revision`；用于精确撤回 |
+| `POST /api/sessions/:id/queue/remove` | body `{"revision","kind":"steer或followUp","index":0}`；单独撤回，队列已变化返回 409 |
+| `GET /api/search?q=&scope=all或session&sessionId=` | 搜索对话、当前项目文件名和最近项目路径 |
+| `GET /api/search/message?sessionId=&entryId=` | 读取命中消息的历史原文及相邻消息标识 |
 | `POST /api/sessions/:id/compact` | 手动压缩上下文（body 可带 `instructions`） |
 | `POST /api/sessions/:id/fork` | body `{"requestId"}` 或 `{"timestamp"}`；编辑重问：从该用户消息前分叉出新会话，返回 `{sessionId}` |
 | `GET` / `PUT /api/prompt-templates` | 提示词模板库（全量列表读写） |
@@ -146,8 +159,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/git/stage` | body `{"cwd","paths":[],"all"?,"unstage"?}` 暂存/取消暂存 |
 | `POST /api/git/commit` | body `{"cwd","message"}` 提交 |
 | `POST /api/git/push` / `pull` | 推送 / 拉取（pull 为 `--ff-only`） |
-| `GET /api/tasks` | 检测监听端口的开发服务（node/python 等） |
-| `POST /api/tasks/kill` | body `{"pid","processName"}` 停止服务（终止前复核进程名） |
+| `GET /api/tasks` | 检测可确认会话归属的开发服务，返回 `taskId`、会话和工作目录 |
+| `POST /api/tasks/kill` | body `{"pid","processName","taskId"}`；停止前复核实际进程身份与归属 |
 | `POST /api/terminal/start` | 启动交互 shell，返回 `{terminalId, shell}` |
 | `GET /api/terminal/:id/stream` | 终端输出 SSE |
 | `POST /api/terminal/:id/input` | body `{"data":"..."}` 写入终端 |
