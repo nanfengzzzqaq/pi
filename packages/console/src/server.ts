@@ -87,7 +87,6 @@ import {
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
-import { PromptTemplateStore } from "./prompt-templates.ts";
 import * as redteam from "./redteam.ts";
 import { RequestLedger } from "./request-ledger.ts";
 import { readSessionIndexFile, type SessionIndexEntry, writeSessionIndexFile } from "./session-index.ts";
@@ -130,8 +129,6 @@ const WORKSPACES_DIR = join(DATA_DIR, "workspaces");
 const SESSION_DIR = join(DATA_DIR, "sessions");
 /** 会话索引：ourSessionId → { cwd, title, createdAt, updatedAt } */
 const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
-/** 提示词模板库（空对话一键模板卡片） */
-const promptTemplates = new PromptTemplateStore(DATA_DIR);
 const sessionSearch = new SessionSearch();
 /**
  * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
@@ -2279,23 +2276,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			sendJson(res, 200, { ok: true, runtimePending: result.runtimePending });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
-		}
-		return;
-	}
-
-	// ---------------------------------------------------------------------------
-	// 提示词模板库（空对话一键模板）
-	// ---------------------------------------------------------------------------
-	if (pathname === "/api/prompt-templates" && req.method === "GET") {
-		sendJson(res, 200, { templates: promptTemplates.list() });
-		return;
-	}
-	if (pathname === "/api/prompt-templates" && req.method === "PUT") {
-		try {
-			const body = (await readBodyJson(req)) as { templates?: unknown };
-			sendJson(res, 200, { templates: promptTemplates.save(body?.templates) });
-		} catch (error) {
-			sendJson(res, 400, { error: error instanceof Error ? error.message : "模板保存失败" });
 		}
 		return;
 	}

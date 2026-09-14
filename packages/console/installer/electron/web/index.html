@@ -131,14 +131,10 @@
 							<div class="messages-empty-eyebrow">PI AGENT WORKSPACE</div>
 							<div class="messages-empty-title">今天想一起完成什么？</div>
 							<div class="messages-empty-hint">从一个目标开始。Pi 会规划步骤、调用工具并把执行过程呈现在工作台。</div>
-							<div class="messages-empty-prompts" id="template-grid" aria-label="提示词模板">
+							<div class="messages-empty-prompts" aria-label="能力示例">
 								<div class="empty-prompt"><span>01</span><strong>分析与规划</strong><small>梳理问题，形成可执行方案</small></div>
 								<div class="empty-prompt"><span>02</span><strong>创建与修改</strong><small>处理代码、文档和本地文件</small></div>
 								<div class="empty-prompt"><span>03</span><strong>验证与交付</strong><small>查看过程、结果和生成产物</small></div>
-							</div>
-							<div class="templates-manage-row">
-								<button id="template-new-btn" class="secondary-btn small" type="button">＋ 新建模板</button>
-								<button id="template-save-draft-btn" class="secondary-btn small" type="button" title="把当前输入框草稿存为模板" hidden>存草稿为模板</button>
 							</div>
 						</div>
 					</main>
@@ -452,31 +448,8 @@
 		</div>
 	</div>
 
-	<!-- 提示词模板编辑弹窗 -->
-	<div id="template-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="template-modal-title" hidden>
-		<div class="modal-body template-modal-body">
-			<div class="modal-header">
-				<span class="modal-title" id="template-modal-title">新建模板</span>
-				<button id="template-modal-close" class="icon-btn" title="关闭">×</button>
-			</div>
-			<div class="template-form">
-				<div class="key-add-row">
-					<input type="text" id="template-form-icon" placeholder="图标（如 🛠）" maxlength="8">
-					<input type="text" id="template-form-title" placeholder="模板名称（必填）" maxlength="80">
-				</div>
-				<input type="text" id="template-form-description" placeholder="一句话描述" maxlength="160">
-				<textarea id="template-form-text" rows="6" placeholder="模板内容：点击卡片后会填入输入框（必填）" maxlength="8000"></textarea>
-				<div class="model-form-actions">
-					<button id="template-form-delete" class="key-delete" type="button" hidden>删除模板</button>
-					<span class="composer-spacer"></span>
-					<button id="template-form-cancel" class="secondary-btn" type="button">取消</button>
-					<button id="template-form-save" class="primary-btn" type="button">保存</button>
-				</div>
-			</div>
-		</div>
-	</div>
-
-	<div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-label="设置" hidden>		<div class="modal-body settings-body">
+	<div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-label="设置" hidden>
+		<div class="modal-body settings-body">
 			<div class="modal-header">
 				<div class="settings-title-group">
 					<span class="modal-title">设置</span>

@@ -4126,7 +4126,6 @@ function slashCommandList() {
 		{ name: "/git", description: "打开 Git 源代码管理面板", group: "工作区", run: () => { showSidePanel("git"); void loadGitPanel(); } },
 		{ name: "/terminal", description: "打开交互终端", group: "工作区", run: () => { showSidePanel("shell"); void ensureShellSession(); } },
 		{ name: "/tasks", description: "查看后台任务（端口）", group: "工作区", run: () => void refreshTasksPopover(true) },
-		{ name: "/templates", description: "浏览提示词模板", group: "对话", run: () => { messagesEmptyEl.hidden = true; inputEl.focus(); void loadTemplates(); } },
 	];
 }
 
@@ -4227,138 +4226,6 @@ function executeSlashCommand(index) {
 inputEl.addEventListener("input", () => {
 	slashActiveIndex = 0;
 	updateSlashPalette();
-	// 空对话且有草稿时提供“存草稿为模板”
-	if (templateSaveDraftBtn) {
-		templateSaveDraftBtn.hidden = !(inputEl.value.trim() && messagesEmptyEl && !messagesEmptyEl.hidden);
-	}
-});
-
-// ---------------------------------------------------------------------------
-// 提示词模板库
-// ---------------------------------------------------------------------------
-
-const templateGridEl = $("template-grid");
-const templateNewBtn = $("template-new-btn");
-const templateSaveDraftBtn = $("template-save-draft-btn");
-const templateModal = $("template-modal");
-let promptTemplatesCache = [];
-
-async function loadTemplates() {
-	try {
-		const data = await api("/api/prompt-templates");
-		promptTemplatesCache = data.templates || [];
-		renderTemplateGrid();
-	} catch {
-		/* 模板加载失败时保留空状态默认卡片 */
-	}
-}
-
-function renderTemplateGrid() {
-	if (!templateGridEl) return;
-	templateGridEl.innerHTML = "";
-	for (const template of promptTemplatesCache) {
-		const card = document.createElement("button");
-		card.type = "button";
-		card.className = "template-card";
-		card.title = "点击填入输入框";
-		const icon = document.createElement("span");
-		icon.className = "template-icon";
-		icon.textContent = template.icon || "📄";
-		const title = document.createElement("strong");
-		title.textContent = template.title;
-		const description = document.createElement("small");
-		description.textContent = template.description || "";
-		card.append(icon, title, description);
-		card.addEventListener("click", () => {
-			insertComposerText(template.text);
-			inputEl.focus();
-		});
-		card.addEventListener("contextmenu", (event) => {
-			event.preventDefault();
-			openTemplateModal(template);
-		});
-		const editBtn = document.createElement("span");
-		editBtn.className = "template-edit-btn";
-		editBtn.textContent = "✎";
-		editBtn.title = "编辑模板（也可右键卡片）";
-		editBtn.addEventListener("click", (event) => {
-			event.stopPropagation();
-			openTemplateModal(template);
-		});
-		card.appendChild(editBtn);
-		templateGridEl.appendChild(card);
-	}
-}
-
-function openTemplateModal(template = null) {
-	$("template-modal-title").textContent = template ? "编辑模板" : "新建模板";
-	$("template-form-icon").value = template?.icon ?? "";
-	$("template-form-title").value = template?.title ?? "";
-	$("template-form-description").value = template?.description ?? "";
-	$("template-form-text").value = template?.text ?? "";
-	$("template-form-delete").hidden = !template;
-	$("template-form-delete").dataset.templateId = template?.id ?? "";
-	templateModal.hidden = false;
-	$("template-form-title").focus();
-}
-
-function closeTemplateModal() {
-	templateModal.hidden = true;
-}
-
-async function saveTemplateFromModal() {
-	const id = $("template-form-delete").dataset.templateId || `tpl-${crypto.randomUUID().slice(0, 8)}`;
-	const template = {
-		id,
-		icon: $("template-form-icon").value.trim() || "📄",
-		title: $("template-form-title").value.trim(),
-		description: $("template-form-description").value.trim(),
-		text: $("template-form-text").value,
-	};
-	if (!template.title || !template.text.trim()) return showError("模板名称和内容不能为空");
-	const next = template.id
-		? [...promptTemplatesCache.filter((item) => item.id !== id), template]
-		: [...promptTemplatesCache, template];
-	try {
-		const data = await api("/api/prompt-templates", { method: "PUT", body: JSON.stringify({ templates: next }) });
-		promptTemplatesCache = data.templates || [];
-		renderTemplateGrid();
-		closeTemplateModal();
-	} catch (error) {
-		showError(`模板保存失败：${error.message}`);
-	}
-}
-
-async function deleteTemplateFromModal() {
-	const id = $("template-form-delete").dataset.templateId;
-	if (!id) return;
-	try {
-		const data = await api("/api/prompt-templates", {
-			method: "PUT",
-			body: JSON.stringify({ templates: promptTemplatesCache.filter((item) => item.id !== id) }),
-		});
-		promptTemplatesCache = data.templates || [];
-		renderTemplateGrid();
-		closeTemplateModal();
-	} catch (error) {
-		showError(`模板删除失败：${error.message}`);
-	}
-}
-
-templateNewBtn?.addEventListener("click", () => openTemplateModal());
-templateSaveDraftBtn?.addEventListener("click", () => {
-	const draft = inputEl.value.trim();
-	if (!draft) return showInfo("输入框没有内容");
-	openTemplateModal(null);
-	$("template-form-text").value = draft;
-	$("template-form-title").focus();
-});
-$("template-modal-close")?.addEventListener("click", closeTemplateModal);
-$("template-form-cancel")?.addEventListener("click", closeTemplateModal);
-$("template-form-save")?.addEventListener("click", () => void saveTemplateFromModal());
-$("template-form-delete")?.addEventListener("click", () => void deleteTemplateFromModal());
-templateModal?.addEventListener("click", (event) => {
-	if (event.target === templateModal) closeTemplateModal();
 });
 
 // ---------------------------------------------------------------------------
@@ -7420,7 +7287,7 @@ async function init() {
 		inputEl.focus();
 		void Promise.allSettled([
 			refreshCatalog().catch(() => showError("工具目录加载失败，可在工具页重试")),
-			loadFsRoots(), loadContextPanel(), loadUpdateRecovery(), loadTemplates(),
+			loadFsRoots(), loadContextPanel(), loadUpdateRecovery(),
 		]);
 		// 右侧工作台默认关闭；智能体运行命令或用户使用快捷键时再打开，避免挤占对话空间。
 		void autoCheckUpdate();

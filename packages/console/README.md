@@ -18,7 +18,7 @@
 **对话**
 
 - **补充（steer）** — 回复流式中可直接发送跟进消息，当前回合工具结算后立即注入（对应 pi CLI 的 Enter 打断语义）；输入框上方显示"排队中"队列。
-- **斜杠命令** — 输入 `/` 弹出命令面板（`/new` `/compact` `/copy` `/model` `/thinking` `/cwd` `/git` `/terminal` `/tasks` `/templates`），支持 ↑↓ 导航。
+- **斜杠命令** — 输入 `/` 弹出命令面板（`/new` `/compact` `/copy` `/model` `/thinking` `/cwd` `/git` `/terminal` `/tasks`），支持 ↑↓ 导航。
 - **编辑重问** — 悬停任意历史问题点"编辑重问"，从该消息前分叉出新对话（parentSession 溯源），原对话不受影响。
 - **失败轮次标红 + 一键重试** — 模型报错重试用尽后，失败轮次红色标记，用户消息旁出现"重试"按钮。
 - **消息自动折叠 + 惰性渲染** — 超过 30 条消息自动折叠较早内容；CSS `content-visibility` 跳过视口外渲染。
@@ -37,10 +37,6 @@
 - **文件预览增强** — 文本预览带行号；选中文字一键"引用到输入框"；二进制文件十六进制视图（GBK 解码原本已支持，自动回退 gb18030）。
 - **实时文件树** — 服务端 fs.watch 监听当前浏览目录，改动静默重列（搜索态不刷新）。
 - **视觉桥** — 当前模型不支持识图时（如本地 vLLM/Ollama 文本模型），自动把图片交给一个视觉模型转写成文字证据再发送；设置 → 模型服务可指定模型或停用；按图片哈希缓存。
-
-**提示词模板**
-
-- 空对话状态展示 12 个内置模板卡片（仓库初始化/代码审查/有据调研/系统化排错等），点击填入输入框；可编辑、删除、新建，草稿可存为模板；全局共享保存在 `<dataDir>/prompt-templates.json`。
 
 ## 安装与启动（开发模式）
 
@@ -153,7 +149,6 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `GET /api/search/message?sessionId=&entryId=` | 读取命中消息的历史原文及相邻消息标识 |
 | `POST /api/sessions/:id/compact` | 手动压缩上下文（body 可带 `instructions`） |
 | `POST /api/sessions/:id/fork` | body `{"requestId"}` 或 `{"timestamp"}`；编辑重问：从该用户消息前分叉出新会话，返回 `{sessionId}` |
-| `GET` / `PUT /api/prompt-templates` | 提示词模板库（全量列表读写） |
 | `GET /api/git/status?cwd=` | 仓库状态：分支、上游、更改列表（porcelain 解析） |
 | `GET /api/git/diff?cwd=&path=&staged=` | 单文件 unified diff（截断 400KB） |
 | `POST /api/git/stage` | body `{"cwd","paths":[],"all"?,"unstage"?}` 暂存/取消暂存 |
