@@ -23,6 +23,10 @@
 		<span id="conn-state" class="conn-state" role="status" aria-live="polite">连接中…</span>
 		<button id="conn-retry" class="secondary-btn small" type="button" hidden>重试连接</button>
 		<div class="topbar-right">
+			<div class="topbar-tasks-menu">
+				<button id="tasks-btn" class="secondary-btn small topbar-action" type="button" title="智能体启动的后台服务（端口）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h5l1.5 2H17v6H3z"></path><path d="M7 13h6"></path></svg><span>后台任务</span></button>
+				<div id="tasks-popover" class="tasks-popover" hidden></div>
+			</div>
 			<button id="workbench-btn" class="secondary-btn small topbar-action" type="button" title="打开或关闭右侧工作台（Ctrl+Alt+B）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 4.5h13v11h-13zM11.5 4.5v11M4 8h7"></path></svg><span>工作台</span></button>
 			<button id="agent-browser-btn" class="secondary-btn small topbar-action" type="button" title="打开客户端独立浏览器（agent_browser）"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg><span>浏览器</span></button>
 			<button id="theme-btn" class="icon-btn" title="切换主题">🌙</button>
@@ -125,10 +129,14 @@
 							<div class="messages-empty-eyebrow">PI AGENT WORKSPACE</div>
 							<div class="messages-empty-title">今天想一起完成什么？</div>
 							<div class="messages-empty-hint">从一个目标开始。Pi 会规划步骤、调用工具并把执行过程呈现在工作台。</div>
-							<div class="messages-empty-prompts" aria-label="能力示例">
+							<div class="messages-empty-prompts" id="template-grid" aria-label="提示词模板">
 								<div class="empty-prompt"><span>01</span><strong>分析与规划</strong><small>梳理问题，形成可执行方案</small></div>
 								<div class="empty-prompt"><span>02</span><strong>创建与修改</strong><small>处理代码、文档和本地文件</small></div>
 								<div class="empty-prompt"><span>03</span><strong>验证与交付</strong><small>查看过程、结果和生成产物</small></div>
+							</div>
+							<div class="templates-manage-row">
+								<button id="template-new-btn" class="secondary-btn small" type="button">＋ 新建模板</button>
+								<button id="template-save-draft-btn" class="secondary-btn small" type="button" title="把当前输入框草稿存为模板" hidden>存草稿为模板</button>
 							</div>
 						</div>
 					</main>
@@ -137,6 +145,8 @@
 
 					<footer class="composer">
 						<div id="message-recovery" class="message-recovery" role="status" aria-live="polite" hidden></div>
+						<div id="steer-queue" class="steer-queue" hidden></div>
+						<div id="slash-palette" class="slash-palette" hidden></div>
 						<div class="attachments" id="attachments" hidden></div>
 						<div class="composer-row">
 							<div class="composer-input-box">
@@ -290,6 +300,63 @@
 						</div>
 					</div>
 
+					<div id="git-pane" class="workbench-pane" hidden>
+						<header class="workbench-pane-header">
+							<div class="workbench-pane-heading">
+								<span class="office-preview-kicker">源代码管理（git）</span>
+								<strong id="git-branch-title" class="office-preview-title">Git</strong>
+								<span id="git-status-text" class="office-preview-status">未加载</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="git-refresh" class="icon-btn small" type="button" title="刷新状态">⟳</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台">×</button>
+							</div>
+						</header>
+						<div class="git-toolbar">
+							<button id="git-pull" class="secondary-btn small" type="button" title="拉取远端更新（--ff-only）">↓ 拉取</button>
+							<button id="git-push" class="secondary-btn small" type="button" title="提交后推送到远端">↑ 推送</button>
+							<span id="git-ahead-behind" class="git-ahead-behind"></span>
+						</div>
+						<div class="git-changes-head">
+							<span>更改</span>
+							<span id="git-changes-count" class="git-changes-count">0</span>
+						</div>
+						<div id="git-changes" class="git-changes">
+							<div class="git-empty">当前工作区不是 Git 仓库，或没有改动。</div>
+						</div>
+						<div class="git-commit-box">
+							<input id="git-commit-message" type="text" placeholder="提交说明（必填）" maxlength="2000" autocomplete="off">
+							<div class="git-commit-actions">
+								<button id="git-stage-all" class="secondary-btn small" type="button" title="暂存全部改动">暂存全部</button>
+								<button id="git-commit" class="primary-btn small" type="button" disabled>✓ 提交</button>
+							</div>
+						</div>
+						<div id="git-diff" class="git-diff"></div>
+					</div>
+
+					<div id="shell-pane" class="workbench-pane" hidden>
+						<header class="workbench-pane-header">
+							<div class="workbench-pane-heading">
+								<span class="office-preview-kicker">交互终端（shell）</span>
+								<strong id="shell-title" class="office-preview-title">终端</strong>
+								<span id="shell-status" class="office-preview-status">未启动</span>
+							</div>
+							<div class="office-preview-actions">
+								<button id="shell-restart" class="icon-btn small" type="button" title="重启终端">⟳</button>
+								<button id="shell-clear" class="icon-btn small" type="button" title="清屏">⌫</button>
+								<button class="icon-btn small" data-workbench-maximize type="button" title="放大右侧工作台">□</button>
+								<button class="icon-btn small" data-workbench-close type="button" title="关闭右侧工作台">×</button>
+							</div>
+						</header>
+						<div class="shell-note">在当前工作区运行命令；全屏交互程序（如 vim）不受支持。</div>
+						<div id="shell-output" class="shell-output"></div>
+						<div class="shell-input-row">
+							<span class="shell-prompt" aria-hidden="true">❯</span>
+							<input id="shell-input" type="text" placeholder="输入命令后按 Enter" autocomplete="off" spellcheck="false">
+						</div>
+					</div>
+
 					<div id="side-browser-pane" class="workbench-pane" hidden>
 						<header class="agent-browser-header">
 							<div class="agent-browser-heading">
@@ -331,6 +398,12 @@
 						<button id="side-tab-review" class="workbench-tab" type="button" title="查看工作区代码差异"><span>差异</span></button>
 						<button id="side-tab-terminal" class="workbench-tab" type="button" title="查看本地终端执行">
 							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 6 3.5 4-3.5 4M10.5 14h5"></path></svg></span><span>终端</span>
+						</button>
+						<button id="side-tab-git" class="workbench-tab" type="button" title="Git 源代码管理（暂存 / 提交 / 推送）">
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="15" r="2.2"></circle><circle cx="5" cy="5" r="2.2"></circle><circle cx="15" cy="9" r="2.2"></circle><path d="M5 7.2v5.6M7.2 15h4a2 2 0 0 0 2-2v-1.6M15 6.8V4.5"></path></svg></span><span>Git</span>
+						</button>
+						<button id="side-tab-shell" class="workbench-tab" type="button" title="交互式终端（在工作区运行命令）">
+							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="14" height="12" rx="1.5"></rect><path d="m6.5 8 2.2 2-2.2 2M10.5 12h3"></path></svg></span><span>命令行</span>
 						</button>
 						<button id="side-tab-browser" class="workbench-tab" type="button" title="打开客户端独立浏览器">
 							<span class="workbench-tab-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"></circle><path d="M3.5 10h13M10 3.5c2 2.1 2.8 4.2 2.8 6.5S12 14.4 10 16.5C8 14.4 7.2 12.3 7.2 10S8 5.6 10 3.5"></path></svg></span><span>浏览器</span>
@@ -377,8 +450,31 @@
 		</div>
 	</div>
 
-	<div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-label="设置" hidden>
-		<div class="modal-body settings-body">
+	<!-- 提示词模板编辑弹窗 -->
+	<div id="template-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="template-modal-title" hidden>
+		<div class="modal-body template-modal-body">
+			<div class="modal-header">
+				<span class="modal-title" id="template-modal-title">新建模板</span>
+				<button id="template-modal-close" class="icon-btn" title="关闭">×</button>
+			</div>
+			<div class="template-form">
+				<div class="key-add-row">
+					<input type="text" id="template-form-icon" placeholder="图标（如 🛠）" maxlength="8">
+					<input type="text" id="template-form-title" placeholder="模板名称（必填）" maxlength="80">
+				</div>
+				<input type="text" id="template-form-description" placeholder="一句话描述" maxlength="160">
+				<textarea id="template-form-text" rows="6" placeholder="模板内容：点击卡片后会填入输入框（必填）" maxlength="8000"></textarea>
+				<div class="model-form-actions">
+					<button id="template-form-delete" class="key-delete" type="button" hidden>删除模板</button>
+					<span class="composer-spacer"></span>
+					<button id="template-form-cancel" class="secondary-btn" type="button">取消</button>
+					<button id="template-form-save" class="primary-btn" type="button">保存</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<div id="settings-modal" class="modal" role="dialog" aria-modal="true" aria-label="设置" hidden>		<div class="modal-body settings-body">
 			<div class="modal-header">
 				<div class="settings-title-group">
 					<span class="modal-title">设置</span>
@@ -465,6 +561,15 @@
 					<button id="key-add-btn">添加</button>
 				</div>
 				<div id="key-list" class="key-list"></div>
+				<div class="settings-subheading">视觉桥</div>
+				<p class="modal-hint">当前模型不支持识图时，自动把图片交给一个支持视觉的模型转写成文字，再作为文字证据发送。不设置则自动选用第一个可用的视觉模型。</p>
+				<div class="key-row">
+					<label class="modal-hint vision-bridge-toggle"><input id="vision-bridge-enabled" type="checkbox"> 启用视觉桥</label>
+					<select id="vision-bridge-model" title="视觉桥模型">
+						<option value="">自动选择可用的视觉模型</option>
+					</select>
+				</div>
+				<div id="vision-bridge-status" class="workspace-current">读取中…</div>
 				<div class="settings-subheading">自定义 OpenAI 兼容模型</div>
 				<p class="modal-hint">适用于 vLLM、Ollama、LM Studio 和兼容代理。建议按“连接地址 → 读取模型 → 设置能力 → 保存”的顺序完成。</p>
 				<input type="hidden" id="custom-model-provider-id">

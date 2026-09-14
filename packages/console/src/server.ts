@@ -9,9 +9,9 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	type AgentSession,
 	type AgentSessionEvent,
@@ -36,6 +36,7 @@ import {
 	getAttachmentReference,
 	saveAttachmentSnapshot,
 } from "./attachment-snapshots.ts";
+import { killBackgroundTask, listBackgroundTasks } from "./background-tasks.ts";
 import { bundledProviderExtensionPaths, createAntigravityModelRefresher } from "./bundled-providers.ts";
 import * as codeDevelopment from "./code-development.ts";
 import { CodexOAuthCoordinator } from "./codex-oauth.ts";
@@ -46,9 +47,18 @@ import * as customModels from "./custom-models.ts";
 import { needsEventResync } from "./event-replay.ts";
 import { FILE_LIMITS, MAX_TEXT_REQUEST_BYTES } from "./file-limits.ts";
 import * as fsExplorer from "./fs.ts";
+import { watchDirectory } from "./fs-watcher.ts";
+import * as gitPanel from "./git-panel.ts";
 import { HttpBodyError, readBodyJson } from "./http-body.ts";
 import { isAllowedLoopbackHost, isAllowedRequestOrigin, safeFileHeaders } from "./http-security.ts";
 import { InstallCompletion } from "./install-completion.ts";
+import {
+	destroyTerminal,
+	getTerminal,
+	startTerminal,
+	subscribeTerminal,
+	writeTerminal,
+} from "./interactive-terminal.ts";
 import * as managedFileTools from "./managed-file-tools.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { configureConsoleNetworking } from "./network.ts";
@@ -76,6 +86,7 @@ import {
 	unmountPack,
 } from "./packs.ts";
 import { DATA_DIR } from "./paths.ts";
+import { PromptTemplateStore } from "./prompt-templates.ts";
 import * as redteam from "./redteam.ts";
 import { RequestLedger } from "./request-ledger.ts";
 import { readSessionIndexFile, type SessionIndexEntry, writeSessionIndexFile } from "./session-index.ts";
@@ -88,6 +99,7 @@ import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages
 import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
 import * as updates from "./updates.ts";
+import { modelSupportsImages, VisionBridge } from "./vision-bridge.ts";
 import {
 	BRAVE_WEB_SEARCH_AUTH_RECORD,
 	BRAVE_WEB_SEARCH_DISPLAY_NAME,
@@ -116,6 +128,8 @@ const WORKSPACES_DIR = join(DATA_DIR, "workspaces");
 const SESSION_DIR = join(DATA_DIR, "sessions");
 /** 会话索引：ourSessionId → { cwd, title, createdAt, updatedAt } */
 const SESSION_INDEX_FILE = join(DATA_DIR, "sessions-index.json");
+/** 提示词模板库（空对话一键模板卡片） */
+const promptTemplates = new PromptTemplateStore(DATA_DIR);
 /**
  * 控制台专属 agentDir：模型/思考等级选择通过 Pi 的 SettingsManager 原生持久化在这里
  * （<DATA_DIR>/agent/settings.json），新会话自动沿用，且不污染用户全局 ~/.pi/agent/settings.json
@@ -186,6 +200,10 @@ interface ConsoleSession {
 	activePrompt: TrackedSessionPrompt | null;
 	/** 切换模型会异步检查鉴权；删除必须等它结束，避免重新写入已删除的会话文件。 */
 	modelChange: Promise<void> | null;
+	/** 工具看门狗：toolCallId → 开始时间；tool_execution_end 时移除。 */
+	runningToolStarts: Map<string, number>;
+	/** 看门狗报错用的工具名：toolCallId → toolName。 */
+	lastToolNames: Map<string, string>;
 }
 
 const sessions = new Map<string, ConsoleSession>();
@@ -423,6 +441,7 @@ const AUTH_FILE = join(CONSOLE_AGENT_DIR, "auth.json");
 /** 全服共享一个 ModelRuntime，启动时创建；auth 指向控制台专属文件（页面添加的 Key 在此持久化） */
 const credentials = createConsoleCredentials(AUTH_FILE);
 const modelRuntime = await ModelRuntime.create({ authPath: AUTH_FILE, credentials: credentials.store });
+const visionBridge = new VisionBridge(DATA_DIR, modelRuntime);
 const customModelManager = createCustomModelManager(CUSTOM_MODELS_FILE, credentials, modelRuntime);
 const refreshAntigravityModels = createAntigravityModelRefresher(
 	modelRuntime,
@@ -593,6 +612,13 @@ function toClientEvent(ev: AgentSessionEvent): { type: string; [key: string]: un
 			return { type: "compaction_start" };
 		case "compaction_end":
 			return { type: "compaction_end" };
+		case "queue_update":
+			// steer/followUp 队列变化：前端据此显示"已排队"的补充消息
+			return {
+				type: "queue_update",
+				steering: [...ev.steering],
+				followUp: [...ev.followUp],
+			};
 		case "thinking_level_changed":
 			return { type: "thinking_level_changed", level: ev.level };
 		default:
@@ -837,6 +863,14 @@ function subscribeConsoleSession(cs: ConsoleSession): void {
 				}
 			}
 		}
+		// 工具看门狗：记录运行中的工具，超过时限由全局定时器统一中止会话
+		if (ev.type === "tool_execution_start") {
+			cs.runningToolStarts.set(ev.toolCallId, Date.now());
+			cs.lastToolNames.set(ev.toolCallId, ev.toolName);
+		} else if (ev.type === "tool_execution_end") {
+			cs.runningToolStarts.delete(ev.toolCallId);
+			cs.lastToolNames.delete(ev.toolCallId);
+		}
 		if (ev.type === "message_start" && ev.message.role === "user" && cs.lastCapabilityTrace) {
 			cs.session.sessionManager.appendCustomEntry("console-turn", {
 				userTimestamp: ev.message.timestamp,
@@ -876,6 +910,8 @@ async function createConsoleSession(
 		deleting: false,
 		activePrompt: null,
 		modelChange: null,
+		runningToolStarts: new Map(),
+		lastToolNames: new Map(),
 	};
 	try {
 		touchSessionIndex(sessionId, cwd, sessionFile, enabledPacks);
@@ -919,6 +955,8 @@ async function restoreConsoleSession(sessionId: string): Promise<ConsoleSession 
 			deleting: false,
 			activePrompt: null,
 			modelChange: null,
+			runningToolStarts: new Map(),
+			lastToolNames: new Map(),
 		};
 		try {
 			touchSessionIndex(sessionId, entry.cwd, sessionFile, enabledPacks);
@@ -948,6 +986,31 @@ async function getOrRestoreSession(sessionId: string): Promise<ConsoleSession | 
 	restoringSessions.set(sessionId, pending);
 	return pending;
 }
+
+// ---------------------------------------------------------------------------
+// 工具看门狗：单个工具调用超过 20 分钟视为卡死，自动中止该会话当前任务
+// ---------------------------------------------------------------------------
+
+const TOOL_WATCHDOG_MS = 20 * 60 * 1000;
+
+setInterval(() => {
+	const now = Date.now();
+	for (const cs of sessions.values()) {
+		if (cs.runningToolStarts.size === 0 || cs.deleting) continue;
+		const stale = [...cs.runningToolStarts.entries()].filter(([, startedAt]) => now - startedAt > TOOL_WATCHDOG_MS);
+		if (stale.length === 0) continue;
+		const minutes = Math.round(TOOL_WATCHDOG_MS / 60000);
+		const names = [...new Set(stale.map(([toolCallId]) => cs.lastToolNames.get(toolCallId)).filter(Boolean))].join(
+			"、",
+		);
+		const message = `工具${names ? `（${names}）` : ""}运行超过 ${minutes} 分钟，已自动中止本次任务`;
+		console.warn(`[看门狗] 会话 ${cs.sessionId}：${message}`);
+		bufferAndBroadcast(cs, { type: "watchdog_abort", message });
+		void abortTrackedSessionPrompt(cs.session, cs.activePrompt)
+			.then(() => undefined)
+			.catch(() => undefined);
+	}
+}, 60_000).unref();
 
 // ---------------------------------------------------------------------------
 // 历史快照
@@ -998,6 +1061,8 @@ function buildHistory(sessionId: string, session: AgentSession, start = 0): Hist
 					role: "user",
 					text: redactSensitiveText(parsed.text),
 					attachments: messageAttachments,
+					// 编辑重问（fork）按时间戳精确定位该消息
+					timestamp: message.timestamp,
 				};
 				const facts = turnFacts.get(message.timestamp);
 				if (facts?.capabilityTrace) item.capabilityTrace = facts.capabilityTrace;
@@ -1333,6 +1398,79 @@ function listModels(): Array<{
 // 模型服务 Key 管理（auth.json：Record<provider, {type:"api_key",key}>）
 // ---------------------------------------------------------------------------
 
+/** Git 面板 / 终端的工作目录：解析为绝对路径并要求是已存在的目录。 */
+function resolveGitCwd(cwd: string): string {
+	const resolved = resolve(cwd || workspace.getWorkspacePath() || DATA_DIR);
+	if (!existsSync(resolved)) throw new Error("目录不存在");
+	const stat = statSync(resolved);
+	if (!stat.isDirectory()) throw new Error("路径不是目录");
+	return resolved;
+}
+
+/**
+ * 编辑重问的分叉：复制源会话文件，截断到目标用户消息之前（含该消息一并丢弃）。
+ * 返回新会话文件路径；parentSession 指回源文件。失败返回 null。
+ */
+function forkSessionFile(
+	sourceFile: string,
+	newSessionId: string,
+	targetUserTimestamp: number | undefined,
+): string | null {
+	try {
+		const lines = readFileSync(sourceFile, "utf8").split("\n");
+		const headerLine = lines.find((line) => line.trim().startsWith("{"));
+		if (!headerLine) return null;
+		const header = JSON.parse(headerLine) as Record<string, unknown>;
+		if (header.type !== "session") return null;
+		const dir = dirname(sourceFile);
+		const timestamp = new Date().toISOString();
+		const newFile = join(dir, `${timestamp.replace(/[:.]/g, "-")}_${newSessionId}.jsonl`);
+		const kept: string[] = [];
+		let cut = false;
+		for (const line of lines) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			let entry: Record<string, unknown>;
+			try {
+				entry = JSON.parse(trimmed) as Record<string, unknown>;
+			} catch {
+				continue;
+			}
+			if (entry.type === "session") continue;
+			// 截断点：目标用户消息条目（按时间戳对齐）
+			if (
+				targetUserTimestamp !== undefined &&
+				entry.type === "message" &&
+				(entry as { message?: { role?: string; timestamp?: number } }).message?.role === "user" &&
+				(entry as { message?: { role?: string; timestamp?: number } }).message?.timestamp === targetUserTimestamp
+			) {
+				cut = true;
+			}
+			if (cut) break;
+			kept.push(trimmed);
+		}
+		const newHeader = {
+			...header,
+			id: newSessionId,
+			timestamp,
+			parentSession: sourceFile,
+		};
+		writeFileSync(newFile, `${JSON.stringify(newHeader)}\n${kept.join("\n")}\n`, { flag: "wx" });
+		return newFile;
+	} catch {
+		return null;
+	}
+}
+
+/** 把 git 子进程报错转成面向用户的中文提示。 */
+function gitErrorMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	if (/ENOENT|not recognized|command not found/i.test(message)) {
+		return "未找到 git 命令，请先安装 Git（https://git-scm.com）";
+	}
+	return message;
+}
+
 async function savedApiKey(provider: string): Promise<string | undefined> {
 	return (await credentials.apiKeys())[provider];
 }
@@ -1464,6 +1602,7 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
 	"/redteam.svg": { file: "redteam.svg", contentType: "image/svg+xml" },
+	"/vendor/mermaid.min.js": { file: "vendor/mermaid.min.js", contentType: "text/javascript; charset=utf-8" },
 };
 
 function serveStatic(pathname: string, res: ServerResponse): boolean {
@@ -2031,6 +2170,220 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
+	// ---------------------------------------------------------------------------
+	// 提示词模板库（空对话一键模板）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/prompt-templates" && req.method === "GET") {
+		sendJson(res, 200, { templates: promptTemplates.list() });
+		return;
+	}
+	if (pathname === "/api/prompt-templates" && req.method === "PUT") {
+		try {
+			const body = (await readBodyJson(req)) as { templates?: unknown };
+			sendJson(res, 200, { templates: promptTemplates.save(body?.templates) });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : "模板保存失败" });
+		}
+		return;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Git 源代码管理面板（供人使用；与会话工作区绑定）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/git/status" && req.method === "GET") {
+		const cwd = url.searchParams.get("cwd") ?? "";
+		try {
+			sendJson(res, 200, await gitPanel.gitStatus(resolveGitCwd(cwd)));
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/git/diff" && req.method === "GET") {
+		const cwd = url.searchParams.get("cwd") ?? "";
+		const filePath = url.searchParams.get("path") ?? "";
+		const staged = url.searchParams.get("staged") === "1";
+		if (!filePath) {
+			sendJson(res, 400, { error: "缺少 path 参数" });
+			return;
+		}
+		try {
+			sendJson(res, 200, await gitPanel.gitDiffFile(resolveGitCwd(cwd), filePath, staged));
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/git/stage" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { cwd?: unknown; paths?: unknown; all?: unknown; unstage?: unknown };
+		const paths = Array.isArray(body?.paths)
+			? body.paths.filter((p): p is string => typeof p === "string" && p.length > 0).slice(0, 500)
+			: [];
+		try {
+			if (body?.all === true)
+				await gitPanel.gitStageAll(resolveGitCwd(String(body?.cwd ?? "")), body?.unstage === true);
+			else await gitPanel.gitStage(resolveGitCwd(String(body?.cwd ?? "")), paths, body?.unstage === true);
+			sendJson(res, 200, { ok: true });
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/git/commit" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { cwd?: unknown; message?: unknown };
+		if (typeof body?.message !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"message": "..."}' });
+			return;
+		}
+		try {
+			sendJson(res, 200, await gitPanel.gitCommit(resolveGitCwd(String(body?.cwd ?? "")), body.message));
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/git/push" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { cwd?: unknown };
+		try {
+			sendJson(res, 200, { message: await gitPanel.gitPush(resolveGitCwd(String(body?.cwd ?? ""))) });
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+	if (pathname === "/api/git/pull" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { cwd?: unknown };
+		try {
+			sendJson(res, 200, { message: await gitPanel.gitPull(resolveGitCwd(String(body?.cwd ?? ""))) });
+		} catch (error) {
+			sendJson(res, 400, { error: gitErrorMessage(error) });
+		}
+		return;
+	}
+
+	// ---------------------------------------------------------------------------
+	// 后台任务面板（智能体启动的开发服务端口）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/tasks" && req.method === "GET") {
+		try {
+			sendJson(res, 200, { tasks: await listBackgroundTasks() });
+		} catch (error) {
+			sendJson(res, 500, { error: error instanceof Error ? error.message : "后台任务列表读取失败" });
+		}
+		return;
+	}
+	if (pathname === "/api/tasks/kill" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { pid?: unknown; processName?: unknown };
+		if (typeof body?.pid !== "number" || typeof body?.processName !== "string") {
+			sendJson(res, 400, { error: '请求体需为 {"pid": 123, "processName": "node"}' });
+			return;
+		}
+		try {
+			await killBackgroundTask(body.pid, body.processName);
+			sendJson(res, 200, { ok: true });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : "停止失败" });
+		}
+		return;
+	}
+
+	// ---------------------------------------------------------------------------
+	// 交互式终端（每客户端独立 shell；管道模式无原生依赖）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/terminal/start" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { cwd?: unknown };
+		try {
+			const session = startTerminal(resolveGitCwd(String(body?.cwd ?? "")));
+			sendJson(res, 200, { terminalId: session.id, shell: session.shell });
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : "终端启动失败" });
+		}
+		return;
+	}
+	const terminalMatch = pathname.match(/^\/api\/terminal\/([a-zA-Z0-9-]{1,80})(?:\/(input|stream|kill))?$/);
+	if (terminalMatch) {
+		const terminalId = terminalMatch[1];
+		const terminalAction = terminalMatch[2] ?? "";
+		if (req.method === "GET" && terminalAction === "stream") {
+			const terminal = getTerminal(terminalId);
+			if (!terminal) {
+				sendJson(res, 404, { error: "终端已关闭" });
+				return;
+			}
+			res.writeHead(200, {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+				Connection: "keep-alive",
+			});
+			const unsubscribe = subscribeTerminal(terminalId, (chunk) => {
+				try {
+					res.write(`data: ${JSON.stringify({ output: chunk })}\n\n`);
+				} catch {
+					unsubscribe();
+				}
+			});
+			res.on("close", unsubscribe);
+			return;
+		}
+		if (req.method === "POST" && terminalAction === "input") {
+			const body = (await readBodyJson(req)) as { data?: unknown };
+			if (typeof body?.data !== "string" || body.data.length > 8000) {
+				sendJson(res, 400, { error: "输入内容无效" });
+				return;
+			}
+			try {
+				writeTerminal(terminalId, body.data);
+				sendJson(res, 200, { ok: true });
+			} catch (error) {
+				sendJson(res, 400, { error: error instanceof Error ? error.message : "写入失败" });
+			}
+			return;
+		}
+		if (req.method === "POST" && terminalAction === "kill") {
+			destroyTerminal(terminalId);
+			sendJson(res, 200, { ok: true });
+			return;
+		}
+	}
+
+	// ---------------------------------------------------------------------------
+	// 视觉桥（无识图模型时用视觉模型转写图片）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/vision-bridge" && req.method === "GET") {
+		sendJson(res, 200, visionBridge.getConfig());
+		return;
+	}
+	if (pathname === "/api/vision-bridge" && req.method === "POST") {
+		const body = (await readBodyJson(req)) as { enabled?: unknown; provider?: unknown; modelId?: unknown };
+		try {
+			sendJson(res, 200, visionBridge.setConfig(body as { enabled?: boolean; provider?: string; modelId?: string }));
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : "视觉桥配置保存失败" });
+		}
+		return;
+	}
+	if (pathname === "/api/vision-bridge/models" && req.method === "GET") {
+		sendJson(res, 200, { models: visionBridge.listVisionModels() });
+		return;
+	}
+
+	// ---------------------------------------------------------------------------
+	// 文件树实时刷新（fs.watch → SSE）
+	// ---------------------------------------------------------------------------
+	if (pathname === "/api/fs/watch" && req.method === "GET") {
+		const directory = url.searchParams.get("path") ?? "";
+		if (!directory) {
+			sendJson(res, 400, { error: "缺少 path 参数" });
+			return;
+		}
+		try {
+			watchDirectory(directory, res);
+		} catch {
+			sendJson(res, 400, { error: "无法监听该目录" });
+		}
+		return;
+	}
+
 	// Codex 订阅登录（Pi 官方 openai-codex OAuth；使用设备码避免占用本地回调端口）
 	if (pathname === "/api/oauth/openai-codex/status" && req.method === "GET") {
 		sendJson(res, 200, codexOAuth.status());
@@ -2520,7 +2873,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			// URL 中的临时登录凭据绝不能进入 AgentSession/JSONL。模型只看到可导航的
 			// 随机引用，browser_navigate 在当前进程内存中于执行前还原原始 URL。
 			const safeText = vaultSensitiveUrlsInText(text);
-			const promptText = appendAttachmentAnnotation(safeText, attachments);
+			let promptText = appendAttachmentAnnotation(safeText, attachments);
+			let promptImages = images;
 			// Persist acceptance metadata before replying; a disk failure must still
 			// return an HTTP error instead of leaving the client waiting for a run.
 			updateSessionTitle(
@@ -2539,9 +2893,44 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			const controller = new AbortController();
 			const activePrompt: TrackedSessionPrompt = { preflight, done: Promise.resolve(), controller, requestId };
 			cs.activePrompt = activePrompt;
+			// 视觉桥：当前模型不支持识图时，把图片交给视觉模型转写成文字证据
+			// （此时 202 已回复、abort 通道就绪；转写失败则丢弃图片并告知模型）
+			if (images && images.length > 0 && !modelSupportsImages(currentModel)) {
+				const bridgeConfig = visionBridge.getConfig();
+				const transcriptions: string[] = [];
+				let bridgeError: string | null = null;
+				if (bridgeConfig.enabled) {
+					for (const image of images) {
+						try {
+							transcriptions.push(await visionBridge.transcribe(image, controller.signal));
+						} catch (error) {
+							bridgeError = error instanceof Error ? error.message : String(error);
+							break;
+						}
+					}
+				} else {
+					bridgeError = "视觉桥未启用";
+				}
+				if (transcriptions.length === images.length) {
+					promptImages = undefined;
+					promptText = `${promptText}\n\n[图片内容转写（视觉桥）]\n${transcriptions
+						.map((item, index) => `图 ${index + 1}：${item}`)
+						.join("\n\n")}`;
+					bufferAndBroadcast(cs, { type: "vision_bridge_applied", count: transcriptions.length });
+				} else {
+					promptImages = undefined;
+					promptText = `${promptText}\n\n[提示：用户附加了 ${images.length} 张图片，但当前模型不支持识图，视觉桥未生效（${redactSensitiveText(
+						bridgeError ?? "未知原因",
+					)}）。图片未发送。]`;
+					bufferAndBroadcast(cs, {
+						type: "vision_bridge_failed",
+						error: redactSensitiveText(bridgeError ?? "未知原因"),
+					});
+				}
+			}
 			activePrompt.done = cs.session
 				.prompt(promptText, {
-					images,
+					images: promptImages,
 					signal: controller.signal,
 					preflightResult: (accepted) => {
 						resolvePreflight(accepted);
@@ -2584,6 +2973,116 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 					if (cs.activePrompt === activePrompt) cs.activePrompt = null;
 					if (pendingSkillReloads.has(sessionId) && !cs.deleting) void reloadInstalledSkillsInSessions(true);
 				});
+			return;
+		}
+
+		// POST /api/sessions/:id/steer — 运行中排队补充消息（工具结算后注入）
+		case "POST steer": {
+			const body = (await readBodyJson(req)) as { text?: unknown; images?: unknown };
+			const text = typeof body?.text === "string" ? body.text.trim() : "";
+			if (!text) {
+				sendJson(res, 400, { error: "补充内容不能为空" });
+				return;
+			}
+			if (text.length > 32000) {
+				sendJson(res, 400, { error: "补充内容过长" });
+				return;
+			}
+			if (!cs.session.isStreaming && !cs.activePrompt) {
+				sendJson(res, 409, { error: "当前没有运行中的任务，直接发送即可" });
+				return;
+			}
+			const images = parseImages(body.images) ?? undefined;
+			if (Array.isArray(body.images) && !images) {
+				sendJson(res, 400, { error: "images 参数格式错误" });
+				return;
+			}
+			try {
+				await cs.session.steer(vaultSensitiveUrlsInText(text), images);
+				sendJson(res, 202, { ok: true });
+			} catch (error) {
+				sendJson(res, 409, { error: error instanceof Error ? error.message : "补充消息排队失败" });
+			}
+			return;
+		}
+
+		// POST /api/sessions/:id/compact — 手动压缩上下文
+		case "POST compact": {
+			if (cs.session.isStreaming || cs.activePrompt || cs.modelChange) {
+				sendJson(res, 409, { error: "任务运行中不能压缩，请等待完成或先停止" });
+				return;
+			}
+			const body = (await readBodyJson(req).catch(() => ({}))) as { instructions?: unknown };
+			const instructions = typeof body?.instructions === "string" ? body.instructions.slice(0, 2000) : undefined;
+			cs.modelChange = cs.session
+				.compact(instructions)
+				.then(() => undefined)
+				.finally(() => {
+					if (cs.modelChange) cs.modelChange = null;
+				});
+			sendJson(res, 202, { ok: true });
+			return;
+		}
+
+		// POST /api/sessions/:id/fork — 编辑重问：从指定用户消息前分叉出新会话
+		case "POST fork": {
+			const body = (await readBodyJson(req)) as { requestId?: unknown; timestamp?: unknown };
+			// 定位目标用户消息：优先 requestId（console-turn 记录），否则直接给时间戳
+			let targetTimestamp = Number(body?.timestamp);
+			if (!Number.isFinite(targetTimestamp) || targetTimestamp <= 0) {
+				targetTimestamp = 0;
+				if (typeof body?.requestId === "string" && body.requestId) {
+					for (const entry of cs.session.sessionManager.getEntries()) {
+						if (entry.type !== "custom" || entry.customType !== "console-turn" || !entry.data) continue;
+						const data = entry.data as { requestId?: unknown; userTimestamp?: unknown };
+						if (data.requestId === body.requestId && typeof data.userTimestamp === "number") {
+							targetTimestamp = data.userTimestamp;
+							break;
+						}
+					}
+				}
+			}
+			if (!targetTimestamp) {
+				sendJson(res, 400, { error: "缺少 requestId 或 timestamp，无法定位要重问的消息" });
+				return;
+			}
+			const visibleUserMessages = cs.session.messages.filter((message) => {
+				if (message.role !== "user") return false;
+				if (typeof message.content === "string") return message.content.length > 0;
+				return message.content.some((block) => block.type === "text" || block.type === "image");
+			});
+			if (!visibleUserMessages.some((message) => message.timestamp === targetTimestamp)) {
+				sendJson(res, 400, { error: "该消息不存在" });
+				return;
+			}
+			if (cs.session.isStreaming || cs.activePrompt) {
+				sendJson(res, 409, { error: "任务运行中不能分叉，请等待完成或先停止" });
+				return;
+			}
+			const sourceFile = cs.session.sessionFile;
+			if (!sourceFile || !existsSync(sourceFile)) {
+				sendJson(res, 409, { error: "会话文件不可读，无法分叉" });
+				return;
+			}
+			const newSessionId = randomUUID();
+			const cwd = cs.session.sessionManager.getCwd();
+			const newFile = forkSessionFile(sourceFile, newSessionId, targetTimestamp);
+			if (!newFile) {
+				sendJson(res, 500, { error: "会话分叉失败" });
+				return;
+			}
+			try {
+				touchSessionIndex(newSessionId, cwd, newFile, cs.enabledPacks);
+			} catch {
+				sendJson(res, 500, { error: "分叉会话注册失败" });
+				return;
+			}
+			const forked = await restoreConsoleSession(newSessionId).catch(() => null);
+			if (!forked) {
+				sendJson(res, 500, { error: "分叉会话创建失败" });
+				return;
+			}
+			sendJson(res, 200, { sessionId: newSessionId });
 			return;
 		}
 

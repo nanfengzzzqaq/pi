@@ -4,6 +4,35 @@
 默认形态为**纯净原生 Pi**（内置 read/bash/edit/write + find/grep/ls 全套原生工具，官方系统提示词）；能力包通过 `customTools` 注册、
 `setActiveToolsByName` 挂载/卸载，未挂载任何包时行为与纯净版完全一致。
 
+## v0.4.0 新特性（借鉴 pi-web-ui 社区项目）
+
+**对话**
+
+- **补充（steer）** — 回复流式中可直接发送跟进消息，当前回合工具结算后立即注入（对应 pi CLI 的 Enter 打断语义）；输入框上方显示"排队中"队列。
+- **斜杠命令** — 输入 `/` 弹出命令面板（`/new` `/compact` `/copy` `/model` `/thinking` `/cwd` `/git` `/terminal` `/tasks` `/templates`），支持 ↑↓ 导航。
+- **编辑重问** — 悬停任意历史问题点"编辑重问"，从该消息前分叉出新对话（parentSession 溯源），原对话不受影响。
+- **失败轮次标红 + 一键重试** — 模型报错重试用尽后，失败轮次红色标记，用户消息旁出现"重试"按钮。
+- **消息自动折叠 + 惰性渲染** — 超过 30 条消息自动折叠较早内容；CSS `content-visibility` 跳过视口外渲染。
+- **问题序号** — 每条用户消息带 `#N` 序号标签。
+
+**工作台**
+
+- **Git 源代码管理面板** — 右侧工作台新增 Git tab：分支/上游状态、更改列表（勾选暂存/取消暂存、M/U/D 状态徽标）、提交、推送、拉取、按文件查看 diff（execFile 数组传参，不拼 shell）。
+- **交互终端** — 新增"命令行" tab：每客户端独立 shell（Windows 优先 Git Bash），命令实时流式回显，零原生模块依赖（管道模式，不支持 vim 等全屏程序）。
+- **后台任务面板** — 顶栏"后台任务"按钮：检测智能体启动的开发服务端口（node/python/npm 等进程），可单独停止。
+- **工具看门狗** — 单个工具调用超过 20 分钟自动中止该会话任务并提示。
+
+**文件与图片**
+
+- **Mermaid 图表** — 回复中的 ` ```mermaid ` 围栏渲染为 SVG（本地 vendored mermaid.min.js，离线可用，失败回退代码块）。
+- **文件预览增强** — 文本预览带行号；选中文字一键"引用到输入框"；二进制文件十六进制视图（GBK 解码原本已支持，自动回退 gb18030）。
+- **实时文件树** — 服务端 fs.watch 监听当前浏览目录，改动静默重列（搜索态不刷新）。
+- **视觉桥** — 当前模型不支持识图时（如本地 vLLM/Ollama 文本模型），自动把图片交给一个视觉模型转写成文字证据再发送；设置 → 模型服务可指定模型或停用；按图片哈希缓存。
+
+**提示词模板**
+
+- 空对话状态展示 12 个内置模板卡片（仓库初始化/代码审查/有据调研/系统化排错等），点击填入输入框；可编辑、删除、新建，草稿可存为模板；全局共享保存在 `<dataDir>/prompt-templates.json`。
+
 ## 安装与启动（开发模式）
 
 ```bash
@@ -108,6 +137,23 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `POST /api/sessions/:id/messages` | body `{"text":"...","images":[{"data","mimeType"}]}`；立即回 202，错误走 SSE |
 | `POST /api/sessions/:id/files` | body `{"files":[{name,mimeType,dataBase64}]}`；单文件 ≤20MB、总量 ≤50MB，超限 413；返回模型工作副本 `files` 与消息原始快照 `messageFiles` |
 | `POST /api/sessions/:id/abort` | 中止当前运行 |
+| `POST /api/sessions/:id/steer` | body `{"text":"..."}`；运行中排队补充消息，工具结算后注入 |
+| `POST /api/sessions/:id/compact` | 手动压缩上下文（body 可带 `instructions`） |
+| `POST /api/sessions/:id/fork` | body `{"requestId"}` 或 `{"timestamp"}`；编辑重问：从该用户消息前分叉出新会话，返回 `{sessionId}` |
+| `GET` / `PUT /api/prompt-templates` | 提示词模板库（全量列表读写） |
+| `GET /api/git/status?cwd=` | 仓库状态：分支、上游、更改列表（porcelain 解析） |
+| `GET /api/git/diff?cwd=&path=&staged=` | 单文件 unified diff（截断 400KB） |
+| `POST /api/git/stage` | body `{"cwd","paths":[],"all"?,"unstage"?}` 暂存/取消暂存 |
+| `POST /api/git/commit` | body `{"cwd","message"}` 提交 |
+| `POST /api/git/push` / `pull` | 推送 / 拉取（pull 为 `--ff-only`） |
+| `GET /api/tasks` | 检测监听端口的开发服务（node/python 等） |
+| `POST /api/tasks/kill` | body `{"pid","processName"}` 停止服务（终止前复核进程名） |
+| `POST /api/terminal/start` | 启动交互 shell，返回 `{terminalId, shell}` |
+| `GET /api/terminal/:id/stream` | 终端输出 SSE |
+| `POST /api/terminal/:id/input` | body `{"data":"..."}` 写入终端 |
+| `POST /api/terminal/:id/kill` | 关闭终端 |
+| `GET /api/fs/watch?path=` | 目录监听 SSE（`fs_change` 事件） |
+| `GET` / `POST /api/vision-bridge` | 视觉桥配置；`GET /api/vision-bridge/models` 列出可用视觉模型 |
 | `GET /api/sessions/:id/history` | 消息快照（含 `model`、`thinkingLevel`、`lastSeq`），刷新恢复 |
 | `POST /api/sessions/:id/model` | body `{"provider","modelId"}` → `session.setModel`，SSE 发 `model_changed` |
 | `POST /api/sessions/:id/thinking` | body `{"level"}`（off/minimal/low/medium/high/xhigh/max），返回实际生效值 |

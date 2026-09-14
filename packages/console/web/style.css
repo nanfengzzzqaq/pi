@@ -6715,3 +6715,537 @@ body::before {
 		margin-top: 18px;
 	}
 }
+/* =========================================================================
+ * v0.4 新增：Mermaid / steer / 斜杠命令 / 失败重试 / 编辑重问 /
+ * 提示词模板 / Git 面板 / 交互终端 / 后台任务 / 文件预览增强
+ * ========================================================================= */
+
+/* 长对话惰性渲染：视口外的消息跳过布局与绘制 */
+.message {
+	content-visibility: auto;
+	contain-intrinsic-size: auto 120px;
+}
+
+/* --- Mermaid 图表 --- */
+.mermaid-block {
+	margin: 10px 0;
+	padding: 14px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--panel);
+	overflow-x: auto;
+	text-align: center;
+}
+.mermaid-block .mermaid-loading {
+	color: var(--muted);
+	font-size: 12px;
+}
+.mermaid-figure svg {
+	max-width: 100%;
+	height: auto;
+}
+.mermaid-failed .mermaid-error {
+	color: var(--error);
+	font-size: 12px;
+	margin-bottom: 8px;
+}
+
+/* --- 补充（steer）队列 --- */
+.steer-queue {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin-bottom: 8px;
+}
+.steer-chip {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 7px 12px;
+	border: 1px dashed var(--accent);
+	border-radius: var(--radius);
+	background: var(--accent-soft);
+	font-size: 12px;
+}
+.steer-chip-text {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--text);
+}
+.steer-chip-state {
+	color: var(--accent);
+	flex-shrink: 0;
+}
+
+/* --- 斜杠命令面板 --- */
+.slash-palette {
+	max-height: 260px;
+	overflow-y: auto;
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius);
+	background: var(--panel);
+	box-shadow: var(--shadow);
+	margin-bottom: 8px;
+	padding: 4px;
+}
+.slash-item {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 7px 10px;
+	border-radius: 8px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.slash-item.active {
+	background: var(--accent-soft);
+}
+.slash-item code {
+	font-family: var(--mono);
+	color: var(--accent);
+	min-width: 88px;
+}
+.slash-item-desc {
+	flex: 1;
+	color: var(--muted);
+}
+.slash-item-group {
+	color: var(--faint);
+	font-size: 11px;
+	border: 1px solid var(--border);
+	padding: 1px 6px;
+	border-radius: 99px;
+}
+
+/* --- 用户消息：序号 + 悬停操作 + 失败态 --- */
+.user-bubble-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-bottom: 6px;
+	opacity: 0;
+	transition: opacity 0.15s ease;
+}
+.message.user:hover .user-bubble-actions,
+.message.user.turn-failed .user-bubble-actions {
+	opacity: 1;
+}
+.user-question-index {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--faint);
+}
+.user-action-btn {
+	border: 1px solid var(--border-strong);
+	background: var(--panel-2);
+	color: var(--muted);
+	border-radius: 6px;
+	padding: 2px 8px;
+	font-size: 11px;
+	cursor: pointer;
+}
+.user-action-btn:hover {
+	color: var(--text);
+	border-color: var(--accent);
+}
+.user-action-btn.retry-turn-btn {
+	color: var(--error);
+	border-color: var(--error);
+}
+.message.turn-failed > .bubble {
+	border: 1px solid rgba(242, 112, 122, 0.4);
+}
+.turn-error-note {
+	margin-top: 8px;
+	color: var(--error);
+	background: var(--error-bg);
+	border-radius: 8px;
+	padding: 8px 10px;
+	font-size: 12px;
+}
+
+/* --- 编辑重问 --- */
+.reask-editor {
+	margin-top: 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.reask-editor textarea {
+	width: 100%;
+	resize: vertical;
+	background: var(--code-bg);
+	border: 1px solid var(--border-strong);
+	border-radius: 8px;
+	color: var(--text);
+	padding: 8px 10px;
+	font-family: inherit;
+	font-size: 13px;
+}
+.reask-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	justify-content: flex-end;
+}
+.reask-note {
+	color: var(--faint);
+	font-size: 11px;
+	margin-right: auto;
+}
+
+/* --- 提示词模板卡片 --- */
+.messages-empty-prompts {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+	gap: 10px;
+	max-width: 760px;
+}
+.template-card {
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 4px;
+	text-align: left;
+	padding: 12px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--panel);
+	color: var(--text);
+	cursor: pointer;
+	transition: border-color 0.15s ease, transform 0.1s ease;
+}
+.template-card:hover {
+	border-color: var(--accent);
+	transform: translateY(-1px);
+}
+.template-icon {
+	font-size: 18px;
+}
+.template-card strong {
+	font-size: 13px;
+}
+.template-card small {
+	color: var(--muted);
+	font-size: 11px;
+}
+.template-edit-btn {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	width: 22px;
+	height: 22px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 6px;
+	color: var(--faint);
+	opacity: 0;
+	transition: opacity 0.15s ease;
+}
+.template-card:hover .template-edit-btn {
+	opacity: 1;
+}
+.template-edit-btn:hover {
+	color: var(--text);
+	background: var(--panel-2);
+}
+.templates-manage-row {
+	display: flex;
+	gap: 8px;
+	justify-content: center;
+	margin-top: 14px;
+}
+.template-modal-body {
+	max-width: 560px;
+}
+.template-form {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 14px;
+}
+.template-form textarea {
+	width: 100%;
+	resize: vertical;
+	min-height: 120px;
+	background: var(--code-bg);
+	border: 1px solid var(--border-strong);
+	border-radius: 8px;
+	color: var(--text);
+	padding: 8px 10px;
+	font-family: inherit;
+	font-size: 13px;
+}
+
+/* --- Git 源代码管理面板 --- */
+.git-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--border);
+}
+.git-ahead-behind {
+	color: var(--muted);
+	font-size: 12px;
+}
+.git-changes-head {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	padding: 8px 12px 4px;
+	color: var(--muted);
+	font-size: 12px;
+}
+.git-changes-count {
+	background: var(--panel-2);
+	border-radius: 99px;
+	padding: 0 8px;
+	font-size: 11px;
+}
+.git-changes {
+	flex: 1;
+	overflow-y: auto;
+	padding: 4px 8px;
+	min-height: 80px;
+}
+.git-change {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 5px 8px;
+	border-radius: 7px;
+	cursor: pointer;
+	font-size: 12px;
+}
+.git-change:hover {
+	background: var(--panel-2);
+}
+.git-change.selected {
+	background: var(--accent-soft);
+}
+.git-change.staged .git-path {
+	color: var(--ok);
+}
+.git-badge {
+	flex-shrink: 0;
+	width: 18px;
+	height: 18px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 4px;
+	font-family: var(--mono);
+	font-size: 11px;
+	color: #fff;
+}
+.git-badge.modified { background: #c98a3d; }
+.git-badge.added { background: #4c9e63; }
+.git-badge.deleted { background: #c65a63; }
+.git-badge.untracked { background: #6d7280; }
+.git-path {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	direction: rtl;
+	text-align: left;
+}
+.git-commit-box {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 10px 12px;
+	border-top: 1px solid var(--border);
+}
+.git-commit-box input {
+	flex: 1;
+	background: var(--code-bg);
+	border: 1px solid var(--border-strong);
+	border-radius: 8px;
+	color: var(--text);
+	padding: 7px 10px;
+	font-size: 12px;
+}
+.git-commit-actions {
+	display: flex;
+	gap: 8px;
+	justify-content: flex-end;
+}
+.git-diff {
+	max-height: 40%;
+	overflow: auto;
+	border-top: 1px solid var(--border);
+	padding: 8px;
+}
+.git-empty,
+.tasks-empty {
+	color: var(--faint);
+	font-size: 12px;
+	padding: 14px 12px;
+	text-align: center;
+}
+.diff-text {
+	font-family: var(--mono);
+	font-size: 11.5px;
+	line-height: 1.55;
+	margin: 0;
+	white-space: pre;
+}
+.diff-text .diff-add { color: #8fd6a4; background: rgba(76, 195, 138, 0.08); }
+.diff-text .diff-del { color: #f2707a; background: rgba(242, 112, 122, 0.08); }
+.diff-text .diff-hunk { color: var(--accent); }
+.diff-text .diff-ctx { color: var(--muted); }
+
+/* --- 交互终端 --- */
+.shell-note {
+	padding: 6px 12px;
+	color: var(--faint);
+	font-size: 11px;
+	border-bottom: 1px solid var(--border);
+}
+.shell-output {
+	flex: 1;
+	overflow-y: auto;
+	padding: 10px 12px;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.6;
+	white-space: pre-wrap;
+	word-break: break-all;
+	color: var(--code-text);
+	background: var(--code-bg);
+	min-height: 120px;
+}
+.shell-input-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	border-top: 1px solid var(--border);
+}
+.shell-prompt {
+	color: var(--accent);
+	font-family: var(--mono);
+}
+.shell-input-row input {
+	flex: 1;
+	background: transparent;
+	border: none;
+	outline: none;
+	color: var(--text);
+	font-family: var(--mono);
+	font-size: 12.5px;
+}
+
+/* --- 后台任务（顶栏弹层） --- */
+.topbar-tasks-menu {
+	position: relative;
+}
+.tasks-popover {
+	position: absolute;
+	top: calc(100% + 8px);
+	right: 0;
+	width: 340px;
+	max-height: 380px;
+	overflow-y: auto;
+	background: var(--panel);
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+	padding: 6px;
+	z-index: 60;
+}
+.tasks-head {
+	padding: 8px 10px;
+	color: var(--muted);
+	font-size: 12px;
+	border-bottom: 1px solid var(--border);
+	margin-bottom: 4px;
+}
+.task-row {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 8px 10px;
+	border-radius: 8px;
+}
+.task-row:hover {
+	background: var(--panel-2);
+}
+.task-info {
+	flex: 1;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.task-info strong {
+	font-size: 12.5px;
+}
+.task-info small {
+	color: var(--faint);
+	font-size: 11px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+/* --- 文件预览增强：行号 / 选区引用 / 十六进制 --- */
+.preview-lines {
+	display: flex;
+	font-family: var(--mono);
+	font-size: 12px;
+	line-height: 1.6;
+	max-height: 100%;
+	overflow: auto;
+}
+.preview-lines-gutter {
+	flex-shrink: 0;
+	padding: 10px 8px 10px 12px;
+	color: var(--faint);
+	text-align: right;
+	user-select: none;
+	background: var(--panel);
+	border-right: 1px solid var(--border);
+	display: flex;
+	flex-direction: column;
+}
+.preview-line-number {
+	white-space: pre;
+}
+.preview-lines-content {
+	flex: 1;
+	padding: 10px 14px;
+	white-space: pre;
+	outline: none;
+}
+.preview-line {
+	min-height: 1.6em;
+}
+.preview-quote-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 8px 14px;
+	border-top: 1px solid var(--border);
+	color: var(--faint);
+	font-size: 11.5px;
+}
+.hex-view {
+	font-size: 11px;
+	line-height: 1.5;
+	max-height: 100%;
+}
+
+/* --- 视觉桥设置 --- */
+.vision-bridge-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
