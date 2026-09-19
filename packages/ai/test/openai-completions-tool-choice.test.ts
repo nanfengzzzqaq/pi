@@ -321,8 +321,10 @@ describe("openai-completions tool_choice", () => {
 
 	it("stores z.ai effort metadata", () => {
 		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			for (const modelId of ["glm-5.2", "glm-5.2-highspeed"] as const) {
-				const model = getModel(provider, modelId)!;
+			// GLM-5.2 remains on the global plan; the China plan now lists GLM-5.3.
+			const legacyModels =
+				provider === "zai" ? [getModel("zai", "glm-5.2"), getModel("zai", "glm-5.2-highspeed")] : [];
+			for (const model of legacyModels) {
 				expect(model.compat?.supportsReasoningEffort).toBe(true);
 				expect(model.thinkingLevelMap).toEqual({
 					off: "none",
