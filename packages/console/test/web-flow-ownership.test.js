@@ -90,12 +90,12 @@ describe("Console asynchronous flow ownership", () => {
     const field=value=>({value});
     const app=createContext({customModelRevision:0,customModelProviderIdEl:field(""),customModelNameEl:field("Local"),customModelBaseUrlEl:field("http://localhost/v1"),
       customModelApiKeyEl:field("stale-key"),customModelNoAuthEl:{checked:true},customModelIdEl:field("local"),customModelContextEl:field("10000"),customModelMaxTokensEl:field("1000"),
-      customModelReasoningEl:{checked:false},customModelVisionEl:{checked:false},customModelSaveBtnEl:{addEventListener:(_event,fn)=>{save=fn;}},
+      customModelReasoningEl:{checked:false},customModelVisionEl:{checked:false},customModelAutoSyncEl:{checked:true},customModelSaveBtnEl:{addEventListener:(_event,fn)=>{save=fn;}},
       api:(_path,options)=>{body=JSON.parse(options.body);return new Promise(resolve=>{finish=resolve;});},resetCustomModelForm:vi.fn(),loadCustomModelsSection:vi.fn(),loadKeysSection:vi.fn(),loadModels:vi.fn(),showInfo:vi.fn(),showError:vi.fn()});
     runInContext(listener("customModelSaveBtnEl"),app);
     const saving=save(); app.customModelRevision++; app.customModelNameEl.value="Next unsaved model";
     finish({runtimePending:true}); await saving;
-    expect(body.authMode).toBe("none"); expect(body.apiKey).toBe("");
+    expect(body.authMode).toBe("none"); expect(body.apiKey).toBe(""); expect(body.syncMode).toBe("auto");
     expect(app.resetCustomModelForm).not.toHaveBeenCalled(); expect(app.showInfo).toHaveBeenCalledWith("自定义模型已保存，重新启动 Pi 后生效");
   });
   it("copies exactly the previewed workspace paths and revision", async () => {
