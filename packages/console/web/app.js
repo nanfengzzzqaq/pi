@@ -72,6 +72,9 @@ const customModelContextEl = $("custom-model-context");
 const customModelMaxTokensEl = $("custom-model-max-tokens");
 const customModelReasoningEl = $("custom-model-reasoning");
 const customModelVisionEl = $("custom-model-vision");
+const customModelAutoSyncEl = $("custom-model-auto-sync");
+const customModelCapabilityStateEl = $("custom-model-capability-state");
+let customModelDetails = new Map();
 const customModelSaveBtnEl = $("custom-model-save-btn");
 const customModelCancelBtnEl = $("custom-model-cancel-btn");
 const customModelListEl = $("custom-model-list");
@@ -6070,7 +6073,7 @@ modelsRefreshBtnEl.addEventListener("click", async () => {
 	try {
 		const summary = await api("/api/models/refresh", { method: "POST" });
 		const parts = [`已更新 ${summary.refreshed.length} 个服务`];
-		if (summary.skipped.length) parts.push(`跳过 ${summary.skipped.length} 个未配置 Key 的服务`);
+		if (summary.skipped.length) parts.push(`跳过 ${summary.skipped.length} 个无需同步或未配置 Key 的服务`);
 		if (summary.aborted) parts.push("部分检查未完成");
 		if (summary.errors.length) parts.push(`${summary.errors.length} 个失败`);
 		parts.push(`当前共 ${summary.modelCount} 个模型`);
@@ -6078,7 +6081,7 @@ modelsRefreshBtnEl.addEventListener("click", async () => {
 		modelsRefreshStatusEl.title = summary.errors.length
 			? summary.errors.map((error) => `${error.provider}: ${error.message}`).join("\n")
 			: "";
-		await loadModels();
+		await Promise.all([loadModels(), loadCustomModelsSection()]);
 	} catch (error) {
 		modelsRefreshStatusEl.textContent = `更新失败：${error.message}；已有模型列表保留`;
 	} finally {
@@ -6875,6 +6878,9 @@ keyAddBtnEl.addEventListener("click", async () => {
 });
 
 function resetCustomModelForm() {
+	customModelDetails.clear();
+	customModelAutoSyncEl.checked = true;
+	customModelCapabilityStateEl.textContent = "尚未读取配置；下方数值作为服务器未公布时的备用值。";
 	customModelRevision++;
 	customModelDiscovery++;
 	customModelProviderIdEl.value = "";
@@ -6896,6 +6902,8 @@ function resetCustomModelForm() {
 }
 
 function editCustomModel(entry) {
+	customModelDetails = new Map([[entry.modelId, entry.serverConfig ?? {}]]);
+	customModelAutoSyncEl.checked = entry.syncMode !== "manual";
 	customModelRevision++;
 	customModelDiscovery++;
 	customModelOptionsEl.replaceChildren();
@@ -6912,6 +6920,7 @@ function editCustomModel(entry) {
 	customModelMaxTokensEl.value = String(entry.maxTokens);
 	customModelReasoningEl.checked = entry.reasoning === true;
 	customModelVisionEl.checked = entry.vision;
+	applyDiscoveredModelCapabilities();
 	customModelSaveBtnEl.textContent = "保存修改";
 	customModelCancelBtnEl.hidden = false;
 	customModelNameEl.focus();
@@ -6933,6 +6942,8 @@ function renderCustomModelList(entries) {
 		const detail = document.createElement("span");
 		detail.className = "key-masked";
 		detail.textContent = `${Number(entry.contextWindow).toLocaleString()} 上下文${entry.vision ? " · 视觉" : " · 文本"}${entry.reasoning ? " · 推理等级" : ""}${entry.authMode === "none" ? " · 无需鉴权" : entry.hasKey ? "" : " · 缺少 Key"}`;
+		detail.textContent += entry.syncMode === "manual" ? " · 手动配置" : entry.syncError ? " · 同步失败，保留上次配置" : entry.serverConfig?.contextWindow ? " · 上下文来自服务器" : " · 自动同步，未公布项使用备用值";
+		detail.title = entry.syncError ?? (entry.syncedAt ? `最近同步：${new Date(entry.syncedAt).toLocaleString()}` : "尚未同步服务器配置");
 		const edit = document.createElement("button");
 		edit.className = "secondary-btn small";
 		edit.type = "button";
@@ -6972,6 +6983,27 @@ async function loadCustomModelsSection() {
 	}
 }
 
+function applyDiscoveredModelCapabilities() {
+	if (!customModelAutoSyncEl.checked) {
+		customModelCapabilityStateEl.textContent = "手动配置：更新模型时保留下方设置。";
+		return;
+	}
+	const model = customModelDetails.get(customModelIdEl.value.trim()) ?? {};
+	const fields = [
+		["contextWindow", "上下文", customModelContextEl], ["maxTokens", "最大输出", customModelMaxTokensEl],
+		["reasoning", "推理等级", customModelReasoningEl], ["vision", "图片", customModelVisionEl],
+	];
+	const known = [], unknown = [];
+	for (const [key, label, element] of fields) {
+		if (model[key] === undefined) { unknown.push(label); continue; }
+		known.push(label);
+		if (typeof model[key] === "boolean") element.checked = model[key];
+		else element.value = String(model[key]);
+	}
+	customModelMaxTokensEl.value = String(Math.min(Number(customModelMaxTokensEl.value), Number(customModelContextEl.value)));
+	customModelCapabilityStateEl.textContent = `${known.length ? `来自服务器：${known.join("、")}。` : "服务器尚未公布这些配置。"}${unknown.length ? `未公布：${unknown.join("、")}，使用下方备用值。` : ""}`;
+}
+
 customModelDiscoverBtnEl.addEventListener("click", async () => {
 	const baseUrl = customModelBaseUrlEl.value.trim();
 	if (!baseUrl) {
@@ -6995,6 +7027,7 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 			}),
 		});
 		if (revision !== customModelRevision || request !== customModelDiscovery) return;
+		customModelDetails = new Map((result.details ?? []).map((model) => [model.id, model]));
 		customModelOptionsEl.innerHTML = "";
 		for (const modelId of result.models) {
 			const option = document.createElement("option");
@@ -7002,6 +7035,7 @@ customModelDiscoverBtnEl.addEventListener("click", async () => {
 			customModelOptionsEl.appendChild(option);
 		}
 		if (result.models.length === 1) customModelIdEl.value = result.models[0];
+		applyDiscoveredModelCapabilities();
 		customModelConnectionStateEl.textContent = `连接正常 · 发现 ${result.models.length} 个模型`;
 		customModelConnectionStateEl.dataset.state = "ok";
 		showInfo(`已读取 ${result.models.length} 个模型${result.models.length ? "，可在模型 ID 中选择" : ""}`);
@@ -7034,11 +7068,13 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 				maxTokens: customModelMaxTokensEl.value,
 				reasoning: customModelReasoningEl.checked,
 				vision: customModelVisionEl.checked,
+				syncMode: customModelAutoSyncEl.checked ? "auto" : "manual",
 			}),
 		});
 		if (revision === customModelRevision) resetCustomModelForm();
 		await Promise.all([loadCustomModelsSection(), loadKeysSection(), loadModels()]);
 		showInfo(result.runtimePending ? "自定义模型已保存，重新启动 Pi 后生效" : editing ? "自定义模型已更新" : "自定义模型已添加，可在聊天区模型列表中选择");
+		if (result.syncError) showError(`配置已保存，服务器同步未完成：${result.syncError}。暂用已保存的配置。`);
 	} catch (error) {
 		showError(`保存失败：${error.message}`);
 	} finally {
@@ -7047,15 +7083,18 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 });
 
 customModelCancelBtnEl.addEventListener("click", resetCustomModelForm);
-for (const element of [customModelNameEl, customModelBaseUrlEl, customModelApiKeyEl, customModelNoAuthEl, customModelIdEl, customModelContextEl, customModelMaxTokensEl, customModelReasoningEl, customModelVisionEl]) {
+for (const element of [customModelNameEl, customModelBaseUrlEl, customModelApiKeyEl, customModelNoAuthEl, customModelIdEl, customModelContextEl, customModelMaxTokensEl, customModelReasoningEl, customModelVisionEl, customModelAutoSyncEl]) {
 	element.addEventListener("input", () => {
 		customModelRevision++;
 		customModelApiKeyEl.disabled = customModelNoAuthEl.checked;
 		if (element === customModelBaseUrlEl || element === customModelApiKeyEl || element === customModelNoAuthEl) {
+			customModelDetails.clear();
+			applyDiscoveredModelCapabilities();
 			customModelOptionsEl.replaceChildren();
 			customModelConnectionStateEl.textContent = "连接信息已更改，请重新测试";
 			customModelConnectionStateEl.dataset.state = "idle";
 		}
+		if (element === customModelIdEl || element === customModelAutoSyncEl) applyDiscoveredModelCapabilities();
 	});
 }
 

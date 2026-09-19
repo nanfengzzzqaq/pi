@@ -18,7 +18,7 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
-async function fixture() {
+async function fixture(options: Parameters<typeof createCustomModelManager>[3] = {}) {
 	const directory = mkdtempSync(join(tmpdir(), "pi-model-transaction-"));
 	directories.push(directory);
 	const file = join(directory, "custom-models.json"),
@@ -29,7 +29,7 @@ async function fixture() {
 		modelsPath: null,
 		refreshOnCreate: false,
 	});
-	const manager = createCustomModelManager(file, credentials, runtime);
+	const manager = createCustomModelManager(file, credentials, runtime, options);
 	const definition = customModels.normalizeCustomModel("pi-console-custom-fixture", {
 		name: "Fixture",
 		baseUrl: "http://127.0.0.1:12345/v1",
@@ -38,6 +38,54 @@ async function fixture() {
 	return { directory, file, authFile, credentials, runtime, manager, definition };
 }
 describe("custom model transactions", () => {
+	it("refreshes legacy auto configs and runtime while preserving credentials, caches checks, and force refreshes", async () => {
+		let time = 100000;
+		let context = 262144;
+		const fetcher = vi.fn<typeof fetch>(async () =>
+			Response.json({ data: [{ id: "fixture", max_model_len: context }] }),
+		);
+		const { manager, definition, file, authFile, runtime } = await fixture({ fetch: fetcher, now: () => time });
+		await manager.save({ ...definition, reasoning: true }, "fixture-key");
+		const authBefore = readFileSync(authFile, "utf8");
+		expect((await manager.refresh(definition.providerId)).refreshed).toBe(true);
+		expect(customModels.loadCustomModels(file)[0]).toMatchObject({
+			contextWindow: 262144,
+			maxTokens: 16384,
+			reasoning: true,
+		});
+		expect(runtime.getModel(definition.providerId, "fixture")?.contextWindow).toBe(262144);
+		expect(readFileSync(authFile, "utf8")).toBe(authBefore);
+		await manager.refresh(definition.providerId);
+		expect(fetcher).toHaveBeenCalledTimes(1);
+		context = 32768;
+		await manager.refresh(definition.providerId, true);
+		expect(runtime.getModel(definition.providerId, "fixture")?.contextWindow).toBe(32768);
+		time += 60001;
+		await manager.refresh(definition.providerId);
+		expect(fetcher).toHaveBeenCalledTimes(3);
+	});
+	it("retains last known configuration on network and missing-model failures; manual entries do not fetch", async () => {
+		const fetcher = vi.fn<typeof fetch>(async () => {
+			throw new Error("offline");
+		});
+		const { manager, definition, file } = await fixture({ fetch: fetcher });
+		await manager.save(definition, "fixture");
+		expect(await manager.refresh(definition.providerId)).toMatchObject({ refreshed: false, error: "offline" });
+		expect(customModels.loadCustomModels(file)).toEqual([definition]);
+		fetcher.mockImplementation(async () => Response.json({ data: [{ id: "different" }] }));
+		expect((await manager.refresh(definition.providerId, true)).error).toContain("不再提供");
+		await manager.save({ ...definition, syncMode: "manual" });
+		await manager.refresh(definition.providerId, true);
+		expect(fetcher).toHaveBeenCalledTimes(2);
+	});
+	it("requires a new credential when the endpoint changes", async () => {
+		const { manager, definition, credentials } = await fixture();
+		await manager.save(definition, "old-service-key");
+		await expect(manager.save({ ...definition, baseUrl: "https://different.example/v1" })).rejects.toThrow(
+			"API 地址已更改",
+		);
+		expect(await credentials.apiKeys()).toEqual({ [definition.providerId]: "old-service-key" });
+	});
 	it("serializes model/key edits and deletion without losing another provider", async () => {
 		const { manager, definition, file, credentials } = await fixture();
 		const other = { ...definition, providerId: "pi-console-custom-other" };
@@ -135,6 +183,46 @@ describe("custom model transactions", () => {
 			);
 			expect(result.stopReason).toBe("stop");
 			expect(authorization).toBeUndefined();
+		} finally {
+			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+		}
+	}, 15000);
+	it("sends normal Qwen xhigh thinking with the configured output allowance and no fixed thinking budget", async () => {
+		const { manager, definition, runtime } = await fixture();
+		let payload: Record<string, unknown> = {};
+		const server = createServer(async (req, res) => {
+			const chunks: Buffer[] = [];
+			for await (const chunk of req) chunks.push(Buffer.from(chunk));
+			payload = JSON.parse(Buffer.concat(chunks).toString());
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.end(
+				'data: {"id":"fixture","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+			);
+		});
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Missing test port");
+			await manager.save({
+				...definition,
+				modelId: "qwen-fixture",
+				baseUrl: `http://127.0.0.1:${address.port}/v1`,
+				reasoning: true,
+				authMode: "none",
+				maxTokens: 32768,
+			});
+			const model = runtime.getModels(definition.providerId)[0];
+			const result = await runtime.completeSimple(
+				model,
+				{ messages: [{ role: "user", content: "fixture", timestamp: 0 }] },
+				{ reasoning: "xhigh" },
+			);
+			expect(result.stopReason).toBe("stop");
+			expect(payload).toMatchObject({
+				max_tokens: 32768,
+				chat_template_kwargs: { enable_thinking: true, preserve_thinking: true },
+			});
+			expect(payload).not.toHaveProperty("thinking_token_budget");
 		} finally {
 			await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 		}

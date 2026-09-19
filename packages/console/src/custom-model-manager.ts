@@ -4,7 +4,9 @@ import type { Credential } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { createConsoleCredentials } from "./credentials.ts";
 import {
+	applyServerCapabilities,
 	type CustomModelDefinition,
+	discoverOpenAIModelDetails,
 	loadCustomModels,
 	normalizeCustomModel,
 	toProviderConfig,
@@ -46,9 +48,12 @@ export function createCustomModelManager(
 	file: string,
 	credentials: ReturnType<typeof createConsoleCredentials>,
 	runtime: ModelRuntime,
+	options: { fetch?: typeof fetch; now?: () => number; timeoutMs?: number } = {},
 ) {
 	const pendingFile = `${file}.pending.json`;
 	const queues = new Map<string, Promise<unknown>>();
+	const syncStatus = new Map<string, { checkedAt: number; error?: string }>();
+	const now = options.now ?? Date.now;
 	const finish = (change: PendingChange) => {
 		writeCustomModels(file, change.models);
 		try {
@@ -68,6 +73,62 @@ export function createCustomModelManager(
 		return work;
 	};
 	return {
+		status(providerId: string) {
+			return syncStatus.get(providerId);
+		},
+		refresh(providerId: string, force = false) {
+			return enqueue(providerId, async () => {
+				const previous = loadCustomModels(file).find((entry) => entry.providerId === providerId);
+				if (!previous || previous.syncMode === "manual") return { refreshed: false, definition: previous };
+				const status = syncStatus.get(providerId);
+				if (!force && status && now() - status.checkedAt < 60_000)
+					return { refreshed: false, definition: previous, error: status.error };
+				let persisted = previous;
+				try {
+					const key = previous.authMode === "none" ? undefined : (await credentials.apiKeys())[providerId];
+					if (!key && previous.authMode !== "none") throw new Error("尚未配置 API Key");
+					const models = await discoverOpenAIModelDetails(previous.baseUrl, key, {
+						fetch: options.fetch,
+						timeoutMs: options.timeoutMs ?? 5000,
+					});
+					const model = models.find((entry) => entry.id === previous.modelId);
+					if (!model) throw new Error("服务器已不再提供此模型，请重新选择模型 ID");
+					const definition = applyServerCapabilities(previous, model);
+					await credentials.commit((records) => {
+						const models = loadCustomModels(file);
+						const current = models.find((entry) => entry.providerId === providerId);
+						const stored = records[providerId];
+						if (
+							JSON.stringify(current) !== JSON.stringify(previous) ||
+							(previous.authMode !== "none" && (stored?.type !== "api_key" || stored.key !== key))
+						)
+							throw new Error("模型连接已更改，请重新刷新");
+						return {
+							result: undefined,
+							next: records,
+							commit: () =>
+								writeCustomModels(
+									file,
+									models.map((entry) => (entry.providerId === providerId ? definition : entry)),
+								),
+						};
+					});
+					persisted = definition;
+					registerCustomModel(runtime, definition);
+					syncStatus.set(providerId, { checkedAt: now() });
+					return { refreshed: true, definition };
+				} catch (error) {
+					const message =
+						persisted !== previous
+							? "服务器配置已保存，运行配置启用失败，请重启 Pi"
+							: error instanceof Error
+								? error.message
+								: "模型配置同步失败";
+					syncStatus.set(providerId, { checkedAt: now(), error: message });
+					return { refreshed: false, definition: persisted, error: message };
+				}
+			});
+		},
 		async recover(): Promise<void> {
 			if (!existsSync(pendingFile)) return;
 			await credentials.commit((records) => {
@@ -102,6 +163,14 @@ export function createCustomModelManager(
 				const normalized = normalizeCustomModel(definition.providerId, definition);
 				await credentials.commit((records) => {
 					const previous = records[definition.providerId];
+					const oldDefinition = loadCustomModels(file).find((entry) => entry.providerId === definition.providerId);
+					if (
+						oldDefinition &&
+						oldDefinition.baseUrl !== normalized.baseUrl &&
+						!apiKey?.trim() &&
+						normalized.authMode !== "none"
+					)
+						throw new Error("API 地址已更改，请为新服务填写 API Key，或选择无需鉴权");
 					const key =
 						normalized.authMode === "none"
 							? "unused"
@@ -119,6 +188,7 @@ export function createCustomModelManager(
 						commit: () => finish(change),
 					};
 				});
+				syncStatus.delete(definition.providerId);
 				let runtimePending = false;
 				try {
 					registerCustomModel(runtime, normalized);
@@ -132,6 +202,7 @@ export function createCustomModelManager(
 		},
 		remove(providerId: string) {
 			return enqueue(providerId, async () => {
+				syncStatus.delete(providerId);
 				const removed = await credentials.commit((records) => {
 					const models = loadCustomModels(file);
 					const nextModels = models.filter((entry) => entry.providerId !== providerId);

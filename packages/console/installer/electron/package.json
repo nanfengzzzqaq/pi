@@ -1,6 +1,6 @@
 {
 	"name": "pi-console-electron",
-	"version": "0.4.2",
+	"version": "0.4.3",
 	"private": true,
 	"description": "Pi 控制台 Electron 壳（主进程）",
 	"main": "main.js",

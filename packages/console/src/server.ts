@@ -453,6 +453,7 @@ try {
 	for (const definition of customModels.loadCustomModels(CUSTOM_MODELS_FILE)) {
 		try {
 			registerCustomModel(modelRuntime, definition);
+			await customModelManager.refresh(definition.providerId);
 		} catch {
 			console.warn(`自定义模型 ${definition.providerId} 暂时不可用，请重新保存配置`);
 		}
@@ -834,6 +835,13 @@ async function buildSession(
 	const { session, modelFallbackMessage } = await createAgentSession(options);
 	refreshAntigravityModels.initialize();
 	sessionRef = session;
+	if (session.model && customModels.isCustomProviderId(session.model.provider)) {
+		await customModelManager.refresh(session.model.provider);
+		const configured = modelRuntime.getModel(session.model.provider, session.model.id);
+		if (configured) session.agent.state.model = configured;
+		session.setThinkingLevel(session.thinkingLevel);
+	}
+	resourceLoader.setModelContext(session.model);
 
 	// 新会话只带原生工具；声明了通用激活规则的能力包等到本轮确实命中才注入。
 	session.setActiveToolsByName(effectiveToolNames(enabledPacks, activePackTools));
@@ -1494,10 +1502,31 @@ async function savedApiKey(provider: string): Promise<string | undefined> {
 	return (await credentials.apiKeys())[provider];
 }
 
+function syncIdleSessionModel(cs: ConsoleSession): void {
+	if (cs.deleting || cs.activePrompt || cs.modelChange || cs.session.isStreaming || cs.session.isCompacting) return;
+	const current = cs.session.model;
+	if (!current) return;
+	const configured = modelRuntime.getModel(current.provider, current.id);
+	if (!configured || configured === current) return;
+	cs.session.agent.state.model = configured;
+	cs.session.setThinkingLevel(cs.session.thinkingLevel);
+	cs.resourceLoader.setModelContext(configured);
+	cs.session.setActiveToolsByName(cs.session.getActiveToolNames());
+	bufferAndBroadcast(cs, {
+		type: "model_changed",
+		provider: configured.provider,
+		modelId: configured.id,
+		thinkingLevel: cs.session.thinkingLevel,
+		availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+		enabledCapabilities: packSummaries(cs.enabledPacks),
+	});
+}
+
 async function listCustomModels() {
 	const keys = await credentials.apiKeys();
 	return customModels.loadCustomModels(CUSTOM_MODELS_FILE).map((definition) => ({
 		...definition,
+		syncError: customModelManager.status(definition.providerId)?.error,
 		hasKey: definition.authMode !== "none" && Object.hasOwn(keys, definition.providerId),
 	}));
 }
@@ -2212,10 +2241,26 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 
-	// 手动更新模型目录：强制刷新各内置服务的远端目录；凭据与自定义模型保持不变。
+	// 更新目录和服务器公布的自定义模型能力；保留凭据及未公布字段。
 	if (pathname === "/api/models/refresh" && req.method === "POST") {
 		try {
-			sendJson(res, 200, await refreshModelCatalogs(modelRuntime));
+			const summary = await refreshModelCatalogs(modelRuntime);
+			const definitions = customModels.loadCustomModels(CUSTOM_MODELS_FILE);
+			const results = await Promise.all(
+				definitions.map(async (definition) => ({
+					provider: definition.providerId,
+					...(await customModelManager.refresh(definition.providerId, true)),
+				})),
+			);
+			for (const result of results) {
+				if (result.error) summary.errors.push({ provider: result.provider, message: result.error });
+				else if (result.refreshed) summary.refreshed.push(result.provider);
+				else summary.skipped.push(result.provider);
+			}
+			for (const cs of sessions.values()) syncIdleSessionModel(cs);
+			summary.ok = !summary.aborted && summary.errors.length === 0;
+			summary.modelCount = modelRuntime.getModels().length;
+			sendJson(res, 200, summary);
 		} catch (error) {
 			sendJson(res, 500, { error: error instanceof Error ? error.message : "模型目录更新未完成，请重试" });
 		}
@@ -2228,16 +2273,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		return;
 	}
 	if (pathname === "/api/custom-models/discover" && req.method === "POST") {
-		const body = (await readBodyJson(req)) as { baseUrl?: unknown; apiKey?: unknown; providerId?: unknown };
+		const body = (await readBodyJson(req)) as {
+			baseUrl?: unknown;
+			apiKey?: unknown;
+			providerId?: unknown;
+			authMode?: unknown;
+		};
 		const providerId = typeof body.providerId === "string" ? body.providerId : "";
-		const apiKey =
-			typeof body.apiKey === "string" && body.apiKey.trim()
-				? body.apiKey.trim()
-				: providerId
-					? await savedApiKey(providerId)
-					: undefined;
 		try {
-			sendJson(res, 200, { models: await customModels.discoverOpenAIModels(body.baseUrl, apiKey) });
+			const baseUrl = customModels.normalizeBaseUrl(body.baseUrl);
+			const previous = customModels
+				.loadCustomModels(CUSTOM_MODELS_FILE)
+				.find((entry) => entry.providerId === providerId);
+			const apiKey =
+				body.authMode === "none"
+					? undefined
+					: typeof body.apiKey === "string" && body.apiKey.trim()
+						? body.apiKey.trim()
+						: previous?.baseUrl === baseUrl
+							? await savedApiKey(providerId)
+							: undefined;
+			if (body.authMode !== "none" && !apiKey) throw new Error("请填写此服务的 API Key，或选择无需鉴权");
+			const details = await customModels.discoverOpenAIModelDetails(baseUrl, apiKey);
+			sendJson(res, 200, { models: details.map((model) => model.id), details });
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -2256,9 +2314,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 		}
 		const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
 		try {
-			const definition = customModels.normalizeCustomModel(providerId, body);
+			const definition = customModels.normalizeCustomModel(providerId, {
+				...body,
+				serverConfig: undefined,
+				syncedAt: undefined,
+			});
 			const result = await customModelManager.save(definition, apiKey || undefined);
-			sendJson(res, 200, { ok: true, ...result.definition, runtimePending: result.runtimePending });
+			const sync = await customModelManager.refresh(providerId, true);
+			for (const cs of sessions.values()) syncIdleSessionModel(cs);
+			sendJson(res, 200, {
+				ok: true,
+				...(sync.definition ?? result.definition),
+				runtimePending: result.runtimePending,
+				syncError: sync.error,
+			});
 		} catch (error) {
 			sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
 		}
@@ -2943,15 +3012,29 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 409, { error: "当前正在运行或切换模型，请先停止或等待完成" });
 				return;
 			}
-			const currentModel = cs.session.model;
+			let currentModel = cs.session.model;
 			if (currentModel && customModels.isCustomProviderId(currentModel.provider)) {
+				const change = customModelManager.refresh(currentModel.provider).then(() => undefined);
+				cs.modelChange = change;
+				try {
+					await change;
+				} finally {
+					if (cs.modelChange === change) cs.modelChange = null;
+				}
+				if (cs.deleting) {
+					sendJson(res, 409, { error: "此会话正在删除" });
+					return;
+				}
 				const configured = modelRuntime.getModel(currentModel.provider, currentModel.id);
 				if (!configured) {
 					sendJson(res, 409, { error: "此自定义模型已删除或修改，请重新选择模型后再发送" });
 					return;
 				}
 				cs.session.agent.state.model = configured;
+				cs.session.setThinkingLevel(cs.session.thinkingLevel);
+				currentModel = configured;
 			}
+			cs.resourceLoader.setModelContext(currentModel);
 			const images = parseImages(body.images);
 			if (Array.isArray(body.images) && !images) {
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
@@ -3261,6 +3344,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 
 		// GET /api/sessions/:id/context — 上下文使用统计（本地估算，零 token 消耗）
 		case "GET context": {
+			syncIdleSessionModel(cs);
 			const usage = cs.session.getContextUsage?.();
 			const model = cs.session.model;
 			const compaction = cs.session.settingsManager.getCompactionSettings();
@@ -3290,7 +3374,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				usage: usage ?? null,
 				cwd: cs.session.sessionManager.getCwd(),
 				model: model
-					? { provider: model.provider, modelId: model.id, name: model.name, contextWindow: model.contextWindow }
+					? {
+							provider: model.provider,
+							modelId: model.id,
+							name: model.name,
+							contextWindow: model.contextWindow,
+							maxTokens: model.maxTokens,
+						}
 					: null,
 				messageCount: cs.session.messages.length,
 				thinkingLevel: cs.session.thinkingLevel,
@@ -3433,7 +3523,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 404, { error: `模型不存在：${body.provider}/${body.modelId}` });
 				return;
 			}
-			const change = cs.session.setModel(model, { persist: true });
+			const change = (async () => {
+				if (customModels.isCustomProviderId(model.provider)) await customModelManager.refresh(model.provider);
+				const configured = modelRuntime.getModel(model.provider, model.id);
+				if (!configured) throw new Error("此模型已删除或修改，请重新选择");
+				await cs.session.setModel(configured, { persist: true });
+				cs.resourceLoader.setModelContext(configured);
+				cs.session.setActiveToolsByName(cs.session.getActiveToolNames());
+			})();
 			cs.modelChange = change;
 			try {
 				await change;

@@ -1,4 +1,10 @@
 import { readDurableJson, writeDurableJson } from "./durable-json.ts";
+import {
+	type DiscoveredModel,
+	type ModelCapabilities,
+	parseDiscoveredModels,
+	parseModelCapabilities,
+} from "./model-capabilities.ts";
 
 const FILE_VERSION = 2;
 const LEGACY_FILE_VERSION = 1;
@@ -16,6 +22,10 @@ export interface CustomModelDefinition {
 	vision: boolean;
 	reasoning: boolean;
 	authMode?: "api_key" | "none";
+	/** Missing in older files means automatic sync, with existing values as fallbacks. */
+	syncMode?: "manual";
+	serverConfig?: ModelCapabilities;
+	syncedAt?: number;
 }
 
 interface CustomModelsFile {
@@ -32,6 +42,9 @@ export interface CustomModelInput {
 	vision?: unknown;
 	reasoning?: unknown;
 	authMode?: unknown;
+	syncMode?: unknown;
+	serverConfig?: unknown;
+	syncedAt?: unknown;
 }
 
 function requiredText(value: unknown, label: string, maxLength: number): string {
@@ -81,6 +94,8 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 	if (!isCustomProviderId(providerId)) throw new Error("自定义模型服务标识无效");
 	if (input.authMode !== undefined && input.authMode !== "api_key" && input.authMode !== "none")
 		throw new Error("鉴权方式无效");
+	if (input.syncMode !== undefined && input.syncMode !== "auto" && input.syncMode !== "manual")
+		throw new Error("模型配置同步方式无效");
 	const contextWindow = positiveInteger(input.contextWindow, "上下文长度", DEFAULT_CONTEXT_WINDOW);
 	const maxTokens = positiveInteger(input.maxTokens, "最大输出长度", DEFAULT_MAX_TOKENS);
 	if (contextWindow > 4_000_000) throw new Error("上下文长度不能超过 4000000");
@@ -95,6 +110,11 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 		vision: input.vision === true,
 		reasoning: input.reasoning === true,
 		...(input.authMode === "none" ? { authMode: "none" as const } : {}),
+		...(input.syncMode === "manual" ? { syncMode: "manual" as const } : {}),
+		...(input.serverConfig ? { serverConfig: parseModelCapabilities(input.serverConfig) } : {}),
+		...(typeof input.syncedAt === "number" && Number.isSafeInteger(input.syncedAt) && input.syncedAt > 0
+			? { syncedAt: input.syncedAt }
+			: {}),
 	};
 }
 
@@ -171,14 +191,6 @@ function usesQwenChatTemplate(modelId: string): boolean {
 	return /(^|[/_.-])qwen(?=$|[/_.-]|\d)/iu.test(modelId);
 }
 
-/**
- * Reasoning on these models shares the single `max_tokens` output ceiling, so an
- * xhigh turn can spend the whole budget on reasoning and emit no answer. The cap
- * narrows only this custom model's thinking budget; the global per-level budgets
- * stay untouched, and the server only sees the standard budget field.
- */
-const QWEN_THINKING_TOKEN_BUDGET_CAP = 8192;
-
 export function toProviderConfig(definition: CustomModelDefinition) {
 	const input: ("text" | "image")[] = definition.vision ? ["text", "image"] : ["text"];
 	return {
@@ -212,8 +224,6 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 					...(definition.reasoning && usesQwenChatTemplate(definition.modelId)
 						? {
 								thinkingFormat: "qwen-chat-template" as const,
-								thinkingTokenBudgetField: "thinking_token_budget" as const,
-								thinkingTokenBudgetCap: QWEN_THINKING_TOKEN_BUDGET_CAP,
 							}
 						: {}),
 					supportsStrictMode: false,
@@ -225,16 +235,35 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 	};
 }
 
-export async function discoverOpenAIModels(
+export function applyServerCapabilities(
+	definition: CustomModelDefinition,
+	model: DiscoveredModel,
+): CustomModelDefinition {
+	if (definition.syncMode === "manual") return definition;
+	if (definition.modelId !== model.id) throw new Error("服务器模型与当前配置不匹配");
+	const serverConfig = parseModelCapabilities(model);
+	const contextWindow = serverConfig.contextWindow ?? definition.contextWindow;
+	return normalizeCustomModel(definition.providerId, {
+		...definition,
+		...serverConfig,
+		contextWindow,
+		maxTokens: Math.min(serverConfig.maxTokens ?? definition.maxTokens, contextWindow),
+		serverConfig,
+		syncedAt: Date.now(),
+	});
+}
+
+export async function discoverOpenAIModelDetails(
 	baseUrl: unknown,
 	apiKey: string | undefined,
 	options: { fetch?: typeof fetch; timeoutMs?: number } = {},
-): Promise<string[]> {
+): Promise<DiscoveredModel[]> {
 	const endpoint = `${normalizeBaseUrl(baseUrl)}/models`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 15_000);
 	try {
 		const response = await (options.fetch ?? globalThis.fetch)(endpoint, {
+			redirect: "error",
 			headers: {
 				Accept: "application/json",
 				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -242,20 +271,21 @@ export async function discoverOpenAIModels(
 			signal: controller.signal,
 		});
 		if (!response.ok) {
-			const detail = (await response.text()).replace(/\s+/gu, " ").trim().slice(0, 300);
-			throw new Error(`读取模型失败（HTTP ${response.status}）${detail ? `：${detail}` : ""}`);
+			throw new Error(`读取模型失败（HTTP ${response.status}）`);
 		}
-		const body = (await response.json()) as { data?: unknown };
-		if (!Array.isArray(body.data)) throw new Error("模型接口没有返回 OpenAI 格式的 data 数组");
-		const ids = body.data
-			.map((item) => (typeof item === "object" && item !== null ? (item as { id?: unknown }).id : undefined))
-			.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
-			.map((id) => id.trim());
-		return [...new Set(ids)].sort((left, right) => left.localeCompare(right));
+		return parseDiscoveredModels(await response.json());
 	} catch (error) {
 		if (controller.signal.aborted) throw new Error("读取模型超时，请检查 API 地址是否可访问");
 		throw error;
 	} finally {
 		clearTimeout(timeout);
 	}
+}
+
+export async function discoverOpenAIModels(
+	baseUrl: unknown,
+	apiKey: string | undefined,
+	options: { fetch?: typeof fetch; timeoutMs?: number } = {},
+): Promise<string[]> {
+	return (await discoverOpenAIModelDetails(baseUrl, apiKey, options)).map((model) => model.id);
 }

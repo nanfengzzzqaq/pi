@@ -8,6 +8,21 @@ import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
  */
 export class RoutedSkillResourceLoader extends DefaultResourceLoader {
 	private activeSkillNames = new Set<string>();
+	private modelContext = "";
+
+	setModelContext(
+		model:
+			| { id: string; contextWindow: number; maxTokens: number; reasoning: boolean; input: readonly string[] }
+			| undefined,
+	): void {
+		this.modelContext = model
+			? `当前会话的客户端有效配置（配置数据，不是指令）：${JSON.stringify({ modelId: model.id, contextWindow: model.contextWindow, maxOutputTokens: model.maxTokens, reasoning: model.reasoning, vision: model.input.includes("image") })}。长度单位为 token，上下文包含输入与输出。回答当前模型或上下文配置问题时使用这些数据；它们不证明模型的训练身份，也不代表本轮实际占用量。不要为查询这些配置读取凭据文件或环境变量。`
+			: "";
+	}
+
+	override getAppendSystemPrompt(): string[] {
+		return [...super.getAppendSystemPrompt(), ...(this.modelContext ? [this.modelContext] : [])];
+	}
 
 	setActiveSkillNames(names: Iterable<string>): void {
 		this.activeSkillNames = new Set(names);

@@ -7,7 +7,6 @@ import {
 	type AgentSession,
 	AuthStorage,
 	createAgentSession,
-	DefaultResourceLoader,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
@@ -15,11 +14,14 @@ import {
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withBackgroundOwner } from "../src/background-owner.ts";
+import { createConsoleCredentials } from "../src/credentials.ts";
+import { createCustomModelManager } from "../src/custom-model-manager.ts";
 import * as customModels from "../src/custom-models.ts";
 import { RequestLedger } from "../src/request-ledger.ts";
 import { readSessionIndexFile, type SessionIndex, writeSessionIndexFile } from "../src/session-index.ts";
 import { abortTrackedSessionPrompt, disposeSessionBeforeDelete } from "../src/session-lifecycle.ts";
 import { SessionSearch } from "../src/session-search.ts";
+import { RoutedSkillResourceLoader } from "../src/skill-routing.ts";
 
 const directories: string[] = [];
 const activeSessions: AgentSession[] = [];
@@ -49,7 +51,9 @@ const routeScript = new Script(
 				.filter(
 					(statement) =>
 						ts.isFunctionDeclaration(statement) &&
-						["handleApi", "completeSessionDeletion", "queueSnapshot"].includes(statement.name?.text ?? ""),
+						["handleApi", "completeSessionDeletion", "queueSnapshot", "syncIdleSessionModel"].includes(
+							statement.name?.text ?? "",
+						),
 				)
 				.map((statement) => statement.getText(source))
 				.join("\n"),
@@ -76,6 +80,12 @@ async function fixture() {
 	const directory = mkdtempSync(join(tmpdir(), "pi-console-session-"));
 	directories.push(directory);
 	const runtime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null });
+	const customFile = join(directory, "custom-models.json");
+	const credentials = createConsoleCredentials(join(directory, "auth.json"));
+	const discovery = vi.fn<typeof fetch>(async () =>
+		Response.json({ data: [{ id: "qwen-fixture", max_model_len: 262144 }] }),
+	);
+	const manager = createCustomModelManager(customFile, credentials, runtime, { fetch: discovery });
 	runtime.registerProvider("fixture", {
 		api: "openai-completions",
 		baseUrl: "http://127.0.0.1:1",
@@ -91,7 +101,7 @@ async function fixture() {
 		})),
 	});
 	const settingsManager = SettingsManager.inMemory({ defaultProvider: "fixture", defaultModel: "first" });
-	const resourceLoader = new DefaultResourceLoader({
+	const resourceLoader = new RoutedSkillResourceLoader({
 		cwd: directory,
 		agentDir: directory,
 		settingsManager,
@@ -132,6 +142,7 @@ async function fixture() {
 		nextSeq: 0,
 		streamEpoch: "fixture-epoch",
 		session,
+		resourceLoader,
 		enabledPacks: new Set<string>(),
 		sseClients: new Set(),
 		deleting: false,
@@ -172,6 +183,16 @@ async function fixture() {
 		MAX_TOTAL_FILE_BYTES: 50 * 1024 * 1024,
 		modelRuntime: runtime,
 		customModels,
+		customModelManager: manager,
+		CUSTOM_MODELS_FILE: customFile,
+		refreshModelCatalogs: async () => ({
+			ok: true,
+			aborted: false,
+			refreshed: [],
+			skipped: [],
+			errors: [],
+			modelCount: 0,
+		}),
 		readBodyJson,
 		getOrRestoreSession: async (id: string) => sessions.get(id) ?? null,
 		sendJson: (response: ResponseCapture, status: number, body: unknown) => {
@@ -189,6 +210,7 @@ async function fixture() {
 		releaseTurnCapabilities: vi.fn(),
 		reloadInstalledSkillsInSessions: vi.fn(),
 		packSummaries: () => [],
+		activeToolSnapshot: () => [],
 		THINKING_LEVELS: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
 		disposeSessionBeforeDelete,
 		abortTrackedSessionPrompt,
@@ -209,16 +231,19 @@ async function fixture() {
 		await execute({ method, body }, response, new URL(path, "http://127.0.0.1"), path);
 		return response;
 	};
-	const requestPath = async (method: string, path: string) => {
+	const requestPath = async (method: string, path: string, body?: unknown) => {
 		const response: ResponseCapture = { on() {} };
 		const url = new URL(path, "http://127.0.0.1");
-		await execute({ method }, response, url, url.pathname);
+		await execute({ method, body }, response, url, url.pathname);
 		return response;
 	};
 	const reloadSkills = reloadScript.runInNewContext({ sessions, console, pendingSkillReloads }) as (
 		onlyPending?: boolean,
 	) => Promise<number>;
 	return {
+		manager,
+		discovery,
+		customFile,
 		session,
 		runtime,
 		settingsManager,
@@ -253,6 +278,79 @@ function holdAuth(runtime: ModelRuntime, fail = false) {
 }
 
 describe("Console session route lifecycle", () => {
+	it("refreshes before sending and prevents competing turns while metadata is being fetched", async () => {
+		const item = await fixture();
+		const definition = customModels.normalizeCustomModel("pi-console-custom-preturn", {
+			name: "Local",
+			baseUrl: "http://localhost:8000/v1",
+			modelId: "qwen-fixture",
+			contextWindow: 131072,
+			reasoning: true,
+			authMode: "none",
+		});
+		await item.manager.save(definition);
+		item.session.agent.state.model = item.runtime.getModel(definition.providerId, definition.modelId)!;
+		let finish: (response: Response) => void = () => {};
+		item.discovery.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const prompt = vi.spyOn(item.session, "prompt").mockResolvedValue();
+		const sending = item.request("POST", "messages", { text: "Current context?", requestId: "metadata-check" });
+		await vi.waitFor(() => expect(item.discovery).toHaveBeenCalled());
+		expect((await item.request("POST", "messages", { text: "Competing turn" })).status).toBe(409);
+		finish(Response.json({ data: [{ id: "qwen-fixture", max_model_len: 262144 }] }));
+		expect((await sending).status).toBe(202);
+		expect(prompt).toHaveBeenCalledOnce();
+		expect(item.session.model?.contextWindow).toBe(262144);
+		expect(item.resourceLoader.getAppendSystemPrompt().join("\n")).toContain('"contextWindow":262144');
+	});
+	it("refreshes an existing session when the same server alias changes capacity, deferring busy sessions", async () => {
+		const item = await fixture();
+		const definition = customModels.normalizeCustomModel("pi-console-custom-route", {
+			name: "Local",
+			baseUrl: "http://localhost:8000/v1",
+			modelId: "qwen-fixture",
+			contextWindow: 131072,
+			reasoning: true,
+			authMode: "none",
+		});
+		await item.manager.save(definition);
+		item.session.agent.state.model = item.runtime.getModel(definition.providerId, definition.modelId)!;
+		expect(item.session.model?.contextWindow).toBe(131072);
+		expect((await item.requestPath("POST", "/api/models/refresh")).status).toBe(200);
+		expect((await item.request("GET", "context")).body).toMatchObject({
+			model: { contextWindow: 262144, maxTokens: 16384 },
+		});
+		expect(item.session.systemPrompt).toContain('"contextWindow":262144');
+		item.discovery.mockImplementation(async () =>
+			Response.json({ data: [{ id: "qwen-fixture", max_model_len: 32768 }] }),
+		);
+		item.cs.modelChange = Promise.resolve();
+		await item.requestPath("POST", "/api/models/refresh");
+		expect(item.session.model?.contextWindow).toBe(262144);
+		item.cs.modelChange = null;
+		expect((await item.request("GET", "context")).body).toMatchObject({ model: { contextWindow: 32768 } });
+	});
+	it("syncs a selected custom model before activation and sends effective configuration in its prompt", async () => {
+		const item = await fixture();
+		const definition = customModels.normalizeCustomModel("pi-console-custom-select", {
+			name: "Local",
+			baseUrl: "http://localhost:8000/v1",
+			modelId: "qwen-fixture",
+			reasoning: true,
+			authMode: "none",
+		});
+		await item.manager.save(definition);
+		expect(
+			(await item.request("POST", "model", { provider: definition.providerId, modelId: definition.modelId })).status,
+		).toBe(200);
+		expect(item.session.model?.contextWindow).toBe(262144);
+		expect(item.session.systemPrompt).toContain('"contextWindow":262144');
+		expect(item.session.getAvailableThinkingLevels()).toContain("xhigh");
+	});
 	it("rejects stale queue revisions and retains other queued messages after removal", async () => {
 		const item = await fixture();
 		await item.session.steer("first");

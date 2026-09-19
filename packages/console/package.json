@@ -1,6 +1,6 @@
 {
 	"name": "@pi/console",
-	"version": "0.4.2",
+	"version": "0.4.3",
 	"private": true,
 	"type": "module",
 	"description": "Pi 控制台：本地对话、模型服务与按需工具工作台",

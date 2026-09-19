@@ -88,8 +88,6 @@ describe("custom model configuration", () => {
 						supportsDeveloperRole: false,
 						supportsReasoningEffort: true,
 						thinkingFormat: "qwen-chat-template",
-						thinkingTokenBudgetField: "thinking_token_budget",
-						thinkingTokenBudgetCap: 8192,
 						supportsOpenAIGrammarTools: false,
 					},
 				},
@@ -97,7 +95,7 @@ describe("custom model configuration", () => {
 		});
 	});
 
-	it("enables the capped thinking_token_budget only for Qwen reasoning custom models", () => {
+	it("enables Qwen thinking without imposing a fixed thinking token budget", () => {
 		const reasoning = normalizeCustomModel(createCustomProviderId("qwen-budget"), {
 			name: "Qwen reasoning",
 			baseUrl: "http://127.0.0.1:8000/v1",
@@ -122,13 +120,11 @@ describe("custom model configuration", () => {
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: true,
 			thinkingFormat: "qwen-chat-template",
-			thinkingTokenBudgetField: "thinking_token_budget",
-			thinkingTokenBudgetCap: 8192,
 			supportsStrictMode: false,
 			supportsOpenAIGrammarTools: false,
 			maxTokensField: "max_tokens",
 		});
-		for (const definition of [nonReasoning, otherModel]) {
+		for (const definition of [reasoning, nonReasoning, otherModel]) {
 			const compat = toProviderConfig(definition).models[0]?.compat;
 			expect(compat).not.toHaveProperty("thinkingTokenBudgetField");
 			expect(compat).not.toHaveProperty("thinkingTokenBudgetCap");
@@ -152,8 +148,6 @@ describe("custom model configuration", () => {
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: true,
 			thinkingFormat: "qwen-chat-template",
-			thinkingTokenBudgetField: "thinking_token_budget",
-			thinkingTokenBudgetCap: 8192,
 		});
 		expect(runtime.getModel(providerId, "qwen")?.thinkingLevelMap?.xhigh).toBe("xhigh");
 	});

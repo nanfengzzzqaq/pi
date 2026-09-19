@@ -546,7 +546,7 @@
 				</div>
 				<div id="vision-bridge-status" class="workspace-current">读取中…</div>
 				<div class="settings-subheading">自定义 OpenAI 兼容模型</div>
-				<p class="modal-hint">适用于 vLLM、Ollama、LM Studio 和兼容代理。建议按“连接地址 → 读取模型 → 设置能力 → 保存”的顺序完成。</p>
+				<p class="modal-hint">适用于 vLLM、Ollama、LM Studio 和兼容代理。读取模型后自动填写服务器公布的配置；未公布的项目请按服务实际能力补充。</p>
 				<input type="hidden" id="custom-model-provider-id">
 				<div class="key-add-row model-form-row model-form-two">
 					<input type="text" id="custom-model-name" placeholder="服务名称，例如 本地 Qwen" autocomplete="off">
@@ -560,6 +560,8 @@
 				</div>
 				<div id="custom-model-connection-state" class="model-connection-state">尚未测试连接</div>
 				<label class="modal-hint"><input id="custom-model-no-auth" type="checkbox"> 此服务无需 API Key（例如本机模型服务）</label>
+				<label class="modal-hint"><input id="custom-model-auto-sync" type="checkbox" checked> 自动同步服务器公布的配置</label>
+				<p id="custom-model-capability-state" class="modal-hint">尚未读取配置；下方数值作为服务器未公布时的备用值。</p>
 				<div class="key-add-row model-capabilities-row">
 					<input type="number" id="custom-model-context" min="1" step="1" value="128000" placeholder="上下文长度">
 					<input type="number" id="custom-model-max-tokens" min="1" step="1" value="16384" placeholder="最大输出长度">
