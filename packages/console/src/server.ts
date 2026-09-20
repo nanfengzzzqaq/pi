@@ -90,6 +90,7 @@ import { DATA_DIR } from "./paths.ts";
 import * as redteam from "./redteam.ts";
 import { RequestLedger } from "./request-ledger.ts";
 import { readSessionIndexFile, type SessionIndexEntry, writeSessionIndexFile } from "./session-index.ts";
+import { readSessionLibrary, updateSessionLibrary } from "./session-library.ts";
 import {
 	abortTrackedSessionPrompt,
 	disposeSessionBeforeDelete,
@@ -99,6 +100,7 @@ import { appendAttachmentAnnotation, parseUserMessage } from "./session-messages
 import { SessionSearch } from "./session-search.ts";
 import { RoutedSkillResourceLoader, removeObsoleteTravelExpenseSkill } from "./skill-routing.ts";
 import * as storage from "./storage.ts";
+import { sessionThinkingOptions } from "./thinking-options.ts";
 import * as updates from "./updates.ts";
 import { modelSupportsImages, VisionBridge } from "./vision-bridge.ts";
 import {
@@ -1516,8 +1518,7 @@ function syncIdleSessionModel(cs: ConsoleSession): void {
 		type: "model_changed",
 		provider: configured.provider,
 		modelId: configured.id,
-		thinkingLevel: cs.session.thinkingLevel,
-		availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+		...sessionThinkingOptions(cs.session),
 		enabledCapabilities: packSummaries(cs.enabledPacks),
 	});
 }
@@ -1648,6 +1649,8 @@ const STATIC_FILES: Record<string, { file: string; contentType: string }> = {
 	"/app.js": { file: "app.js", contentType: "text/javascript; charset=utf-8" },
 	"/search.js": { file: "search.js", contentType: "text/javascript; charset=utf-8" },
 	"/search.css": { file: "search.css", contentType: "text/css; charset=utf-8" },
+	"/sessions.js": { file: "sessions.js", contentType: "text/javascript; charset=utf-8" },
+	"/workspace-ui.css": { file: "workspace-ui.css", contentType: "text/css; charset=utf-8" },
 	"/antigravity-login.js": { file: "antigravity-login.js", contentType: "text/javascript; charset=utf-8" },
 	"/style.css": { file: "style.css", contentType: "text/css; charset=utf-8" },
 	"/officecli.svg": { file: "officecli.svg", contentType: "image/svg+xml" },
@@ -1924,6 +1927,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 			previous: data.messages[position - 1]?.entryId,
 			next: data.messages[position + 1]?.entryId,
 		});
+		return;
+	}
+
+	if (pathname === "/api/session-library" && (req.method === "GET" || req.method === "POST")) {
+		try {
+			const path = join(DATA_DIR, "session-library.json");
+			const body = req.method === "POST" ? await readBodyJson(req) : undefined;
+			const result =
+				req.method === "GET" ? readSessionLibrary(path) : updateSessionLibrary(path, readSessionIndex(), body);
+			sendJson(res, 200, result);
+		} catch (error) {
+			sendJson(res, 400, { error: error instanceof Error ? error.message : "分类保存失败" });
+		}
 		return;
 	}
 
@@ -3033,8 +3049,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				cs.session.agent.state.model = configured;
 				cs.session.setThinkingLevel(cs.session.thinkingLevel);
 				currentModel = configured;
+				bufferAndBroadcast(cs, {
+					type: "model_changed",
+					provider: configured.provider,
+					modelId: configured.id,
+					...sessionThinkingOptions(cs.session),
+				});
 			}
 			cs.resourceLoader.setModelContext(currentModel);
+			sessionThinkingOptions(cs.session);
 			const images = parseImages(body.images);
 			if (Array.isArray(body.images) && !images) {
 				sendJson(res, 400, { error: "images 参数格式错误，应为 [{ data: base64, mimeType }]" });
@@ -3383,7 +3406,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 						}
 					: null,
 				messageCount: cs.session.messages.length,
-				thinkingLevel: cs.session.thinkingLevel,
+				...sessionThinkingOptions(cs.session),
 				compaction,
 				cacheRead,
 				cacheWrite,
@@ -3546,15 +3569,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				type: "model_changed",
 				provider: body.provider,
 				modelId: body.modelId,
-				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				...sessionThinkingOptions(cs.session),
 				enabledCapabilities: packSummaries(cs.enabledPacks),
 			});
 			sendJson(res, 200, {
 				ok: true,
 				provider: body.provider,
 				modelId: body.modelId,
-				thinkingLevel: cs.session.thinkingLevel,
-				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				...sessionThinkingOptions(cs.session),
 			});
 			return;
 		}
@@ -3570,13 +3592,20 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				sendJson(res, 409, { error: "当前会话正在处理任务，请等待完成后再调整思考等级" });
 				return;
 			}
-			cs.session.setThinkingLevel(body.level as (typeof THINKING_LEVELS)[number], { persist: true });
-			sendJson(res, 200, { level: cs.session.thinkingLevel });
+			syncIdleSessionModel(cs);
+			const level = body.level as (typeof THINKING_LEVELS)[number];
+			if (!sessionThinkingOptions(cs.session).availableThinkingLevels.includes(level)) {
+				sendJson(res, 400, { error: "当前模型不支持此推理档位，请重新选择" });
+				return;
+			}
+			cs.session.setThinkingLevel(level, { persist: true });
+			sendJson(res, 200, { level: cs.session.thinkingLevel, ...sessionThinkingOptions(cs.session) });
 			return;
 		}
 
 		// GET /api/sessions/:id/history — 消息快照
 		case "GET history": {
+			syncIdleSessionModel(cs);
 			const model = cs.session.model;
 			const rawMessages = cs.session.messages;
 			const requestedLimit = Number(url.searchParams.get("limit"));
@@ -3596,8 +3625,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL, pa
 				hasMore: start > 0,
 				messages,
 				model: model ? { provider: model.provider, modelId: model.id, label: model.name } : null,
-				thinkingLevel: cs.session.thinkingLevel,
-				availableThinkingLevels: cs.session.getAvailableThinkingLevels(),
+				...sessionThinkingOptions(cs.session),
 				enabledCapabilities: packSummaries(cs.enabledPacks),
 				// 当前事件缓冲的最新序号：前端恢复历史后从该序号续接 SSE，避免重放重复
 				lastSeq: cs.nextSeq - 1,

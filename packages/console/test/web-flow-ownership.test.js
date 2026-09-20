@@ -40,8 +40,9 @@ describe("Console asynchronous flow ownership", () => {
     const app=createContext({sessionId:"A",sessionNavigation:0,historyRequest:0,historyDisplayLimit:100,lastStreamEpoch:null,
       codeEditorPaneEl:{hidden:true},window:{confirm:()=>true},deletedSessions:new Set(),activeSubmissions:new Map(),recoverableSubmissions:new Map(),draftAttachments:new Map(),
       localStorage:{removeItem(){}},inputEl:{value:""},pendingAttachments:[],renderAttachments(){},loadSessions:vi.fn(),showInfo(){},showError:vi.fn(),
+      disconnectSSE(){},closeOfficePreview:async()=>{},clearMessages(){},clearTerminal(){},setRunning(){},renderMessageRecovery(){},connStateEl:{},SESSION_KEY:"fixture",
       api:(_path,options)=>options?.method==="DELETE"?Promise.resolve({}):new Promise(resolve=>{finishList=resolve;})});
-    runInContext(declaration("deleteSession"),app);
+    runInContext(["deleteSession","deleteSessions"].map(declaration).join("\n"),app);
     const deleting=app.deleteSession("A"); await vi.waitFor(()=>expect(typeof finishList).toBe("function"));
     app.sessionId="B"; app.sessionNavigation++;
     finishList([{id:"C"}]); await deleting;
@@ -90,7 +91,7 @@ describe("Console asynchronous flow ownership", () => {
     const field=value=>({value});
     const app=createContext({customModelRevision:0,customModelProviderIdEl:field(""),customModelNameEl:field("Local"),customModelBaseUrlEl:field("http://localhost/v1"),
       customModelApiKeyEl:field("stale-key"),customModelNoAuthEl:{checked:true},customModelIdEl:field("local"),customModelContextEl:field("10000"),customModelMaxTokensEl:field("1000"),
-      customModelReasoningEl:{checked:false},customModelVisionEl:{checked:false},customModelAutoSyncEl:{checked:true},customModelSaveBtnEl:{addEventListener:(_event,fn)=>{save=fn;}},
+      customModelReasoningEl:{checked:false},customModelEffortsEl:field(""),customModelVisionEl:{checked:false},customModelAutoSyncEl:{checked:true},customModelSaveBtnEl:{addEventListener:(_event,fn)=>{save=fn;}},
       api:(_path,options)=>{body=JSON.parse(options.body);return new Promise(resolve=>{finish=resolve;});},resetCustomModelForm:vi.fn(),loadCustomModelsSection:vi.fn(),loadKeysSection:vi.fn(),loadModels:vi.fn(),showInfo:vi.fn(),showError:vi.fn()});
     runInContext(listener("customModelSaveBtnEl"),app);
     const saving=save(); app.customModelRevision++; app.customModelNameEl.value="Next unsaved model";

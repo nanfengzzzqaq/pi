@@ -71,6 +71,7 @@ const customModelConnectionStateEl = $("custom-model-connection-state");
 const customModelContextEl = $("custom-model-context");
 const customModelMaxTokensEl = $("custom-model-max-tokens");
 const customModelReasoningEl = $("custom-model-reasoning");
+const customModelEffortsEl = $("custom-model-efforts");
 const customModelVisionEl = $("custom-model-vision");
 const customModelAutoSyncEl = $("custom-model-auto-sync");
 const customModelCapabilityStateEl = $("custom-model-capability-state");
@@ -265,7 +266,6 @@ let confirmedThinkingLevel = "off";
 let customModelRevision = 0;
 let customModelDiscovery = 0;
 let initializing = false;
-let sessionsRequest = 0;
 const deletedSessions = new Set();
 const activeSubmissions = new Map();
 const recoverableSubmissions = new Map();
@@ -491,7 +491,7 @@ function findOfficePath(value, preferredKeys = []) {
 function maybePreviewOfficeTool(toolCall) {
 	if (!toolCall?.toolName?.startsWith("office_")) return;
 	const path = findOfficePath(toolCall.args, ["output", "file"]);
-	if (path) void openOfficePreview(path, "tool");
+	if (path && !officePreviewPaneEl.hidden) void openOfficePreview(path, "tool");
 }
 
 function findDeliverableToolPath(value, preferredKeys = []) {
@@ -1589,7 +1589,7 @@ async function ensureSession() {
 			renderHistory(history);
 			if (history.model) syncModelSelect(history.model.provider, history.model.modelId);
 			if (history.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
-			syncThinkingOptions(history.availableThinkingLevels);
+			syncThinkingOptions(history.availableThinkingLevels, history || {});
 			renderSessionCapabilities(history.enabledCapabilities);
 			return;
 		} catch (error) {
@@ -1610,24 +1610,22 @@ async function ensureSession() {
 	else setRunning(false, true);
 	if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 	if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
-	syncThinkingOptions(history?.availableThinkingLevels);
+	syncThinkingOptions(history?.availableThinkingLevels, history || {});
 	renderSessionCapabilities(history?.enabledCapabilities);
 }
 
 /** 根据当前模型的推理能力禁用不支持的思考等级选项（避免选中后被服务端钳制弹回） */
-function syncThinkingOptions(availableLevels) {
-	const supported = Array.isArray(availableLevels) ? availableLevels : null;
-	for (const opt of thinkingSelectEl.options) {
-		const ok = !supported || supported.includes(opt.value);
-		opt.disabled = !ok;
-		opt.hidden = !ok;
-		opt.title = ok ? "" : "当前模型不支持此等级";
-	}
-	if (supported && !supported.includes(thinkingSelectEl.value)) {
-		const firstEnabled = [...thinkingSelectEl.options].find((o) => !o.disabled);
-		if (firstEnabled) thinkingSelectEl.value = firstEnabled.value;
-	}
+function syncThinkingOptions(availableLevels, state = {}) {
+	const supported = Array.isArray(availableLevels) ? availableLevels : [];
+	const selected = state.thinkingLevel ?? thinkingSelectEl.value;
+	const choices = state.thinkingChoices || supported.map((value, index) => ({ value, label: value === "off" ? "关闭思考" : value + (index === supported.length - 1 ? " · 最高" : "") }));
+	thinkingSelectEl.replaceChildren(...choices.filter(choice => supported.includes(choice.value)).map(choice => new Option(choice.label, choice.value)));
+	if (!thinkingSelectEl.options.length) thinkingSelectEl.append(new Option("能力待同步", ""));
+	thinkingSelectEl.value = supported.includes(selected) ? selected : supported.at(-1) || "";
+	thinkingSelectEl.title = state.thinkingNote || "当前模型支持的推理档位";
+	$("thinking-hint").textContent = thinkingSelectEl.title;
 	confirmedThinkingLevel = thinkingSelectEl.value;
+	updateComposerModelLabel();
 }
 
 /** 清空消息区（保留折叠控制条） */
@@ -1709,8 +1707,8 @@ function renderHistory(history) {
 	updateTerminalStatus();
 	if (latestAssistant) {
 		void latestAssistant.finalizeArtifacts();
-		if (history.streaming) currentAssistant = latestAssistant;
-		else latestAssistant.foldProcess();
+		if (history.streaming) { currentAssistant = latestAssistant; latestAssistant.flushText(); }
+		else { latestAssistant.foldProcess(); void latestAssistant.finalizeArtifacts(); }
 	}
 	setRunning(Boolean(history.streaming), true);
 	} finally {
@@ -1823,67 +1821,20 @@ async function refreshFromHistory() {
 // ---------------------------------------------------------------------------
 
 /** 上次渲染的列表签名：5 秒轮询数据无变化时跳过 DOM 重建，避免闪烁与 hover 丢失 */
-let lastSessionsSignature = null;
-
+let sessionLibrary = null;
+let sessionListLoading = false;
 async function loadSessions() {
-	const request = ++sessionsRequest;
-	try {
-		const list = await api("/api/sessions");
-		if (request !== sessionsRequest) return;
-		const signature = list
-			.map((s) => `${s.id}:${s.title}:${s.updatedAt}:${s.streaming ? 1 : 0}:${s.id === sessionId ? 1 : 0}`)
-			.join("|");
-		if (signature === lastSessionsSignature) return;
-		lastSessionsSignature = signature;
-		sessionsListEl.innerHTML = "";
-		if (list.length === 0) {
-			sessionsListEl.innerHTML = '<div class="skills-empty">暂无历史对话</div>';
-			return;
-		}
-		for (const session of list) {
-			const row = document.createElement("div");
-			row.className = `session-row${session.id === sessionId ? " active" : ""}${session.streaming ? " running" : ""}`;
-			row.dataset.sid = session.id;
-			enableKeyboardClick(row);
-			const title = document.createElement("div");
-			title.className = "session-title";
-			title.textContent = session.title;
-			const meta = document.createElement("div");
-			meta.className = `session-meta${session.streaming ? " running" : ""}`;
-			const states = [];
-			if (session.id === sessionId) states.push("当前");
-			if (session.streaming) states.push("运行中");
-			meta.textContent = `${new Date(session.updatedAt).toLocaleDateString("zh-CN")}${states.length ? ` · ${states.join(" · ")}` : ""}`;
-			row.appendChild(title);
-			row.appendChild(meta);
-			row.addEventListener("click", () => switchSession(session.id));
-			const menu = document.createElement("button");
-			menu.type = "button";
-			menu.className = "session-menu-button";
-			menu.textContent = "⋯";
-			menu.setAttribute("aria-label", `${session.title} 的更多操作`);
-			menu.addEventListener("click", event => {
-				event.stopPropagation();
-				const bounds = menu.getBoundingClientRect();
-				showSessionContextMenu(bounds.left, bounds.bottom, session.id, session.title);
-			});
-			row.appendChild(menu);
-			row.addEventListener("contextmenu", (e) => {
-				e.preventDefault();
-				e.stopPropagation(); // 阻止冒泡到 document 层，避免菜单被立即隐藏
-				showSessionContextMenu(e.clientX, e.clientY, session.id, session.title);
-			});
-			sessionsListEl.appendChild(row);
-		}
-	} catch (error) {
-		if (request !== sessionsRequest) return;
-		lastSessionsSignature = null;
-		sessionsListEl.textContent = `加载失败：${error.message}`;
-	}
+	if (sessionListLoading) return;
+	sessionLibrary ??= window.createSessionLibrary({ listEl: sessionsListEl, api, currentId: () => sessionId, open: switchSession, remove: deleteSessions, menu: showSessionContextMenu, error: showError });
+	sessionListLoading = true;
+	try { await sessionLibrary.refresh(); }
+	catch (error) { showError("对话列表加载失败：" + error.message); }
+	finally { sessionListLoading = false; }
 }
 
 /** 切换到历史会话（服务端从磁盘恢复，消息与 SSE 随之切换） */
 async function switchSession(id) {
+	sessionLibrary?.reveal(id);
 	if (id === sessionId) return;
 	const navigation = ++sessionNavigation;
 	saveComposerDraft();
@@ -1919,50 +1870,46 @@ async function switchSession(id) {
 let sessionContextMenuEl = null;
 
 /** 删除会话：记录与对话内容删除，工作区文件保留；删除当前会话后跳转到列表第一个会话 */
-async function deleteSession(id) {
-	if (!window.confirm("删除此对话？\n（对话记录将被删除，工作区里的文件会保留）")) return;
-	// 编辑器还开着（可能有未保存修改）时先让用户确认关闭，取消则中止删除
-	if (id === sessionId && !codeEditorPaneEl.hidden && !closeCodeEditor()) return;
-	try {
-		await api(`/api/sessions/${id}`, { method: "DELETE" });
-		deletedSessions.add(id);
-		const submission = activeSubmissions.get(id);
-		if (submission) { submission.cancelRequested = true; submission.controller?.abort(); }
-		recoverableSubmissions.delete(id);
-		localStorage.removeItem(`pi-console-pending:${id}`);
-		localStorage.removeItem(`pi-console-draft:${id}`);
-		draftAttachments.delete(id);
-		if (id === sessionId) {
-			const navigation = ++sessionNavigation;
-			historyRequest++;
-			historyDisplayLimit = 100;
-			lastStreamEpoch = null;
-			inputEl.value = "";
-			pendingAttachments = [];
-			renderAttachments();
-			const list = await api("/api/sessions").catch(() => []);
-			if (navigation !== sessionNavigation || id !== sessionId) { void loadSessions(); return; }
+async function deleteSession(id) { return deleteSessions([id]); }
+
+async function deleteSessions(ids) {
+	if (!window.confirm("删除选中的 " + ids.length + " 条对话？对话记录将被删除，工作区文件保留。运行中的对话会停止。")) return [];
+	if (ids.includes(sessionId) && !codeEditorPaneEl.hidden && !closeCodeEditor()) return [];
+	const removed = [], failed = [];
+	for (const id of ids) {
+		try {
+			await api("/api/sessions/" + id, { method: "DELETE" });
+			removed.push(id);
+			deletedSessions.add(id);
+			const submission = activeSubmissions.get(id);
+			if (submission) { submission.cancelRequested = true; submission.controller?.abort(); }
+			recoverableSubmissions.delete(id);
+			localStorage.removeItem("pi-console-pending:" + id);
+			localStorage.removeItem("pi-console-draft:" + id);
+			draftAttachments.delete(id);
+		} catch (error) { failed.push(error.message); }
+	}
+	if (removed.includes(sessionId)) {
+		const navigation = ++sessionNavigation;
+		historyRequest++;
+		historyDisplayLimit = 100;
+		lastStreamEpoch = null;
+		disconnectSSE();
+		await closeOfficePreview();
+		if (navigation === sessionNavigation) {
+			inputEl.value = ""; pendingAttachments = []; renderAttachments();
 			sessionId = null;
 			localStorage.removeItem(SESSION_KEY);
-			clearMessages();
-			clearTerminal();
-			lastSeq = -1;
-			if (list.length > 0) {
-				// 跳转到会话栏第一个会话
-				await switchSession(list[0].id);
-			} else {
-				// 没有会话了：保持空状态，页面显示空（用户可点 ＋ 新对话）
-				disconnectSSE();
-				setRunning(false, true);
-				renderMessageRecovery();
-				connStateEl.textContent = "空闲";
-			}
+			clearMessages(); clearTerminal(); lastSeq = -1;
+			setRunning(false, true); renderMessageRecovery(); connStateEl.textContent = "空闲";
+			const list = await api("/api/sessions").catch(() => []);
+			if (list.length && navigation === sessionNavigation) await switchSession(list[0].id);
 		}
-		await loadSessions();
-		showInfo("对话已删除");
-	} catch (error) {
-		showError(`删除对话失败：${error.message}`);
 	}
+	await loadSessions();
+	if (failed.length) showError("已删除 " + removed.length + " 条，" + failed.length + " 条未删除：" + failed[0]);
+	else if (removed.length) showInfo("已删除 " + removed.length + " 条对话");
+	return removed;
 }
 
 async function renameSession(id, currentTitle) {
@@ -2006,7 +1953,13 @@ function showSessionContextMenu(x, y, id, currentTitle) {
 		hideSessionContextMenu();
 		await deleteSession(id);
 	});
-	menu.append(renameItem, deleteItem);
+	const organizeItem = document.createElement("button");
+	organizeItem.type = "button"; organizeItem.className = "session-context-item"; organizeItem.textContent = "归类 / 批量管理";
+	organizeItem.addEventListener("click", () => { hideSessionContextMenu(); sessionLibrary?.organize(id); });
+	const archiveItem = document.createElement("button");
+	archiveItem.type = "button"; archiveItem.className = "session-context-item"; archiveItem.textContent = sessionLibrary?.isArchived(id) ? "恢复对话" : "归档对话";
+	archiveItem.addEventListener("click", () => { hideSessionContextMenu(); void sessionLibrary?.archive(id); });
+	menu.append(renameItem, organizeItem, archiveItem, deleteItem);
 	menu.style.left = `${x}px`;
 	menu.style.top = `${y}px`;
 	document.body.appendChild(menu);
@@ -2043,6 +1996,7 @@ sessionNewBtnEl.addEventListener("click", async () => {
 		const result = await api("/api/sessions", { method: "POST", body: "{}" });
 		if (navigation !== sessionNavigation) { void loadSessions(); return; }
 		sessionId = result.sessionId;
+		await sessionLibrary?.placeNew(sessionId);
 		restoreComposerDraft();
 		localStorage.setItem(SESSION_KEY, sessionId);
 		clearMessages();
@@ -2111,6 +2065,7 @@ async function pollContext() {
 		const info = await api(`/api/sessions/${targetSessionId}/context`);
 		if (targetSessionId !== sessionId) return;
 		lastContextInfo = info;
+		if (!modelSelectEl.disabled && !thinkingSelectEl.disabled) syncThinkingOptions(info.availableThinkingLevels, info);
 		renderContextRing(info);
 		renderSessionCapabilities(info.enabledCapabilities);
 	} catch {
@@ -2197,7 +2152,7 @@ function handleEvent(event) {
 			if (!event.isError) {
 				maybePreviewOfficeTool(toolCall);
 				const path = findDeliverableToolPath(toolCall?.args, ["output", "file", "path", "target", "destination"]);
-				if (path) currentAssistant?.addArtifactPath(path);
+				if (path) { currentAssistant?.addArtifactPath(path); void currentAssistant?.finalizeArtifacts(); }
 			}
 			if (terminalEntries.has(event.toolCallId)) {
 				// 终端终值：流式快照通常比摘要结果更完整，保留较长的一份
@@ -2237,6 +2192,7 @@ function handleEvent(event) {
 			if (activeSideTab === "review" && sidePanelVisible()) void loadReview();
 			break;
 		case "auto_retry_start":
+			currentAssistant?.archiveCurrentTextAsProgress();
 			setIndicator(true, `请求失败，自动重试中（第 ${event.attempt}/${event.maxAttempts} 次）`);
 			break;
 		case "queue_update":
@@ -2262,17 +2218,18 @@ function handleEvent(event) {
 			break;
 		case "model_changed":
 			syncModelSelect(event.provider, event.modelId);
-			syncThinkingOptions(event.availableThinkingLevels);
+			syncThinkingOptions(event.availableThinkingLevels, event || {});
 			break;
 		case "thinking_level_changed":
 			thinkingSelectEl.value = event.level;
 			confirmedThinkingLevel = event.level;
+			updateComposerModelLabel();
 			break;
 		case "error":
 			showError(event.message || "发生错误");
 			setIndicator(false);
 			if (!event.fatal) {
-				if (currentAssistant) currentAssistant.foldProcess();
+				if (currentAssistant) currentAssistant.foldProcess("已停止");
 				setRunning(false);
 			}
 			break;
@@ -2356,13 +2313,13 @@ function renderArtifactCards(container, files) {
 	container.hidden = items.length === 0;
 	if (items.length === 0) return;
 	let list = container;
-	if (!container.classList.contains("sent-attachments") && items.length > 2) {
+	if (!container.classList.contains("sent-attachments") && (items.length > 2 || container.classList.contains("process-files"))) {
 		const expanded = container.dataset.expanded === "true";
 		const toggle = document.createElement("button");
 		toggle.type = "button";
 		toggle.className = "artifact-group-toggle";
 		toggle.setAttribute("aria-expanded", String(expanded));
-		toggle.textContent = `${expanded ? "▾" : "▸"} 本轮生成文件（${items.length}）`;
+		toggle.textContent = `${expanded ? "▾" : "▸"} ${container.classList.contains("process-files") ? "过程文件" : "本轮生成文件"}（${items.length}）`;
 		const hint = document.createElement("span");
 		hint.textContent = expanded ? "收起文件" : "展开查看、预览或拖到桌面";
 		toggle.appendChild(hint);
@@ -2374,7 +2331,7 @@ function renderArtifactCards(container, files) {
 			list.hidden = !next;
 			container.dataset.expanded = String(next);
 			toggle.setAttribute("aria-expanded", String(next));
-			toggle.firstChild.textContent = `${next ? "▾" : "▸"} 本轮生成文件（${items.length}）`;
+			toggle.firstChild.textContent = `${next ? "▾" : "▸"} ${container.classList.contains("process-files") ? "过程文件" : "本轮生成文件"}（${items.length}）`;
 			hint.textContent = next ? "收起文件" : "展开查看、预览或拖到桌面";
 		});
 		container.append(toggle, list);
@@ -2483,7 +2440,8 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 		const meta = document.createElement("div");
 		meta.className = "message-meta";
 		const modelName = document.createElement("span");
-		modelName.textContent = model ? `模型 · ${model.provider}/${model.modelId || model.id}` : historical ? "Pi · 历史记录" : modelSelectEl.value ? `模型 · ${modelSelectEl.value}` : "Pi";
+		modelName.textContent = model ? model.modelId || model.id : historical ? "Pi · 历史记录" : modelSelectEl.selectedOptions[0]?.textContent || "Pi";
+		modelName.title = model ? `${model.provider}/${model.modelId || model.id}` : modelSelectEl.value;
 		const copyBtn = document.createElement("button");
 		copyBtn.className = "copy-btn";
 		copyBtn.textContent = "⧉";
@@ -2498,7 +2456,7 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 	const thinking = document.createElement("div");
 	thinking.className = "thinking-block";
 	thinking.hidden = true;
-	if (role === "assistant") bubble.appendChild(thinking);
+	// Thinking belongs to the same collapsed process as tool output.
 
 	// 执行过程区（assistant 专用：一轮里的全部工具调用，运行中展开、完成折叠）
 	let processWrap = null;
@@ -2511,9 +2469,15 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 		bubble.appendChild(processWrap);
 	}
 
+	const liveTextEl = document.createElement("div");
+	liveTextEl.className = "text process-live-text";
+	const processFilesEl = document.createElement("div");
+	processFilesEl.className = "message-artifacts process-files";
+	processFilesEl.hidden = true;
+
 	// 正文
 	const textEl = document.createElement("div");
-	textEl.className = "text";
+	textEl.className = "text message-answer";
 	if (text) renderMarkdownInto(textEl, text);
 	bubble.appendChild(textEl);
 	const artifactsEl = document.createElement("div");
@@ -2558,7 +2522,13 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 			try {
 				const result = await resolveMessageArtifacts(messageSessionId, { text: this._allTextBuffer || "", paths: [...this._artifactPaths] });
 				if (request !== this._artifactRequest || messageSessionId !== sessionId || !this.el.isConnected) return;
-				renderArtifactCards(this.artifactsEl, result.files);
+				const finalResult = this._settled ? await resolveMessageArtifacts(messageSessionId, { text: this._textBuffer || "" }) : { files: [] };
+				if (request !== this._artifactRequest || messageSessionId !== sessionId || !this.el.isConnected) return;
+				renderArtifactCards(this.artifactsEl, finalResult.files);
+				const finalPaths = new Set((finalResult.files || []).map(file => file.path));
+				const processFiles = (result.files || []).filter(file => !finalPaths.has(file.path));
+				if (processFiles.length && !processFilesEl.isConnected) this.addTool(processFilesEl, { countStep: false });
+				renderArtifactCards(processFilesEl, processFiles);
 				for (const file of result.files || []) appendActivityArtifact(file);
 				scrollToBottom();
 			} catch {
@@ -2576,10 +2546,10 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 				head.className = "process-head";
 				const chevron = document.createElement("span");
 				chevron.className = "tool-chevron";
-				chevron.textContent = "▾";
+				chevron.textContent = "▸";
 				const label = document.createElement("span");
 				label.className = "process-label";
-				label.textContent = "执行活动";
+				label.textContent = "执行过程";
 				const countEl = document.createElement("span");
 				countEl.className = "process-count";
 				countEl.textContent = `${processCount} 步`;
@@ -2596,23 +2566,29 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 				head.appendChild(countEl);
 				head.appendChild(stateEl);
 				head.appendChild(copyAll);
-				head.addEventListener("click", () => {
+				head.setAttribute("aria-expanded", "false");
+				head.addEventListener("click", (event) => {
+					if (event.target.closest(".copy-btn")) return;
 					processBody.hidden = !processBody.hidden;
 					chevron.textContent = processBody.hidden ? "▸" : "▾";
+					head.setAttribute("aria-expanded", String(!processBody.hidden));
+					if (!processBody.hidden) processBody.scrollTop = processBody.scrollHeight;
 				});
 				enableKeyboardClick(head);
 				processWrap.appendChild(head);
 				processWrap.dataset.startedAt = historical ? "0" : String(Date.now());
 				processBody = document.createElement("div");
 				processBody.className = "process-body";
+				processBody.hidden = true;
 				processWrap.appendChild(processBody);
 				processWrap.hidden = false;
 			} else if (countStep) {
 				const countEl = processWrap.querySelector(".process-count");
 				if (countEl) countEl.textContent = `${processCount} 步`;
 			}
+			const follow = processBody.hidden || processBody.scrollHeight - processBody.scrollTop - processBody.clientHeight < 48;
 			processBody.appendChild(toolBlock);
-			scrollToBottom();
+			if (follow) processBody.scrollTop = processBody.scrollHeight;
 		},
 		addUsage(usage) {
 			if (!processWrap || processWrap.hidden) return;
@@ -2626,28 +2602,26 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 			usageEl.title = formatModelUsage(usage);
 		},
 		/** 一轮结束：执行过程默认折叠（用户可点开），思考块从"思考中"落定 */
-		foldProcess() {
+		foldProcess(status = "完成") {
+			if (wrap.classList.contains("turn-failed")) status = "未完成";
+			this._settled = true;
+			this.flushText();
 			thinking.classList.remove("active");
 			const thinkingLabel = thinking.querySelector(".thinking-label");
 			if (thinkingLabel) thinkingLabel.textContent = "思考过程";
 			if (!processWrap || processWrap.hidden) return;
-			const body = processWrap.querySelector(".process-body");
-			const chevron = processWrap.querySelector(".tool-chevron");
 			const stateEl = processWrap.querySelector(".process-state");
 			if (stateEl) {
 				const startedAt = Number(processWrap.dataset.startedAt);
 				const elapsed = Number.isFinite(startedAt) && startedAt > 0 ? Math.max(1, Math.round((Date.now() - startedAt) / 1000)) : 0;
 				stateEl.classList.remove("running");
-				stateEl.textContent = `完成${elapsed ? ` · ${elapsed}s` : ""}`;
-			}
-			if (body && !body.hidden) {
-				body.hidden = true;
-				if (chevron) chevron.textContent = "▸";
+				stateEl.textContent = `${status}${elapsed ? ` · ${elapsed}s` : ""}`;
 			}
 		},
 		_appendThinking(delta) {
 			if (!this._thinkingOpen) {
 				this._thinkingOpen = true;
+				this.addTool(thinking, { countStep: false });
 				thinking.hidden = false;
 				thinking.innerHTML = "";
 				thinking.classList.add("active");
@@ -2674,28 +2648,30 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 				enableKeyboardClick(head);
 				this._thinkingBody = body;
 			}
+			const follow = this._thinkingBody.scrollHeight - this._thinkingBody.scrollTop - this._thinkingBody.clientHeight < 48;
 			this._thinkingBody.textContent += delta;
-			if (!this._thinkingBody.hidden) this._thinkingBody.scrollTop = this._thinkingBody.scrollHeight;
+			if (follow && !this._thinkingBody.hidden) this._thinkingBody.scrollTop = this._thinkingBody.scrollHeight;
 		},
 		flushText() {
 			clearTimeout(this._renderTimer);
 			this._renderTimer = null;
-			renderMarkdownInto(this.textEl, this._textBuffer || "");
+			if (this._settled) {
+				liveTextEl.remove();
+				renderMarkdownInto(this.textEl, this._textBuffer || "");
+			} else if (this._textBuffer) {
+				if (!liveTextEl.isConnected) this.addTool(liveTextEl, { countStep: false });
+				this.textEl.replaceChildren();
+				const follow = processBody.hidden || processBody.scrollHeight - processBody.scrollTop - processBody.clientHeight < 48;
+				renderMarkdownInto(liveTextEl, this._textBuffer, { streaming: true });
+				if (follow) processBody.scrollTop = processBody.scrollHeight;
+			}
 		},
 		appendText(delta) {
+			this._settled = false;
 			this._textBuffer = (this._textBuffer ?? "") + delta;
 			this._allTextBuffer = (this._allTextBuffer ?? "") + delta;
-			if (this._renderTimer) return;
-			this._renderTimer = setTimeout(() => {
-				this._renderTimer = null;
-				// 流式渲染：避免每 token 全量重排
-				if (this._textBuffer.length > 4000) {
-					// 超长时把已渲染部分固化，只渲染增量
-					this.textEl.dataset.frozen = "1";
-				}
-				renderMarkdownInto(this.textEl, this._textBuffer, { streaming: true });
-				scrollToBottom();
-			}, 60);
+			if (!liveTextEl.isConnected) this.addTool(liveTextEl, { countStep: false });
+			if (!this._renderTimer) this._renderTimer = setTimeout(() => this.flushText(), 60);
 		},
 		appendHistoryText(value) {
 			const separator = this._textBuffer && value ? "\n\n" : "";
@@ -2716,6 +2692,7 @@ function appendMessage(role, text, attachmentPaths = [], { historical = false, m
 			clearTimeout(this._renderTimer);
 			this._renderTimer = null;
 			this._textBuffer = "";
+			liveTextEl.remove();
 			this.textEl.replaceChildren();
 			this.addTool(appendProcessNarration(value), { countStep: false });
 		},
@@ -3172,22 +3149,20 @@ function updateToolBlock(block, isError, resultText) {
 	}
 }
 
-/** 流式工具更新：运行中的工具块实时显示累计输出，并自动展开。 */
+/** 更新折叠区内的输出，保持用户选择的展开状态。 */
 function updateToolBlockLive(toolCallId, text) {
 	const block = document.querySelector(`[data-tool-call-id="${CSS.escape(toolCallId)}"]`);
 	if (!block || !text) return;
 	if (block.classList.contains("terminal-synced")) return;
 	const liveEl = block.querySelector(".tool-live");
 	if (liveEl) {
+		const follow = liveEl.scrollHeight - liveEl.scrollTop - liveEl.clientHeight < 48;
+		const process = block.closest(".process-body");
+		const followProcess = process && process.scrollHeight - process.scrollTop - process.clientHeight < 48;
 		liveEl.textContent = normalizeTerminalText(text);
 		liveEl.hidden = false;
-		liveEl.scrollTop = liveEl.scrollHeight;
-	}
-	const body = block.querySelector(".tool-body");
-	const chevron = block.querySelector(".tool-chevron");
-	if (body?.hidden) {
-		body.hidden = false;
-		if (chevron) chevron.textContent = "▾";
+		if (follow) liveEl.scrollTop = liveEl.scrollHeight;
+		if (followProcess) process.scrollTop = process.scrollHeight;
 	}
 }
 
@@ -3223,7 +3198,7 @@ function copyTextFrom(btn) {
 	let text = "";
 	const mode = btn.dataset.copy;
 	if (mode === "msg") {
-		const textEl = btn.closest(".bubble")?.querySelector(".text");
+		const textEl = btn.closest(".bubble")?.querySelector(".message-answer");
 		text = textEl ? textEl.innerText : "";
 	} else if (mode === "code") {
 		const codeEl = btn.closest("pre")?.querySelector("code");
@@ -4153,7 +4128,7 @@ async function compactContext() {
 }
 
 function copyLastReply() {
-	const lastAssistant = [...messagesEl.querySelectorAll(".message.assistant .text")].pop();
+	const lastAssistant = [...messagesEl.querySelectorAll(".message.assistant .message-answer")].pop();
 	const text = lastAssistant?.textContent?.trim();
 	if (!text) return showInfo("还没有可复制的回复");
 	void copyTextToClipboard(text);
@@ -4640,9 +4615,17 @@ resizeComposerInput();
 // 模型 / 思考等级（输入区右下角）
 // ---------------------------------------------------------------------------
 
+function updateComposerModelLabel() {
+	const model = modelSelectEl.selectedOptions[0]?.textContent || "选择模型";
+	const effort = thinkingSelectEl.selectedOptions[0]?.textContent || "";
+	$("composer-model-name").textContent = model;
+	$("composer-effort-name").textContent = effort;
+}
+
 function syncModelSelect(provider, modelId) {
 	const value = `${provider}/${modelId}`;
 	if ([...modelSelectEl.options].some((o) => o.value === value)) modelSelectEl.value = value;
+	updateComposerModelLabel();
 }
 
 function filterModelOptions() {
@@ -4697,6 +4680,7 @@ async function loadModels() {
 		const history = targetSessionId ? await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null) : null;
 		if (request !== modelsRequest || targetSessionId !== sessionId) return;
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
+		syncThinkingOptions(history?.availableThinkingLevels, history || {});
 	} catch (error) {
 		showError(`加载模型列表失败：${error.message}`);
 	}
@@ -4717,7 +4701,7 @@ modelSelectEl.addEventListener("change", async () => {
 		});
 		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		if (result?.thinkingLevel) thinkingSelectEl.value = result.thinkingLevel;
-		syncThinkingOptions(result?.availableThinkingLevels);
+		syncThinkingOptions(result?.availableThinkingLevels, result || {});
 	} catch (error) {
 		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		showError(`切换模型失败：${error.message}`);
@@ -4725,7 +4709,7 @@ modelSelectEl.addEventListener("change", async () => {
 		if (targetSessionId !== sessionId || request !== modelChangeRequest) return;
 		if (history?.model) syncModelSelect(history.model.provider, history.model.modelId);
 		if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
-		syncThinkingOptions(history?.availableThinkingLevels);
+		syncThinkingOptions(history?.availableThinkingLevels, history || {});
 	} finally {
 		if (targetSessionId === sessionId && request === modelChangeRequest) modelSelectEl.disabled = !modelSelectEl.value;
 	}
@@ -4744,6 +4728,7 @@ thinkingSelectEl.addEventListener("change", async () => {
 		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
 		thinkingSelectEl.value = result.level;
 		confirmedThinkingLevel = result.level;
+		syncThinkingOptions(result.availableThinkingLevels, result);
 	} catch (error) {
 		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
 		thinkingSelectEl.value = confirmedThinkingLevel;
@@ -4751,7 +4736,7 @@ thinkingSelectEl.addEventListener("change", async () => {
 		const history = await api(`/api/sessions/${targetSessionId}/history?limit=1`).catch(() => null);
 		if (targetSessionId !== sessionId || request !== thinkingChangeRequest) return;
 		if (history?.thinkingLevel) thinkingSelectEl.value = history.thinkingLevel;
-		syncThinkingOptions(history?.availableThinkingLevels);
+		syncThinkingOptions(history?.availableThinkingLevels, history || {});
 	} finally {
 		if (targetSessionId === sessionId && request === thinkingChangeRequest) thinkingSelectEl.disabled = false;
 	}
@@ -6894,6 +6879,7 @@ function resetCustomModelForm() {
 	customModelContextEl.value = "128000";
 	customModelMaxTokensEl.value = "16384";
 	customModelReasoningEl.checked = false;
+	customModelEffortsEl.value = "";
 	customModelVisionEl.checked = false;
 	customModelSaveBtnEl.textContent = "添加模型";
 	customModelCancelBtnEl.hidden = true;
@@ -6919,6 +6905,7 @@ function editCustomModel(entry) {
 	customModelContextEl.value = String(entry.contextWindow);
 	customModelMaxTokensEl.value = String(entry.maxTokens);
 	customModelReasoningEl.checked = entry.reasoning === true;
+	customModelEffortsEl.value = (entry.reasoningEfforts || []).join(", ");
 	customModelVisionEl.checked = entry.vision;
 	applyDiscoveredModelCapabilities();
 	customModelSaveBtnEl.textContent = "保存修改";
@@ -6989,6 +6976,7 @@ function applyDiscoveredModelCapabilities() {
 		return;
 	}
 	const model = customModelDetails.get(customModelIdEl.value.trim()) ?? {};
+	if (Array.isArray(model.reasoningEfforts)) customModelEffortsEl.value = model.reasoningEfforts.join(", ");
 	const fields = [
 		["contextWindow", "上下文", customModelContextEl], ["maxTokens", "最大输出", customModelMaxTokensEl],
 		["reasoning", "推理等级", customModelReasoningEl], ["vision", "图片", customModelVisionEl],
@@ -7067,6 +7055,7 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 				contextWindow: customModelContextEl.value,
 				maxTokens: customModelMaxTokensEl.value,
 				reasoning: customModelReasoningEl.checked,
+				reasoningEfforts: customModelEffortsEl.value.trim() ? customModelEffortsEl.value.split(/[,，\s]+/).filter(Boolean) : undefined,
 				vision: customModelVisionEl.checked,
 				syncMode: customModelAutoSyncEl.checked ? "auto" : "manual",
 			}),
@@ -7083,8 +7072,9 @@ customModelSaveBtnEl.addEventListener("click", async () => {
 });
 
 customModelCancelBtnEl.addEventListener("click", resetCustomModelForm);
-for (const element of [customModelNameEl, customModelBaseUrlEl, customModelApiKeyEl, customModelNoAuthEl, customModelIdEl, customModelContextEl, customModelMaxTokensEl, customModelReasoningEl, customModelVisionEl, customModelAutoSyncEl]) {
+for (const element of [customModelNameEl, customModelBaseUrlEl, customModelApiKeyEl, customModelNoAuthEl, customModelIdEl, customModelContextEl, customModelMaxTokensEl, customModelReasoningEl, customModelEffortsEl, customModelVisionEl, customModelAutoSyncEl]) {
 	element.addEventListener("input", () => {
+		if (element === customModelBaseUrlEl || element === customModelIdEl) customModelEffortsEl.value = "";
 		customModelRevision++;
 		customModelApiKeyEl.disabled = customModelNoAuthEl.checked;
 		if (element === customModelBaseUrlEl || element === customModelApiKeyEl || element === customModelNoAuthEl) {
@@ -7352,3 +7342,8 @@ window.addEventListener("resize", () => {
 	if (!workbenchSideEl.hidden) applyWorkbenchSideWidth(workbenchSideEl.style.width.replace("px", ""));
 });
 void init();
+
+// The model popover groups model search, reasoning and configuration in one place.
+document.addEventListener("click", event => { const menu = $("composer-model-menu"); if (menu.open && !menu.contains(event.target)) menu.open = false; });
+$("composer-model-menu").addEventListener("keydown", event => { if (event.key === "Escape") { $("composer-model-menu").open = false; $("composer-model-menu").querySelector("summary").focus(); } });
+modelManageBtnEl.addEventListener("click", () => { $("composer-model-menu").open = false; });

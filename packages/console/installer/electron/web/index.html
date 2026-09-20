@@ -6,6 +6,7 @@
 	<title>Pi 控制台</title>
 	<link rel="stylesheet" href="/style.css">
 	<link rel="stylesheet" href="/search.css">
+	<link rel="stylesheet" href="/workspace-ui.css">
 	<script>
 		// 防主题闪烁：加载前按本地偏好设置主题（dark 默认）
 		document.documentElement.dataset.theme =
@@ -53,7 +54,7 @@
 				<div class="side-header" data-panel="sessions-panel"><span class="side-header-title"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4.5h12v8.5H9l-3.5 3v-3H4z"></path></svg>对话</span><span class="chevron">▾</span></div>
 				<div id="sessions-panel" class="side-body">
 					<div class="sessions-toolbar">
-						<span class="sessions-label">最近使用</span>
+						<span class="sessions-label">对话库</span>
 						<button id="session-new-btn" class="secondary-btn small" title="新建对话">＋ 新对话</button>
 					</div>
 					<div id="sessions-list" class="sessions-list">加载中…</div>
@@ -146,47 +147,35 @@
 						<div id="steer-queue" class="steer-queue" hidden></div>
 						<div id="slash-palette" class="slash-palette" hidden></div>
 						<div class="attachments" id="attachments" hidden></div>
-						<div class="composer-row">
-							<div class="composer-input-box">
-								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 10.5 11 6a3 3 0 0 1 4.2 4.2l-5.8 5.8a4.3 4.3 0 0 1-6.1-6.1l6-6"></path></svg></button>
+						<div class="composer-surface">
+							<div class="composer-row"><div class="composer-input-box">
 								<input type="file" id="file-input" multiple hidden>
-								<textarea id="input" rows="1" aria-label="消息" placeholder="输入消息，Enter 发送，Shift+Enter 换行" disabled></textarea>
-							</div>
-							<div class="composer-buttons">
-								<button id="send-btn" type="button" aria-label="发送" disabled><span>发送</span><svg class="send-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 11-5-3.8 10-2.1-3.7zM9.1 11.3 15 5"></path></svg><svg class="stop-icon" viewBox="0 0 20 20" aria-hidden="true" hidden><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg></button>
-							</div>
-						</div>
-						<div class="composer-bottom">
-							<span class="composer-model-label">模型</span>
-							<select id="model-select" title="模型" disabled>
-								<option value="">加载中…</option>
-							</select>
-							<button id="model-search-toggle" class="composer-mini-btn" type="button" aria-expanded="false" aria-controls="model-search" title="搜索模型">搜索</button>
-							<input id="model-search" type="search" aria-label="搜索模型名称或来源" placeholder="模型名称或来源" size="14" hidden>
-							<span class="composer-model-label">思考</span>
-							<select id="thinking-select" title="思考等级" disabled>
-								<option value="off">off</option>
-								<option value="minimal">minimal</option>
-								<option value="low">low</option>
-								<option value="medium">medium</option>
-								<option value="high">high</option>
-								<option value="xhigh">xhigh</option>
-								<option value="max">max</option>
-							</select>
-							<button id="model-manage-btn" class="composer-mini-btn" type="button" title="管理模型服务">管理模型</button>
-							<button id="context-btn" class="context-ring-btn" title="上下文使用量">
+								<textarea id="input" rows="1" aria-label="消息" placeholder="描述任务，或拖入文件…" disabled></textarea>
+							</div></div>
+							<div class="composer-bottom">
+								<button id="attach-btn" class="icon-btn" title="添加附件（也可拖拽或 Ctrl+V 粘贴）"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 10.5 11 6a3 3 0 0 1 4.2 4.2l-5.8 5.8a4.3 4.3 0 0 1-6.1-6.1l6-6"></path></svg></button>
+								<details id="composer-model-menu" class="composer-model-menu">
+									<summary title="选择模型与推理档位"><span class="model-trigger-icon" aria-hidden="true">◇</span><span id="composer-model-name">选择模型</span><span id="composer-effort-name"></span><span aria-hidden="true">⌄</span></summary>
+									<div class="composer-model-popover">
+										<div class="model-popover-heading"><strong>模型与思考</strong><button id="model-manage-btn" class="composer-mini-btn" type="button">管理服务 ↗</button></div>
+										<div class="model-search-row"><button id="model-search-toggle" class="composer-mini-btn" type="button" aria-expanded="true" aria-controls="model-search" title="展开或收起模型搜索">搜索模型</button><input id="model-search" type="search" aria-label="搜索模型名称或来源" placeholder="名称或来源"></div>
+										<label for="model-select">模型</label><select id="model-select" title="模型" disabled><option value="">加载中…</option></select>
+										<label for="thinking-select">推理强度</label><select id="thinking-select" title="思考等级" disabled><option value="">能力待同步</option></select>
+										<p id="thinking-hint">选择模型后显示支持的档位。</p>
+									</div>
+								</details>
+								<span class="composer-spacer"></span>
+								<button id="context-btn" class="context-ring-btn" title="上下文使用量">
 								<svg viewBox="0 0 36 36" class="context-ring">
 									<circle class="context-ring-bg" cx="18" cy="18" r="15.5"></circle>
 									<circle class="context-ring-fg" id="context-ring-fg" cx="18" cy="18" r="15.5"></circle>
 								</svg>
 								<span id="context-ring-text" class="context-ring-text">–</span>
 							</button>
-							<span class="composer-spacer"></span>
-							<div class="capability-menu">
-								<button id="context-info" class="context-info" type="button" title="查看本轮可用能力">能力加载中…</button>
-								<div id="capabilities-popover" class="capabilities-popover" hidden></div>
+								<div class="composer-buttons"><button id="send-btn" type="button" aria-label="发送" disabled><span>发送</span><svg class="send-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 11-5-3.8 10-2.1-3.7zM9.1 11.3 15 5"></path></svg><svg class="stop-icon" viewBox="0 0 20 20" aria-hidden="true" hidden><rect x="6" y="6" width="8" height="8" rx="1"></rect></svg></button></div>
 							</div>
 						</div>
+						<div class="composer-status-row"><span>Enter 发送 · Shift + Enter 换行</span><div class="capability-menu"><button id="context-info" class="context-info" type="button" title="查看本轮可用能力">能力加载中…</button><div id="capabilities-popover" class="capabilities-popover" hidden></div></div></div>
 					</footer>
 				</section>
 
@@ -565,9 +554,12 @@
 				<div class="key-add-row model-capabilities-row">
 					<input type="number" id="custom-model-context" min="1" step="1" value="128000" placeholder="上下文长度">
 					<input type="number" id="custom-model-max-tokens" min="1" step="1" value="16384" placeholder="最大输出长度">
-					<label class="modal-hint"><input type="checkbox" id="custom-model-reasoning"> 支持推理等级（low / medium / xhigh）</label>
+					<label class="modal-hint"><input type="checkbox" id="custom-model-reasoning"> 支持思考</label>
 					<label class="modal-hint"><input type="checkbox" id="custom-model-vision"> 支持图片</label>
 				</div>
+				<label class="modal-hint" for="custom-model-efforts">已确认的推理档位（服务器公布时自动同步）</label>
+				<input id="custom-model-efforts" type="text" class="model-efforts-input" placeholder="例如 low, medium, high, xhigh；不确定时留空" autocomplete="off">
+				<p class="modal-hint">留空时，本地 Qwen 仅提供思考开关；其他自定义服务使用服务端默认值，不假定支持 max。</p>
 				<div class="model-form-actions">
 					<button id="custom-model-save-btn" type="button">添加模型</button>
 					<button id="custom-model-cancel-btn" class="secondary-btn" type="button" hidden>取消编辑</button>
@@ -611,6 +603,7 @@
 		</div>
 	</div>
 
+	<script src="/sessions.js"></script>
 	<script src="/app.js"></script>
 	<script src="/search.js"></script>
 	<script type="module" src="/antigravity-login.js"></script>

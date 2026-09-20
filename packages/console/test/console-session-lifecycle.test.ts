@@ -22,6 +22,7 @@ import { readSessionIndexFile, type SessionIndex, writeSessionIndexFile } from "
 import { abortTrackedSessionPrompt, disposeSessionBeforeDelete } from "../src/session-lifecycle.ts";
 import { SessionSearch } from "../src/session-search.ts";
 import { RoutedSkillResourceLoader } from "../src/skill-routing.ts";
+import { sessionThinkingOptions } from "../src/thinking-options.ts";
 
 const directories: string[] = [];
 const activeSessions: AgentSession[] = [];
@@ -174,6 +175,7 @@ async function fixture() {
 		AbortController,
 		withBackgroundOwner,
 		sessionSearch: new SessionSearch(),
+		sessionThinkingOptions,
 		fsExplorer: { searchFiles: async () => ({ results: [], truncated: false }) },
 		workspace: { getWorkspacePath: () => directory },
 		existsSync,
@@ -278,6 +280,36 @@ function holdAuth(runtime: ModelRuntime, fail = false) {
 }
 
 describe("Console session route lifecycle", () => {
+	it("rejects unsupported efforts and refreshes both choices and the selected effort when upstream shrinks", async () => {
+		const item = await fixture();
+		const definition = customModels.normalizeCustomModel("pi-console-custom-efforts", {
+			name: "Reasoning fixture",
+			baseUrl: "http://localhost:8000/v1",
+			modelId: "qwen-fixture",
+			reasoning: true,
+			authMode: "none",
+		});
+		await item.manager.save(definition);
+		item.discovery.mockImplementation(async () =>
+			Response.json({ data: [{ id: "qwen-fixture", supported_reasoning_efforts: ["xhigh"] }] }),
+		);
+		const changed = await item.request("POST", "model", {
+			provider: definition.providerId,
+			modelId: definition.modelId,
+		});
+		expect(changed.body).toMatchObject({ thinkingLevel: "xhigh", availableThinkingLevels: ["xhigh"] });
+		expect((await item.request("POST", "thinking", { level: "max" })).status).toBe(400);
+		expect(item.session.thinkingLevel).toBe("xhigh");
+		item.discovery.mockImplementation(async () =>
+			Response.json({ data: [{ id: "qwen-fixture", supported_reasoning_efforts: ["low"] }] }),
+		);
+		expect((await item.requestPath("POST", "/api/models/refresh")).status).toBe(200);
+		expect((await item.request("GET", "context")).body).toMatchObject({
+			thinkingLevel: "low",
+			availableThinkingLevels: ["low"],
+		});
+		expect((await item.request("POST", "thinking", { level: "xhigh" })).status).toBe(400);
+	});
 	it("refreshes before sending and prevents competing turns while metadata is being fetched", async () => {
 		const item = await fixture();
 		const definition = customModels.normalizeCustomModel("pi-console-custom-preturn", {
@@ -349,7 +381,7 @@ describe("Console session route lifecycle", () => {
 		).toBe(200);
 		expect(item.session.model?.contextWindow).toBe(262144);
 		expect(item.session.systemPrompt).toContain('"contextWindow":262144');
-		expect(item.session.getAvailableThinkingLevels()).toContain("xhigh");
+		expect(item.session.getAvailableThinkingLevels()).toEqual(["off", "high"]);
 	});
 	it("rejects stale queue revisions and retains other queued messages after removal", async () => {
 		const item = await fixture();

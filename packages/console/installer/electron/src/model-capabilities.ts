@@ -4,6 +4,19 @@ export interface ModelCapabilities {
 	maxTokens?: number;
 	vision?: boolean;
 	reasoning?: boolean;
+	reasoningEfforts?: ReasoningEffort[];
+}
+
+export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
+export function parseReasoningEfforts(value: unknown): ReasoningEffort[] | undefined {
+	if (
+		!Array.isArray(value) ||
+		!value.every((item) => typeof item === "string" && (REASONING_EFFORTS as readonly string[]).includes(item))
+	)
+		return undefined;
+	return REASONING_EFFORTS.filter((item) => value.includes(item));
 }
 
 export interface DiscoveredModel extends ModelCapabilities {
@@ -32,6 +45,13 @@ export function parseModelCapabilities(value: unknown): ModelCapabilities {
 	const provider = record(model.top_provider);
 	const modalities = model.input_modalities ?? architecture.input_modalities;
 	const parameters = model.supported_parameters;
+	const reasoningEfforts = parseReasoningEfforts(
+		model.reasoningEfforts ??
+			model.supported_reasoning_efforts ??
+			model.reasoning_efforts ??
+			record(model.reasoning).efforts ??
+			capabilities.reasoning_efforts,
+	);
 	const contextWindow = limit(
 		model.max_model_len,
 		model.context_length,
@@ -58,6 +78,7 @@ export function parseModelCapabilities(value: unknown): ModelCapabilities {
 	const reasoning = flag(
 		model.reasoning,
 		capabilities.reasoning,
+		reasoningEfforts?.length ? true : undefined,
 		Array.isArray(parameters) && parameters.every((item) => typeof item === "string")
 			? parameters.some((item) => item === "reasoning" || item === "reasoning_effort")
 			: undefined,
@@ -67,6 +88,7 @@ export function parseModelCapabilities(value: unknown): ModelCapabilities {
 		...(maxTokens !== undefined ? { maxTokens } : {}),
 		...(vision !== undefined ? { vision } : {}),
 		...(reasoning !== undefined ? { reasoning } : {}),
+		...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
 	};
 }
 

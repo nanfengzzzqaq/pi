@@ -14,6 +14,14 @@ function fixture(api) {
 	return { ...methods, get: (id) => get(`custom-model-${id}`), input(id, value) { const el = get(`custom-model-${id}`); if (typeof value === "boolean") el.checked = value; else el.value = value; el.listeners.input(); } };
 }
 describe("custom model capability form", () => {
+	it("does not carry another model's reasoning efforts into an unknown model", async () => {
+		const app = fixture(async () => ({ models: ["first", "second"], details: [{ id: "first", reasoningEfforts: ["low", "xhigh"] }, { id: "second" }] }));
+		app.input("base-url", "http://localhost/v1"); app.input("id", "first");
+		await app.get("discover-btn").listeners.click();
+		expect(app.get("efforts").value).toBe("low, xhigh");
+		app.input("id", "second");
+		expect(app.get("efforts").value).toBe("");
+	});
 	it("fills server values including false, changes with model selection, and preserves manual settings", async () => {
 		const app = fixture(async () => ({ models: ["first", "second"], details: [{ id: "first", contextWindow: 262144 }, { id: "second", contextWindow: 32768, maxTokens: 4096, vision: false, reasoning: false }] }));
 		app.input("base-url", "https://models.example/v1");

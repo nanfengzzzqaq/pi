@@ -4,6 +4,8 @@ import {
 	type ModelCapabilities,
 	parseDiscoveredModels,
 	parseModelCapabilities,
+	parseReasoningEfforts,
+	type ReasoningEffort,
 } from "./model-capabilities.ts";
 
 const FILE_VERSION = 2;
@@ -21,6 +23,7 @@ export interface CustomModelDefinition {
 	maxTokens: number;
 	vision: boolean;
 	reasoning: boolean;
+	reasoningEfforts?: ReasoningEffort[];
 	authMode?: "api_key" | "none";
 	/** Missing in older files means automatic sync, with existing values as fallbacks. */
 	syncMode?: "manual";
@@ -41,6 +44,7 @@ export interface CustomModelInput {
 	maxTokens?: unknown;
 	vision?: unknown;
 	reasoning?: unknown;
+	reasoningEfforts?: unknown;
 	authMode?: unknown;
 	syncMode?: unknown;
 	serverConfig?: unknown;
@@ -97,6 +101,9 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 	if (input.syncMode !== undefined && input.syncMode !== "auto" && input.syncMode !== "manual")
 		throw new Error("模型配置同步方式无效");
 	const contextWindow = positiveInteger(input.contextWindow, "上下文长度", DEFAULT_CONTEXT_WINDOW);
+	const reasoningEfforts = parseReasoningEfforts(input.reasoningEfforts);
+	if (input.reasoningEfforts !== undefined && !reasoningEfforts)
+		throw new Error("推理档位只支持 none / minimal / low / medium / high / xhigh / max");
 	const maxTokens = positiveInteger(input.maxTokens, "最大输出长度", DEFAULT_MAX_TOKENS);
 	if (contextWindow > 4_000_000) throw new Error("上下文长度不能超过 4000000");
 	if (maxTokens > contextWindow) throw new Error("最大输出长度不能超过上下文长度");
@@ -109,6 +116,7 @@ export function normalizeCustomModel(providerId: string, input: CustomModelInput
 		maxTokens,
 		vision: input.vision === true,
 		reasoning: input.reasoning === true,
+		...(reasoningEfforts ? { reasoningEfforts } : {}),
 		...(input.authMode === "none" ? { authMode: "none" as const } : {}),
 		...(input.syncMode === "manual" ? { syncMode: "manual" as const } : {}),
 		...(input.serverConfig ? { serverConfig: parseModelCapabilities(input.serverConfig) } : {}),
@@ -193,6 +201,17 @@ function usesQwenChatTemplate(modelId: string): boolean {
 
 export function toProviderConfig(definition: CustomModelDefinition) {
 	const input: ("text" | "image")[] = definition.vision ? ["text", "image"] : ["text"];
+	const efforts = definition.reasoningEfforts ?? [];
+	const binaryThinking = definition.reasoning && efforts.length === 0 && usesQwenChatTemplate(definition.modelId);
+	const thinkingLevelMap = {
+		off: efforts.includes("none") ? "none" : binaryThinking || efforts.length === 0 ? undefined : null,
+		minimal: efforts.includes("minimal") ? "minimal" : null,
+		low: efforts.includes("low") ? "low" : null,
+		medium: efforts.includes("medium") ? "medium" : null,
+		high: efforts.includes("high") || binaryThinking ? "high" : null,
+		xhigh: efforts.includes("xhigh") ? "xhigh" : null,
+		max: efforts.includes("max") ? "max" : null,
+	};
 	return {
 		name: definition.name,
 		baseUrl: definition.baseUrl,
@@ -202,17 +221,7 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 				id: definition.modelId,
 				name: definition.modelId,
 				reasoning: definition.reasoning,
-				thinkingLevelMap: definition.reasoning
-					? {
-							off: null,
-							minimal: null,
-							low: "low",
-							medium: "medium",
-							high: null,
-							xhigh: "xhigh",
-							max: "max",
-						}
-					: undefined,
+				thinkingLevelMap: definition.reasoning ? thinkingLevelMap : undefined,
 				input,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: definition.contextWindow,
@@ -220,8 +229,8 @@ export function toProviderConfig(definition: CustomModelDefinition) {
 				compat: {
 					supportsStore: false,
 					supportsDeveloperRole: false,
-					supportsReasoningEffort: definition.reasoning,
-					...(definition.reasoning && usesQwenChatTemplate(definition.modelId)
+					supportsReasoningEffort: definition.reasoning && efforts.length > 0,
+					...(binaryThinking
 						? {
 								thinkingFormat: "qwen-chat-template" as const,
 							}
@@ -246,6 +255,10 @@ export function applyServerCapabilities(
 	return normalizeCustomModel(definition.providerId, {
 		...definition,
 		...serverConfig,
+		// If a previously published list disappears, stop advertising the stale levels.
+		reasoningEfforts:
+			serverConfig.reasoningEfforts ??
+			(definition.serverConfig?.reasoningEfforts ? undefined : definition.reasoningEfforts),
 		contextWindow,
 		maxTokens: Math.min(serverConfig.maxTokens ?? definition.maxTokens, contextWindow),
 		serverConfig,

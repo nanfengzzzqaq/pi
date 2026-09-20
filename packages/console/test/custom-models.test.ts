@@ -58,7 +58,7 @@ describe("custom model configuration", () => {
 		expect(readFileSync(file, "utf8")).not.toContain("apiKey");
 	});
 
-	it("builds a Chat Completions provider with the enabled Qwen reasoning levels", () => {
+	it("exposes only the Qwen thinking switch when no effort list is published", () => {
 		const definition = normalizeCustomModel(createCustomProviderId("model-1"), {
 			name: "Local",
 			baseUrl: "http://127.0.0.1:8000/v1",
@@ -73,20 +73,20 @@ describe("custom model configuration", () => {
 					id: "qwen",
 					reasoning: true,
 					thinkingLevelMap: {
-						off: null,
+						off: undefined,
 						minimal: null,
-						low: "low",
-						medium: "medium",
-						high: null,
-						xhigh: "xhigh",
-						max: "max",
+						low: null,
+						medium: null,
+						high: "high",
+						xhigh: null,
+						max: null,
 					},
 					input: ["text"],
 					contextWindow: 128000,
 					maxTokens: 16384,
 					compat: {
 						supportsDeveloperRole: false,
-						supportsReasoningEffort: true,
+						supportsReasoningEffort: false,
 						thinkingFormat: "qwen-chat-template",
 						supportsOpenAIGrammarTools: false,
 					},
@@ -118,7 +118,7 @@ describe("custom model configuration", () => {
 		expect(toProviderConfig(reasoning).models[0]?.compat).toEqual({
 			supportsStore: false,
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: true,
+			supportsReasoningEffort: false,
 			thinkingFormat: "qwen-chat-template",
 			supportsStrictMode: false,
 			supportsOpenAIGrammarTools: false,
@@ -146,10 +146,10 @@ describe("custom model configuration", () => {
 
 		expect(runtime.getModel(providerId, "qwen")?.compat).toMatchObject({
 			supportsDeveloperRole: false,
-			supportsReasoningEffort: true,
+			supportsReasoningEffort: false,
 			thinkingFormat: "qwen-chat-template",
 		});
-		expect(runtime.getModel(providerId, "qwen")?.thinkingLevelMap?.xhigh).toBe("xhigh");
+		expect(runtime.getModel(providerId, "qwen")?.thinkingLevelMap?.xhigh).toBeNull();
 	});
 
 	it("keeps non-Qwen reasoning models on generic OpenAI reasoning parameters", () => {

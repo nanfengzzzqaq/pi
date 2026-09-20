@@ -60,7 +60,7 @@ describe("Console interaction regressions", () => {
     let finishFirstClose;
     let closes = 0;
     const app = createContext({
-      sessionId: "initial", sessionNavigation: 0, historyRequest: 0, historyDisplayLimit: 100, lastStreamEpoch: null,
+      sessionId: "initial", sessionLibrary: null, sessionNavigation: 0, historyRequest: 0, historyDisplayLimit: 100, lastStreamEpoch: null,
       saveComposerDraft() {}, restoreComposerDraft() {}, disconnectSSE() {}, connectSSE() {}, clearMessages() {},
       closeFilePreview() {}, modelChangeRequest: 0, thinkingChangeRequest: 0, modelSelectEl: { value: "model" }, thinkingSelectEl: {},
       setRunning() {}, localStorage: { setItem() {} }, SESSION_KEY: "fixture", lastSeq: -1,
@@ -227,19 +227,25 @@ describe("Console interaction regressions", () => {
     listener({ ...event, isComposing: false });
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
-  it("renders during an uninterrupted stream", () => {
+  it("renders an uninterrupted stream inside the process until the final result settles", () => {
     vi.useFakeTimers();
-    let method;
+    const methods = [];
     function visit(node) {
-      if (ts.isMethodDeclaration(node) && node.name?.getText(tree) === "appendText") method = node;
+      if (ts.isMethodDeclaration(node) && ["appendText", "flushText"].includes(node.name?.getText(tree))) methods.push(node);
       ts.forEachChild(node, visit);
     }
     visit(tree);
     const renderMarkdownInto = vi.fn();
-    const app = createContext({ setTimeout, clearTimeout, renderMarkdownInto, scrollToBottom() {} });
-    runInContext(`globalThis.message = { textEl: { dataset: {} }, ${method.getText(tree)} };`, app);
+    const liveTextEl = { isConnected: true, remove() {} };
+    const app = createContext({ setTimeout, clearTimeout, renderMarkdownInto, liveTextEl, processBody: {hidden:true,scrollHeight:100,scrollTop:0,clientHeight:50} });
+    runInContext(`globalThis.message = { textEl: { replaceChildren() {} }, ${methods.map(method=>method.getText(tree)).join(",")} };`, app);
     for (let i = 0; i < 25; i++) { app.message.appendText("a"); vi.advanceTimersByTime(20); }
     expect(renderMarkdownInto.mock.calls.length).toBeGreaterThan(3);
     expect(renderMarkdownInto.mock.calls.length).toBeLessThan(25);
+    expect(renderMarkdownInto.mock.calls.every(([target])=>target===liveTextEl)).toBe(true);
+    app.message._settled = true;
+    app.message.flushText();
+    expect(renderMarkdownInto.mock.lastCall[0]).toBe(app.message.textEl);
+    expect(renderMarkdownInto.mock.lastCall[1]).toBe("a".repeat(25));
   });
 });
